@@ -1,5 +1,6 @@
 from cradle.ast_extractor import extract_file
 from cradle.cache import LabelCache
+from cradle.db_visualization import build_db_visualization
 from cradle.graph_models import AnalysisSummary, CallRecord, CodeNode, CodeSymbol, ImportRecord, NodeContextRecord, RepositoryGraph, RetrievalNodeHit, RetrievalResult, RetrievalSymbolHit, SymbolReferenceRecord
 from cradle.labeling import LabelingConfig, LabelingEngine
 from cradle.llm_client import LLMClientConfig, LLMClientError, OpenAICompatibleClient
@@ -18,6 +19,7 @@ __all__ = [
 	"ConsistencyReport",
 	"CradlePipeline",
 	"CradleDatabase",
+	"build_db_visualization",
 	"FilePacket",
 	"FilePacketBuilder",
 	"ImportRecord",

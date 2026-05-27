@@ -5,6 +5,7 @@ import logging
 from pathlib import Path
 
 from cradle.cache import LabelCache
+from cradle.db_visualization import build_db_visualization
 from cradle.labeling import LabelingConfig, LabelingEngine
 from cradle.llm_client import LLMClientConfig, OpenAICompatibleClient
 from cradle.pipeline import CradlePipeline, PipelineConfig
@@ -38,11 +39,19 @@ def main() -> int:
     retrieve_parser.add_argument("--limit", type=int, default=5)
     retrieve_parser.add_argument("--log-level", default="INFO")
 
+    visualize_parser = subparsers.add_parser("visualize-db")
+    visualize_parser.add_argument("db_path")
+    visualize_parser.add_argument("--output", default=None)
+    visualize_parser.add_argument("--sample-limit", type=int, default=10)
+    visualize_parser.add_argument("--log-level", default="INFO")
+
     args = parser.parse_args()
     if args.command == "analyze":
         return _run_analyze(args)
     if args.command == "retrieve":
         return _run_retrieve(args)
+    if args.command == "visualize-db":
+        return _run_visualize_db(args)
     return 1
 
 
@@ -80,6 +89,19 @@ def _run_retrieve(args: argparse.Namespace) -> int:
     return 0
 
 
+def _run_visualize_db(args: argparse.Namespace) -> int:
+    _configure_logging(args.log_level)
+    report = build_db_visualization(args.db_path, sample_limit=args.sample_limit)
+    if args.output:
+        output_path = Path(args.output)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(report, encoding="utf-8")
+        print(f"visualization: {output_path}")
+    else:
+        print(report)
+    return 0
+
+
 def _summarize_result(summary, output_path: Path) -> str:
     repo_categories = ", ".join(summary.repo_categories)
     return "\n".join(
@@ -113,7 +135,7 @@ def _format_retrieval_result(result) -> str:
             symbol = hit.symbol
             location = f"{symbol.path}:{symbol.start_line or 0}:{symbol.start_column or 0}"
             lines.append(f"  - {symbol.qualified_name} [{symbol.kind}] score={hit.score:.2f} at {location}")
-            lines.append(f"    signature: {symbol.signature}")
+            lines.append(f"    signature: {_compact_signature(symbol.signature)}")
             if hit.called_by:
                 lines.append(f"    called_by: {', '.join(_call_source_label(call) for call in hit.called_by[:5])}")
             if hit.callees:
@@ -121,6 +143,17 @@ def _format_retrieval_result(result) -> str:
             if hit.references:
                 lines.append(f"    references: {', '.join(_reference_label(reference) for reference in hit.references[:5])}")
     return "\n".join(lines)
+
+
+def _compact_signature(signature: str, *, max_length: int = 220) -> str:
+    compact = " ".join(signature.split())
+    if "=>" in compact and "{" in compact:
+        compact = compact.split("{", 1)[0].rstrip() + " { ... }"
+    elif "{" in compact and compact.startswith("function "):
+        compact = compact.split("{", 1)[0].rstrip() + " { ... }"
+    if len(compact) > max_length:
+        return compact[: max_length - 3].rstrip() + "..."
+    return compact
 
 
 def _call_source_label(call) -> str:

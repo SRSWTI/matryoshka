@@ -107,3 +107,79 @@ def verify_token(token: str) -> bool:
     assert "files: 1" in captured.out
     assert file_count == 1
     assert repo_summary
+
+
+def test_cli_visualize_db_writes_markdown_report(tmp_path, monkeypatch, capsys):
+    auth_dir = tmp_path / "src" / "auth"
+    auth_dir.mkdir(parents=True)
+    (auth_dir / "middleware.py").write_text(
+        """
+import jwt
+
+
+def verify_token(token: str) -> bool:
+    return jwt.decode(token, "secret", algorithms=["HS256"]) is not None
+""".strip(),
+        encoding="utf-8",
+    )
+
+    output_path = tmp_path / "report.db"
+    cache_path = tmp_path / "labels.db"
+    report_path = tmp_path / "report.md"
+    monkeypatch.setattr(cli, "OpenAICompatibleClient", FakeClient)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "cradle",
+            "analyze",
+            str(tmp_path),
+            "--model",
+            "fake-model",
+            "--api-key",
+            "2508",
+            "--cache-path",
+            str(cache_path),
+            "--output",
+            str(output_path),
+            "--max-parallel-requests",
+            "1",
+            "--max-tokens",
+            "120",
+            "--thinking-budget",
+            "0",
+            "--max-files",
+            "1",
+        ],
+    )
+    assert cli.main() == 0
+    capsys.readouterr()
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "cradle",
+            "visualize-db",
+            str(output_path),
+            "--output",
+            str(report_path),
+            "--sample-limit",
+            "5",
+        ],
+    )
+
+    exit_code = cli.main()
+    captured = capsys.readouterr()
+    report = report_path.read_text(encoding="utf-8")
+
+    assert exit_code == 0
+    assert f"visualization: {report_path}" in captured.out
+    assert "# Cradle DB Visualization" in report
+    assert "## Table Counts" in report
+    assert "## SQL Schema" in report
+    assert "## Sample Stored Rows" in report
+    assert "### `nodes`" in report
+    assert '"node_id"' in report
+    assert "```mermaid" in report
+    assert "| nodes |" in report
