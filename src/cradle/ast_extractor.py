@@ -510,13 +510,29 @@ def _typescript_variable_symbols(source: str, node: Node) -> list[SymbolCapture]
                 SymbolRecord(
                 name=name,
                 kind="constant" if name.isupper() else "variable",
-                signature=f"{name} = {_single_line(_text(source, value_node)) if value_node is not None else ''}".strip(),
+                signature=f"{name} = {_typescript_variable_signature(source, value_node) if value_node is not None else ''}".strip(),
                 line_range=_line_range(child),
                 ),
                 child,
             )
         )
     return symbols
+
+
+def _typescript_variable_signature(source: str, value_node: Node) -> str:
+    text = _single_line(_text(source, value_node))
+    if value_node.type in {"arrow_function", "function_expression"}:
+        body_node = value_node.child_by_field_name("body")
+        if body_node is not None and body_node.type == "statement_block":
+            return _single_line(_text(source, value_node).split("{", 1)[0].strip()) + " { ... }"
+        return text
+    if value_node.type == "object":
+        return "{ ... }"
+    if value_node.type == "array":
+        return "[ ... ]"
+    if len(text) > 160 and "{" in text:
+        return text.split("{", 1)[0].rstrip() + " { ... }"
+    return text
 
 
 def _typescript_parameter_list(source: str, node: Node | None) -> list[str]:

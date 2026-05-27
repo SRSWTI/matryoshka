@@ -149,3 +149,84 @@ class RetrievalResult:
     query: str
     node_hits: list[RetrievalNodeHit] = field(default_factory=list)
     symbol_hits: list[RetrievalSymbolHit] = field(default_factory=list)
+
+
+@dataclass(slots=True)
+class ExactImportHit:
+    score: float
+    import_record: ImportRecord
+    importer_node: CodeNode
+    target_node: CodeNode | None = None
+
+
+@dataclass(slots=True)
+class ExactCallHit:
+    score: float
+    call_record: CallRecord
+    caller_node: CodeNode | None = None
+    caller_symbol: CodeSymbol | None = None
+    target_node: CodeNode | None = None
+    target_symbol: CodeSymbol | None = None
+
+
+@dataclass(slots=True)
+class ExactReferenceHit:
+    score: float
+    reference_record: SymbolReferenceRecord
+    source_node: CodeNode | None = None
+    source_symbol: CodeSymbol | None = None
+    target_node: CodeNode | None = None
+    target_symbol: CodeSymbol | None = None
+
+
+@dataclass(slots=True)
+class ExactSearchResult:
+    query: str
+    search_type: str
+    node_hits: list[RetrievalNodeHit] = field(default_factory=list)
+    symbol_hits: list[RetrievalSymbolHit] = field(default_factory=list)
+    import_hits: list[ExactImportHit] = field(default_factory=list)
+    call_hits: list[ExactCallHit] = field(default_factory=list)
+    reference_hits: list[ExactReferenceHit] = field(default_factory=list)
+
+
+@dataclass(slots=True)
+class TraversalCandidate:
+    score: float
+    node: CodeNode
+
+
+@dataclass(slots=True)
+class TraversalStep:
+    level: str
+    parent_node_ids: list[str] = field(default_factory=list)
+    candidates: list[TraversalCandidate] = field(default_factory=list)
+
+
+@dataclass(slots=True)
+class HierarchicalSearchResult:
+    query: str
+    steps: list[TraversalStep] = field(default_factory=list)
+    node_hits: list[RetrievalNodeHit] = field(default_factory=list)
+    symbol_hits: list[RetrievalSymbolHit] = field(default_factory=list)
+
+
+@dataclass(slots=True)
+class CodeExcerpt:
+    path: str
+    start_line: int
+    end_line: int
+    text: str
+
+
+@dataclass(slots=True)
+class QuestionResult:
+    query: str
+    answer: str
+    traversal_steps: list[TraversalStep] = field(default_factory=list)
+    node_hits: list[RetrievalNodeHit] = field(default_factory=list)
+    symbol_hits: list[RetrievalSymbolHit] = field(default_factory=list)
+    import_hits: list[ExactImportHit] = field(default_factory=list)
+    call_hits: list[ExactCallHit] = field(default_factory=list)
+    reference_hits: list[ExactReferenceHit] = field(default_factory=list)
+    excerpts: list[CodeExcerpt] = field(default_factory=list)

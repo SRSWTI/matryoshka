@@ -3,6 +3,10 @@ from __future__ import annotations
 import json
 import sqlite3
 import sys
+import hashlib
+import re
+
+import numpy as np
 
 from cradle import cli
 
@@ -44,6 +48,24 @@ class FakeClient:
             "confidence": 0.85,
             "evidence": [payload.get("task", "")],
         }
+
+
+class FakeEmbedder:
+    def __init__(self, model_name="fake-embedder", batch_size=32, truncate_dim=None):
+        self.model_name = model_name
+        self.batch_size = batch_size
+        self.dimension = truncate_dim or 48
+
+    def encode(self, texts, *, show_progress_bar=False):
+        vectors = np.zeros((len(texts), self.dimension), dtype=np.float32)
+        for row_index, text in enumerate(texts):
+            for token in re.findall(r"[a-z0-9_]+", text.lower()):
+                token_hash = hashlib.sha256(token.encode("utf-8")).digest()
+                column = int.from_bytes(token_hash[:4], byteorder="little") % self.dimension
+                vectors[row_index, column] += 1.0
+        norms = np.linalg.norm(vectors, axis=1, keepdims=True)
+        norms[norms == 0] = 1.0
+        return vectors / norms
 
 
 def test_cli_analyze_writes_output_and_summary(tmp_path, monkeypatch, capsys):
@@ -183,3 +205,354 @@ def verify_token(token: str) -> bool:
     assert '"node_id"' in report
     assert "```mermaid" in report
     assert "| nodes |" in report
+
+
+def test_cli_semantic_index_and_search(tmp_path, monkeypatch, capsys):
+    auth_dir = tmp_path / "src" / "auth"
+    auth_dir.mkdir(parents=True)
+    (auth_dir / "middleware.py").write_text(
+        """
+import jwt
+
+
+def verify_token(token: str) -> bool:
+    return jwt.decode(token, "secret", algorithms=["HS256"]) is not None
+""".strip(),
+        encoding="utf-8",
+    )
+
+    output_path = tmp_path / "report.db"
+    cache_path = tmp_path / "labels.db"
+    index_dir = tmp_path / "semantic"
+    monkeypatch.setattr(cli, "OpenAICompatibleClient", FakeClient)
+    monkeypatch.setattr(cli, "build_text_embedder", lambda *args, **kwargs: FakeEmbedder())
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "cradle",
+            "analyze",
+            str(tmp_path),
+            "--model",
+            "fake-model",
+            "--api-key",
+            "2508",
+            "--cache-path",
+            str(cache_path),
+            "--output",
+            str(output_path),
+            "--max-parallel-requests",
+            "1",
+            "--max-tokens",
+            "120",
+            "--thinking-budget",
+            "0",
+            "--max-files",
+            "1",
+        ],
+    )
+    assert cli.main() == 0
+    capsys.readouterr()
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "cradle",
+            "semantic-index",
+            str(output_path),
+            "--model",
+            "fake-embedder",
+            "--output-dir",
+            str(index_dir),
+        ],
+    )
+    exit_code = cli.main()
+    captured = capsys.readouterr()
+
+    assert exit_code == 0
+    assert f"semantic_index: {index_dir}" in captured.out
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "cradle",
+            "semantic-search",
+            str(output_path),
+            "where is verify_token implemented",
+            "--index-dir",
+            str(index_dir),
+            "--limit",
+            "3",
+        ],
+    )
+
+    exit_code = cli.main()
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert "src/auth/middleware.py" in captured.out
+
+
+def test_cli_exact_search_commands(tmp_path, monkeypatch, capsys):
+    auth_dir = tmp_path / "src" / "auth"
+    shared_dir = tmp_path / "src" / "shared"
+    providers_dir = tmp_path / "src" / "providers"
+    auth_dir.mkdir(parents=True)
+    shared_dir.mkdir(parents=True)
+    providers_dir.mkdir(parents=True)
+
+    (shared_dir / "crypto.py").write_text(
+        """
+def verify_sig(token: str) -> bool:
+    return token.startswith("sig-")
+""".strip(),
+        encoding="utf-8",
+    )
+    (auth_dir / "middleware.py").write_text(
+        """
+from src.shared.crypto import verify_sig
+
+
+def verify_token(token: str) -> bool:
+    return verify_sig(token)
+""".strip(),
+        encoding="utf-8",
+    )
+    (providers_dir / "streaming.py").write_text(
+        """
+def stream_bedrock() -> str:
+    return "ok"
+""".strip(),
+        encoding="utf-8",
+    )
+    (providers_dir / "adapter.py").write_text(
+        """
+from src.providers.streaming import stream_bedrock
+
+
+def stream_bedrock_lazy() -> str:
+    return stream_bedrock()
+""".strip(),
+        encoding="utf-8",
+    )
+
+    output_path = tmp_path / "report.db"
+    cache_path = tmp_path / "labels.db"
+    monkeypatch.setattr(cli, "OpenAICompatibleClient", FakeClient)
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "cradle",
+            "analyze",
+            str(tmp_path),
+            "--model",
+            "fake-model",
+            "--api-key",
+            "2508",
+            "--cache-path",
+            str(cache_path),
+            "--output",
+            str(output_path),
+            "--max-parallel-requests",
+            "1",
+            "--max-tokens",
+            "120",
+            "--thinking-budget",
+            "0",
+            "--max-files",
+            "4",
+        ],
+    )
+    assert cli.main() == 0
+    capsys.readouterr()
+
+    monkeypatch.setattr(sys, "argv", ["cradle", "file-search", str(output_path), "middleware.py"])
+    assert cli.main() == 0
+    captured = capsys.readouterr()
+    assert "search_type: file" in captured.out
+    assert "src/auth/middleware.py" in captured.out
+
+    monkeypatch.setattr(sys, "argv", ["cradle", "symbol-search", str(output_path), "verify_sig"])
+    assert cli.main() == 0
+    captured = capsys.readouterr()
+    assert "search_type: symbol" in captured.out
+    assert "verify_sig" in captured.out
+
+    monkeypatch.setattr(sys, "argv", ["cradle", "import-search", str(output_path), "src.shared.crypto"])
+    assert cli.main() == 0
+    captured = capsys.readouterr()
+    assert "search_type: import" in captured.out
+    assert "src/auth/middleware.py" in captured.out
+
+    monkeypatch.setattr(sys, "argv", ["cradle", "call-search", str(output_path), "who calls stream_bedrock"])
+    assert cli.main() == 0
+    captured = capsys.readouterr()
+    assert "search_type: call" in captured.out
+    assert "src/providers/adapter.py" in captured.out
+
+
+def test_cli_question_command(tmp_path, monkeypatch, capsys):
+    presentation_dir = tmp_path / "src" / "presentation"
+    presentation_dir.mkdir(parents=True)
+    (presentation_dir / "render.py").write_text(
+        """
+def decide_visible_output(user_role: str) -> str:
+    return "admin panel" if user_role == "admin" else "basic panel"
+""".strip(),
+        encoding="utf-8",
+    )
+
+    output_path = tmp_path / "report.db"
+    cache_path = tmp_path / "labels.db"
+    index_dir = tmp_path / "semantic"
+    monkeypatch.setattr(cli, "OpenAICompatibleClient", FakeClient)
+    monkeypatch.setattr(cli, "build_text_embedder", lambda *args, **kwargs: FakeEmbedder())
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "cradle",
+            "analyze",
+            str(tmp_path),
+            "--model",
+            "fake-model",
+            "--api-key",
+            "2508",
+            "--cache-path",
+            str(cache_path),
+            "--output",
+            str(output_path),
+            "--max-parallel-requests",
+            "1",
+            "--max-tokens",
+            "120",
+            "--thinking-budget",
+            "0",
+            "--max-files",
+            "1",
+        ],
+    )
+    assert cli.main() == 0
+    capsys.readouterr()
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "cradle",
+            "semantic-index",
+            str(output_path),
+            "--model",
+            "fake-embedder",
+            "--output-dir",
+            str(index_dir),
+        ],
+    )
+    assert cli.main() == 0
+    capsys.readouterr()
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "cradle",
+            "question",
+            str(output_path),
+            "where does the system decide what to show the user",
+            "--index-dir",
+            str(index_dir),
+        ],
+    )
+    exit_code = cli.main()
+    captured = capsys.readouterr()
+
+    assert exit_code == 0
+    assert "src/presentation/render.py" in captured.out
+    assert "decide_visible_output" in captured.out
+
+
+def test_cli_visualize_focus_writes_symbol_neighborhood(tmp_path, monkeypatch, capsys):
+    auth_dir = tmp_path / "src" / "auth"
+    shared_dir = tmp_path / "src" / "shared"
+    auth_dir.mkdir(parents=True)
+    shared_dir.mkdir(parents=True)
+
+    (shared_dir / "crypto.py").write_text(
+        """
+def verify_sig(token: str) -> bool:
+    return token.startswith("sig-")
+""".strip(),
+        encoding="utf-8",
+    )
+    (auth_dir / "middleware.py").write_text(
+        """
+from src.shared.crypto import verify_sig
+
+
+def verify_token(token: str) -> bool:
+    return verify_sig(token)
+""".strip(),
+        encoding="utf-8",
+    )
+
+    output_path = tmp_path / "report.db"
+    cache_path = tmp_path / "labels.db"
+    report_path = tmp_path / "focus.md"
+    monkeypatch.setattr(cli, "OpenAICompatibleClient", FakeClient)
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "cradle",
+            "analyze",
+            str(tmp_path),
+            "--model",
+            "fake-model",
+            "--api-key",
+            "2508",
+            "--cache-path",
+            str(cache_path),
+            "--output",
+            str(output_path),
+            "--max-parallel-requests",
+            "1",
+            "--max-tokens",
+            "120",
+            "--thinking-budget",
+            "0",
+            "--max-files",
+            "2",
+        ],
+    )
+    assert cli.main() == 0
+    capsys.readouterr()
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "cradle",
+            "visualize-focus",
+            str(output_path),
+            "verify_sig",
+            "--kind",
+            "symbol",
+            "--output",
+            str(report_path),
+        ],
+    )
+    exit_code = cli.main()
+    captured = capsys.readouterr()
+    report = report_path.read_text(encoding="utf-8")
+
+    assert exit_code == 0
+    assert f"focus_visualization: {report_path}" in captured.out
+    assert "## Symbol: `verify_sig`" in report
+    assert "### Called By" in report
+    assert "```mermaid" in report

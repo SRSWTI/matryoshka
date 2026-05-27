@@ -123,3 +123,24 @@ export function findEnvKeys(provider: string): string[] | undefined {
     export_edge = next(edge for edge in declaration_result.import_edges if edge.imported_module == "./dist/bedrock-provider.js")
     assert export_edge.line_range is not None
     assert export_edge.line_range.start_line == 1
+
+
+def test_extract_typescript_compacts_variable_function_signatures(tmp_path):
+    file_path = tmp_path / "providers.ts"
+    file_path.write_text(
+        """
+export const streamBedrock = (
+  model: string,
+  context: string,
+) => {
+  const output = { role: "assistant" };
+  return `${model}:${context}:${output.role}`;
+};
+""".strip(),
+        encoding="utf-8",
+    )
+
+    result = extract_file(file_path, repo_root=tmp_path)
+
+    symbol = next(symbol for symbol in result.symbols if symbol.name == "streamBedrock")
+    assert symbol.signature == 'streamBedrock = ( model: string, context: string, ) => { ... }'
