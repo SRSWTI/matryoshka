@@ -3,11 +3,141 @@
 
 ---
 
+## Current Status
+
+This document started as the target architecture. The project now has a real working foundation for code extraction, graph storage, deterministic retrieval, and SQLite-backed inspection. The embedding layer and Matryoshka routing are still next.
+
+### What Is Implemented Now
+
+- Tree-sitter extraction for Python and TypeScript
+- Symbol extraction with line/column ranges
+- Import extraction with internal vs external classification
+- Call-site extraction and symbol reference extraction
+- SQLite graph storage instead of JSON output
+- Repo, folder, file, symbol, import, call, reference, context, and edge tables
+- LLM-generated summaries, descriptions, tags, and categories persisted into the graph
+- Deterministic retrieval over the SQLite DB
+- DB visualization report with schema and sample stored rows
+
+### Why We Implemented This First
+
+We implemented the graph and SQLite layer before embeddings because this gives us a stable source of truth for the codebase.
+
+- AST extraction gives grounded structural facts instead of guessing from raw text
+- SQLite makes the index inspectable, queryable, and easy to debug
+- calls, imports, references, and node context make retrieval useful for real coding questions
+- summaries/tags/categories make the graph understandable to humans and usable for later ranking
+- deterministic retrieval gives immediate value before the embedding layer is ready
+
+This means the next embedding system will not be built on vague chunks. It will be built on real files, symbols, edges, and metadata that already exist.
+
+### Current Storage Shape
+
+Current analysis output is a SQLite graph with these main tables:
+
+- `repos`
+- `nodes`
+- `node_categories`
+- `node_tags`
+- `symbols`
+- `imports`
+- `call_sites`
+- `symbol_references`
+- `references`
+- `node_context`
+- `edges`
+
+These tables were chosen so we can support both kinds of future access:
+
+- semantic lookup later through embeddings
+- exact lookup now through graph and metadata queries
+
+Examples:
+
+- `nodes` stores file/folder/repo level metadata
+- `symbols` stores exact symbol identities and positions
+- `imports`, `call_sites`, and `symbol_references` store navigational relationships
+- `node_context` stores inherited internal context from neighboring files
+- `edges` gives a generic graph surface for visualization and future traversal
+
+### Current Retrieval Shape
+
+Current retrieval is not embedding-based yet. It is a practical hybrid of:
+
+- exact and fuzzy symbol/name/path matching
+- FTS-backed node and symbol lookup
+- tag/category matches
+- call/reference expansion for intent like `who calls X`
+- node context inheritance from internal imports
+
+This was implemented first because it solves real coding-session queries immediately:
+
+- exact symbol lookup
+- implementation lookup
+- caller/callee lookup
+- import/module lookup
+- file/folder metadata lookup
+
+This is useful now, and it also defines the exact entities that the embedding layer should later rank.
+
+### What This Gives Us Right Now
+
+The current system is already useful for:
+
+- finding the file that implements a concept
+- finding what calls a symbol
+- finding what a symbol depends on
+- inspecting stored metadata directly in SQLite
+- building exact `axe_*` lookup tools on top of the DB
+
+It is not yet the final semantic search system, but it is already the correct base layer for it.
+
+### Real Example Shape
+
+The current implementation has already been exercised on `/Users/rohit/pi/packages/ai` and stored in `/tmp/pi-ai-cradle-index.db`.
+
+That run shows the storage model is already large enough and structured enough to support the next phase:
+
+- 142 nodes
+- 1065 symbols
+- 615 imports
+- 2767 call sites
+- 3657 references
+- 430 node-context rows
+- 3523 edges
+
+The current implementation can already answer queries like:
+
+- `getEnvApiKey` resolves to `src/env-api-keys.ts`
+- `streamBedrock` resolves to `src/providers/amazon-bedrock.ts`
+- `who calls getEnvApiKey` surfaces real caller files like `test/cross-provider-handoff.test.ts`
+- `where is oauth authentication handled` surfaces `src/utils/oauth` and related files
+
+The current visualization layer can already show:
+
+- table counts
+- top files/folders/symbols
+- actual SQL schema per table
+- sample stored rows from the live DB
+
+### What Is Not Implemented Yet
+
+- embedding generation and storage
+- Matryoshka multi-resolution retrieval
+- Louvain/K-means based retrieval routing
+- hybrid embedding + graph reranking
+- specialized `axe_*` query tools over the DB
+- incremental re-indexing and watchdog flow
+
+---
+
 ## What Is Cradle?
 
 Cradle is a local, in-process code intelligence system that lets a developer ask natural language questions about a codebase and get deterministic, semantically precise answers — without an LLM agent grepping files, without token-bloated context windows, and without a remote server.
 
 The core idea: **index bottom-up, retrieve top-down.**
+
+Today, the bottom-up indexing and graph persistence pieces are real. The top-down semantic embedding path is the next layer to build.
 
 During pre-warming, Cradle builds a nested semantic index of the entire codebase — from raw AST symbols at the bottom, up through files, modules, folders, and the full repository — using graph community detection, Matryoshka embeddings, and call graph analysis. The result is a self-describing map of the codebase that the code itself drew.
 
@@ -382,24 +512,21 @@ Index is incremental — only re-indexes changed files and propagates changes up
 ## CLI Interface
 
 ```bash
-# Pre-warm (index a codebase)
-cradle index ./my-repo
+# Analyze a codebase into SQLite
+cradle analyze ./my-repo --model <model> --output ./my-repo/.cradle/index.db
 
-# Query
+# Current retrieval
+cradle retrieve ./my-repo/.cradle/index.db "where is auth handled"
+cradle retrieve ./my-repo/.cradle/index.db "who calls processPayment"
+
+# Current DB inspection
+cradle visualize-db ./my-repo/.cradle/index.db --output ./.cradle/db-report.md
+
+# Planned later
 cradle search "where does auth work"
-cradle search "what calls processPayment"
-cradle search "what does UserService depend on"
-
-# Inspect a specific symbol
 cradle inspect src/auth/middleware.py::verifyToken
-
-# Show call graph for a symbol
 cradle graph src/auth/middleware.py::verifyToken --depth 2
-
-# Re-index changed files only
 cradle reindex ./my-repo
-
-# Show cluster map (the doll structure)
 cradle map ./my-repo
 ```
 
@@ -435,18 +562,19 @@ cradle map ./my-repo
 
 ## Build Order
 
-1. **tree-sitter AST extractor** — symbol table + import edges for Python and TypeScript
-2. **Call graph resolver** — cross-file edge resolution
-3. **Import signature index** — external package co-occurrence matrix
-4. **Louvain pass** — community detection at all levels
-5. **K-Means centroid builder** — per module/folder/repo node
-6. **Embedding model fine-tuning** — Matryoshka on COIR datasets
-7. **BM25 symbol indexer**
-8. **Index store serializer** — write all of the above to disk
-9. **Top-down retriever** — query traversal pipeline
-10. **Hybrid merge + reranker**
-11. **CLI**
-12. **Incremental re-indexer**
+1. **tree-sitter AST extractor** — done
+2. **Call graph resolver** — done
+3. **SQLite graph store** — done
+4. **LLM summaries/tags/categories persisted in DB** — done
+5. **Deterministic retrieval over graph DB** — done
+6. **DB visualization and inspection reports** — done
+7. **Exact/structured `axe_*` DB tools** — next
+8. **Embedding model selection and storage schema** — next
+9. **Matryoshka embedding generation for nodes/symbols** — next
+10. **Embedding-based `axe_semantic_search`** — next
+11. **Hybrid semantic + exact reranking** — later
+12. **Louvain/K-means centroid routing** — later
+13. **Incremental re-indexer / watchdog** — later
 
 ---
 
