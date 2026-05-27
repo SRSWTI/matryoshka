@@ -1,0 +1,110 @@
+erDiagram
+
+    REPOS {
+        text        id                          PK
+        text        name
+        text        root_path
+        text        language_json
+        text        summary
+        text        category
+        text        tags_json
+        text        content_hash
+        text        indexed_at
+        text        updated_at
+    }
+
+    NODES {
+        integer     id                          PK
+        text        repo_id                     FK
+        text        path
+        text        kind
+        text        parent_path                 FK
+        text        name
+        text        normalized_name
+        text        language
+        text        summary
+        text        category
+        text        tags_json
+        text        top_child_categories_json
+        text        top_dependency_tags_json
+        real        confidence
+        integer     symbol_count
+        integer     import_count
+        text        content_hash
+        integer     start_line
+        integer     end_line
+        text        updated_at
+    }
+
+    SYMBOLS {
+        integer     id                          PK
+        text        repo_id                     FK
+        text        symbol_key
+        text        file_path                   FK
+        text        name
+        text        normalized_name
+        text        kind
+        text        signature
+        text        category
+        text        summary
+        text        tags_json
+        integer     start_line
+        integer     end_line
+        integer     start_col
+        integer     end_col
+        text        updated_at
+    }
+
+    EDGES {
+        integer     id                          PK
+        text        repo_id                     FK
+        text        from_id
+        text        to_id
+        text        edge_type
+        text        strength
+        integer     from_line
+        integer     to_line
+        text        detail
+        text        updated_at
+    }
+
+    REFERENCES {
+        integer     id                          PK
+        text        repo_id                     FK
+        text        symbol_key                  FK
+        text        ref_path                    FK
+        integer     ref_line
+        integer     ref_col
+        text        ref_kind
+        text        context
+        text        updated_at
+    }
+
+    NODE_CONTEXT {
+        integer     id                          PK
+        text        repo_id                     FK
+        text        node_path                   FK
+        text        source_path                 FK
+        text        relation
+        text        inherited_summary
+        text        inherited_tags_json
+        text        inherited_category
+        real        weight
+        text        updated_at
+    }
+
+    REPOS ||--o{ NODES          : "id → repo_id"
+    REPOS ||--o{ SYMBOLS        : "id → repo_id"
+    REPOS ||--o{ EDGES          : "id → repo_id"
+    REPOS ||--o{ REFERENCES     : "id → repo_id"
+    REPOS ||--o{ NODE_CONTEXT   : "id → repo_id"
+
+    NODES ||--o{ NODES          : "parent_path → path (tree)"
+    NODES ||--o{ SYMBOLS        : "path → file_path (owns symbols)"
+    NODES ||--o{ EDGES          : "path → from_id or to_id"
+    NODES ||--o{ NODE_CONTEXT   : "path → node_path (self context)"
+    NODES ||--o{ NODE_CONTEXT   : "path → source_path (imported source)"
+    NODES ||--o{ REFERENCES     : "path → ref_path (referenced in file)"
+
+    SYMBOLS ||--o{ EDGES        : "symbol_key → from_id or to_id"
+    SYMBOLS ||--o{ REFERENCES   : "symbol_key → symbol_key (usages)"

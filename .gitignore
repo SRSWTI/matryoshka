@@ -1,0 +1,25 @@
+.venv/
+
+# Python caches
+__pycache__/
+*.py[cod]
+
+# Test and coverage output
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Type checker / linter caches
+.mypy_cache/
+.ruff_cache/
+
+# Packaging artifacts
+build/
+dist/
+*.egg-info/
+
+# Local analysis output
+.cradle/
+
+# OS files
+.DS_Store
