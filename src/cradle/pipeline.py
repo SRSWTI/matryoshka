@@ -7,6 +7,8 @@ from hashlib import sha256
 from pathlib import Path
 from typing import Callable, Iterable
 
+from pathspec import GitIgnoreSpec
+
 from cradle.ast_extractor import FileExtraction, SymbolRecord, extract_file
 from cradle.community_detection import build_louvain_communities
 from cradle.graph_builder import RepositoryGraphBuilder
@@ -20,6 +22,7 @@ class PipelineConfig:
     include_suffixes: tuple[str, ...] = (".py", ".ts", ".tsx")
     excluded_suffixes: tuple[str, ...] = ()
     excluded_paths: tuple[str, ...] = ()
+    honor_gitignore: bool = True
     ignored_directories: tuple[str, ...] = (
         ".git",
         ".venv",
@@ -27,6 +30,8 @@ class PipelineConfig:
         "node_modules",
         "dist",
         "build",
+        "test",
+        "tests",
         "__pycache__",
         ".pytest_cache",
     )
@@ -50,15 +55,19 @@ class RepositoryWalker:
 
     def collect_source_files(self, repo_root: str | Path) -> list[Path]:
         root = Path(repo_root)
+        gitignore_spec = _load_gitignore_spec(root) if self._config.honor_gitignore else None
         files: list[Path] = []
         for path in root.rglob("*"):
             if path.is_dir():
                 continue
+            relative_path = path.relative_to(root).as_posix()
             if path.suffix.lower() not in self._config.include_suffixes:
                 continue
             if path.suffix.lower() in self._config.excluded_suffixes:
                 continue
             if any(part in self._config.ignored_directories for part in path.parts):
+                continue
+            if gitignore_spec is not None and gitignore_spec.match_file(relative_path):
                 continue
             if _is_excluded_path(path, root, self._config.excluded_paths):
                 continue
@@ -67,6 +76,14 @@ class RepositoryWalker:
         if self._config.max_files is not None:
             return ordered[: self._config.max_files]
         return ordered
+
+
+def _load_gitignore_spec(repo_root: Path) -> GitIgnoreSpec | None:
+    gitignore_path = repo_root / ".gitignore"
+    if not gitignore_path.exists():
+        return None
+    lines = gitignore_path.read_text(encoding="utf-8").splitlines()
+    return GitIgnoreSpec.from_lines(lines)
 
 
 def _is_excluded_path(path: Path, repo_root: Path, excluded_paths: tuple[str, ...]) -> bool:

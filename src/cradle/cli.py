@@ -169,7 +169,7 @@ def main() -> int:
 def _run_analyze(args: argparse.Namespace) -> int:
     _configure_logging(args.log_level)
     repo_root = Path(args.repo_root)
-    output_path = Path(args.output) if args.output else repo_root / ".cradle" / "index.db"
+    output_path = Path(args.output) if args.output else _default_analysis_db_path(repo_root)
     cache_path = Path(args.cache_path) if args.cache_path else output_path
     cache = LabelCache(cache_path)
     client = OpenAICompatibleClient(
@@ -338,6 +338,10 @@ def _normalize_excluded_suffixes(values: list[str] | tuple[str, ...]) -> tuple[s
         suffix = value if value.startswith(".") else f".{value}"
         normalized.append(suffix.lower())
     return tuple(normalized)
+
+
+def _default_analysis_db_path(repo_root: Path) -> Path:
+    return repo_root / ".cradle" / f"{repo_root.name}.db"
 
 
 def _summarize_semantic_index(summary) -> str:

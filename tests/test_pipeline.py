@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 
 from cradle.labeling import LabelingConfig, LabelingEngine
-from cradle.pipeline import CradlePipeline, PipelineConfig
+from cradle.pipeline import CradlePipeline, PipelineConfig, RepositoryWalker
 
 
 class FakeClient:
@@ -158,3 +158,42 @@ def verify_token(token: str) -> bool:
 
     references = [reference for reference in graph.references if reference.target_name == "verify_sig"]
     assert {reference.reference_kind for reference in references} >= {"call", "import"}
+
+
+def test_repository_walker_ignores_nested_test_directories_by_default(tmp_path):
+    src_dir = tmp_path / "src"
+    src_dir.mkdir(parents=True)
+    (src_dir / "keep.py").write_text("def keep() -> bool:\n    return True\n", encoding="utf-8")
+
+    nested_tests_dir = tmp_path / "packages" / "feature" / "tests"
+    nested_tests_dir.mkdir(parents=True)
+    (nested_tests_dir / "test_feature.py").write_text("def test_feature() -> None:\n    assert True\n", encoding="utf-8")
+
+    nested_test_dir = tmp_path / "pkg" / "test"
+    nested_test_dir.mkdir(parents=True)
+    (nested_test_dir / "test_other.py").write_text("def test_other() -> None:\n    assert True\n", encoding="utf-8")
+
+    walker = RepositoryWalker(PipelineConfig())
+
+    files = [path.relative_to(tmp_path).as_posix() for path in walker.collect_source_files(tmp_path)]
+
+    assert files == ["src/keep.py"]
+
+
+def test_repository_walker_honors_root_gitignore(tmp_path):
+    src_dir = tmp_path / "src"
+    src_dir.mkdir(parents=True)
+    (src_dir / "keep.py").write_text("def keep() -> bool:\n    return True\n", encoding="utf-8")
+
+    generated_dir = tmp_path / "generated"
+    generated_dir.mkdir(parents=True)
+    (generated_dir / "skip.py").write_text("def skip() -> bool:\n    return False\n", encoding="utf-8")
+
+    (tmp_path / ".gitignore").write_text("generated/\nignored.py\n", encoding="utf-8")
+    (tmp_path / "ignored.py").write_text("def ignored() -> None:\n    return None\n", encoding="utf-8")
+
+    walker = RepositoryWalker(PipelineConfig())
+
+    files = [path.relative_to(tmp_path).as_posix() for path in walker.collect_source_files(tmp_path)]
+
+    assert files == ["src/keep.py"]

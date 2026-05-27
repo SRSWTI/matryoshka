@@ -207,6 +207,52 @@ export function skipMe(): boolean {
     assert paths == {"src/keep.py"}
 
 
+def test_cli_analyze_uses_repo_named_default_db_path(tmp_path, monkeypatch, capsys):
+    src_dir = tmp_path / "src"
+    src_dir.mkdir(parents=True)
+    (src_dir / "main.py").write_text(
+        """
+def run() -> None:
+    return None
+""".strip(),
+        encoding="utf-8",
+    )
+
+    cache_path = tmp_path / "labels.db"
+    expected_db_path = tmp_path / ".cradle" / f"{tmp_path.name}.db"
+    monkeypatch.setattr(cli, "OpenAICompatibleClient", FakeClient)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "cradle",
+            "analyze",
+            str(tmp_path),
+            "--model",
+            "fake-model",
+            "--api-key",
+            "2508",
+            "--cache-path",
+            str(cache_path),
+            "--max-parallel-requests",
+            "1",
+            "--max-tokens",
+            "120",
+            "--thinking-budget",
+            "0",
+            "--max-files",
+            "1",
+        ],
+    )
+
+    exit_code = cli.main()
+    captured = capsys.readouterr()
+
+    assert exit_code == 0
+    assert expected_db_path.exists()
+    assert f"database: {expected_db_path}" in captured.out
+
+
 def test_cli_visualize_db_writes_markdown_report(tmp_path, monkeypatch, capsys):
     auth_dir = tmp_path / "src" / "auth"
     auth_dir.mkdir(parents=True)
