@@ -131,6 +131,82 @@ def verify_token(token: str) -> bool:
     assert repo_summary
 
 
+def test_cli_analyze_excludes_paths_and_extensions(tmp_path, monkeypatch, capsys):
+    src_dir = tmp_path / "src"
+    src_dir.mkdir(parents=True)
+    (src_dir / "keep.py").write_text(
+        """
+def keep_me() -> bool:
+    return True
+""".strip(),
+        encoding="utf-8",
+    )
+
+    excluded_dir = tmp_path / "tests"
+    excluded_dir.mkdir(parents=True)
+    (excluded_dir / "test_keep.py").write_text(
+        """
+def test_keep_me() -> None:
+    assert True
+""".strip(),
+        encoding="utf-8",
+    )
+
+    (src_dir / "skip.ts").write_text(
+        """
+export function skipMe(): boolean {
+  return true;
+}
+""".strip(),
+        encoding="utf-8",
+    )
+
+    output_path = tmp_path / "report.db"
+    cache_path = tmp_path / "labels.db"
+    monkeypatch.setattr(cli, "OpenAICompatibleClient", FakeClient)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "cradle",
+            "analyze",
+            str(tmp_path),
+            "--model",
+            "fake-model",
+            "--api-key",
+            "2508",
+            "--cache-path",
+            str(cache_path),
+            "--output",
+            str(output_path),
+            "--max-parallel-requests",
+            "1",
+            "--max-tokens",
+            "120",
+            "--thinking-budget",
+            "0",
+            "--exclude-path",
+            "tests",
+            "--exclude-extension",
+            ".ts",
+        ],
+    )
+
+    exit_code = cli.main()
+    captured = capsys.readouterr()
+
+    conn = sqlite3.connect(output_path)
+    paths = {
+        row[0]
+        for row in conn.execute("SELECT path FROM nodes WHERE kind = 'file'").fetchall()
+    }
+    conn.close()
+
+    assert exit_code == 0
+    assert "progress: collected 1 source files" in captured.out
+    assert paths == {"src/keep.py"}
+
+
 def test_cli_visualize_db_writes_markdown_report(tmp_path, monkeypatch, capsys):
     auth_dir = tmp_path / "src" / "auth"
     auth_dir.mkdir(parents=True)

@@ -39,6 +39,8 @@ def main() -> int:
     analyze_parser.add_argument("--temperature", type=float, default=0.0)
     analyze_parser.add_argument("--thinking-budget", type=int, default=0)
     analyze_parser.add_argument("--max-files", type=int, default=None)
+    analyze_parser.add_argument("--exclude-path", action="append", default=None)
+    analyze_parser.add_argument("--exclude-extension", action="append", default=None)
 
     retrieve_parser = subparsers.add_parser("retrieve")
     retrieve_parser.add_argument("db_path")
@@ -180,7 +182,14 @@ def _run_analyze(args: argparse.Namespace) -> int:
         )
     )
     engine = LabelingEngine(client, LabelingConfig(temperature=args.temperature, max_tokens=args.max_tokens), cache=cache)
-    pipeline = CradlePipeline(config=PipelineConfig(max_files=args.max_files), labeling_engine=engine)
+    pipeline = CradlePipeline(
+        config=PipelineConfig(
+            max_files=args.max_files,
+            excluded_paths=tuple(args.exclude_path or ()),
+            excluded_suffixes=_normalize_excluded_suffixes(args.exclude_extension or ()),
+        ),
+        labeling_engine=engine,
+    )
     graph = pipeline.analyze(repo_root, progress=lambda message: print(f"progress: {message}", flush=True))
     database = CradleDatabase(output_path)
     summary = database.replace_graph(graph)
@@ -319,6 +328,16 @@ def _summarize_result(summary, output_path: Path) -> str:
             f"repo_categories: {repo_categories}",
         ]
     )
+
+
+def _normalize_excluded_suffixes(values: list[str] | tuple[str, ...]) -> tuple[str, ...]:
+    normalized: list[str] = []
+    for value in values:
+        if not value:
+            continue
+        suffix = value if value.startswith(".") else f".{value}"
+        normalized.append(suffix.lower())
+    return tuple(normalized)
 
 
 def _summarize_semantic_index(summary) -> str:

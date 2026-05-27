@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections import Counter, defaultdict
 from dataclasses import dataclass
+from fnmatch import fnmatch
 from hashlib import sha256
 from pathlib import Path
 from typing import Callable, Iterable
@@ -17,6 +18,8 @@ from cradle.models import AnalyzedFile, FilePacket, LabelResult, NodePacket
 @dataclass(slots=True)
 class PipelineConfig:
     include_suffixes: tuple[str, ...] = (".py", ".ts", ".tsx")
+    excluded_suffixes: tuple[str, ...] = ()
+    excluded_paths: tuple[str, ...] = ()
     ignored_directories: tuple[str, ...] = (
         ".git",
         ".venv",
@@ -53,13 +56,38 @@ class RepositoryWalker:
                 continue
             if path.suffix.lower() not in self._config.include_suffixes:
                 continue
+            if path.suffix.lower() in self._config.excluded_suffixes:
+                continue
             if any(part in self._config.ignored_directories for part in path.parts):
+                continue
+            if _is_excluded_path(path, root, self._config.excluded_paths):
                 continue
             files.append(path)
         ordered = sorted(files)
         if self._config.max_files is not None:
             return ordered[: self._config.max_files]
         return ordered
+
+
+def _is_excluded_path(path: Path, repo_root: Path, excluded_paths: tuple[str, ...]) -> bool:
+    if not excluded_paths:
+        return False
+    relative_path = path.relative_to(repo_root).as_posix()
+    parts = Path(relative_path).parts
+    for raw_pattern in excluded_paths:
+        pattern = raw_pattern.strip().strip("/")
+        if not pattern:
+            continue
+        if any(token in pattern for token in "*?[]"):
+            if fnmatch(relative_path, pattern) or fnmatch(path.name, pattern):
+                return True
+            continue
+        normalized = Path(pattern).as_posix().strip("/")
+        if relative_path == normalized or relative_path.startswith(f"{normalized}/"):
+            return True
+        if normalized in parts:
+            return True
+    return False
 
 
 class FilePacketBuilder:
