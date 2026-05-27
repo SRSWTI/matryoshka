@@ -52,6 +52,7 @@ class CradleDatabase:
             DROP TABLE IF EXISTS call_sites;
             DROP TABLE IF EXISTS imports;
             DROP TABLE IF EXISTS node_context;
+            DROP TABLE IF EXISTS community_members;
             DROP TABLE IF EXISTS symbols;
             DROP TABLE IF EXISTS node_tags;
             DROP TABLE IF EXISTS node_categories;
@@ -226,6 +227,16 @@ class CradleDatabase:
                 updated_at TEXT NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS community_members (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                repo_id TEXT NOT NULL,
+                community_node_id TEXT NOT NULL,
+                member_node_id TEXT NOT NULL,
+                membership_rank INTEGER NOT NULL,
+                membership_weight REAL NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS edges (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 repo_id TEXT NOT NULL,
@@ -265,6 +276,8 @@ class CradleDatabase:
             CREATE INDEX IF NOT EXISTS idx_context_node ON node_context(node_id);
             CREATE INDEX IF NOT EXISTS idx_context_source ON node_context(source_node_id);
             CREATE INDEX IF NOT EXISTS idx_context_repo ON node_context(repo_id);
+            CREATE INDEX IF NOT EXISTS idx_community_members_community ON community_members(community_node_id, membership_rank);
+            CREATE INDEX IF NOT EXISTS idx_community_members_member ON community_members(member_node_id);
             CREATE INDEX IF NOT EXISTS idx_edges_repo ON edges(repo_id);
             CREATE INDEX IF NOT EXISTS idx_edges_from ON edges(from_id, edge_type);
             CREATE INDEX IF NOT EXISTS idx_edges_to ON edges(to_id, edge_type);
@@ -310,6 +323,7 @@ class CradleDatabase:
             "DELETE FROM edges",
             "DELETE FROM \"references\"",
             "DELETE FROM node_context",
+            "DELETE FROM community_members",
             "DELETE FROM symbol_references",
             "DELETE FROM call_sites",
             "DELETE FROM imports",
@@ -588,6 +602,25 @@ class CradleDatabase:
             ],
         )
 
+        conn.executemany(
+            """
+            INSERT INTO community_members(
+                repo_id, community_node_id, member_node_id, membership_rank, membership_weight, updated_at
+            ) VALUES(?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    repo_id,
+                    record.community_node_id,
+                    record.member_node_id,
+                    record.membership_rank,
+                    record.membership_weight,
+                    timestamp,
+                )
+                for record in graph.community_members
+            ],
+        )
+
         edge_rows: list[tuple[str, str, str, str, str, int | None, int | None, str | None, str]] = []
         for node in graph.nodes:
             if node.parent_id is None:
@@ -620,6 +653,21 @@ class CradleDatabase:
                     record.start_line,
                     symbol_start_lines.get(record.target_symbol_id),
                     _json({"callee_name": record.callee_name, "target_node_id": record.target_node_id, "caller_node_id": record.caller_node_id}),
+                    timestamp,
+                )
+            )
+
+        for record in graph.community_members:
+            edge_rows.append(
+                (
+                    repo_id,
+                    record.community_node_id,
+                    record.member_node_id,
+                    "community_member",
+                    "structural",
+                    None,
+                    None,
+                    _json({"membership_rank": record.membership_rank, "membership_weight": record.membership_weight}),
                     timestamp,
                 )
             )

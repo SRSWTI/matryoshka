@@ -3,8 +3,10 @@ from __future__ import annotations
 import json
 import logging
 import sqlite3
+from collections import defaultdict
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
+from math import isqrt
 from pathlib import Path
 
 import numpy as np
@@ -13,7 +15,7 @@ from cradle.embeddings import DEFAULT_QUERY_TASK, TextEmbedder, format_document_
 
 logger = logging.getLogger(__name__)
 
-MANIFEST_VERSION = 1
+MANIFEST_VERSION = 2
 
 
 @dataclass(slots=True)
@@ -27,6 +29,16 @@ class SemanticRecord:
 
 
 @dataclass(slots=True)
+class NodeCentroidRecord:
+    centroid_id: str
+    parent_id: str
+    member_ids: list[str]
+    representative_ids: list[str]
+    title: str
+    content: str
+
+
+@dataclass(slots=True)
 class SemanticIndexConfig:
     output_dir: Path | None = None
     default_query_task: str = DEFAULT_QUERY_TASK
@@ -37,6 +49,10 @@ class SemanticIndexConfig:
     max_callers: int = 8
     max_callees: int = 8
     max_references: int = 8
+    min_centroid_children: int = 4
+    max_centroids_per_parent: int = 4
+    centroid_iterations: int = 10
+    centroid_preview_members: int = 6
 
 
 @dataclass(slots=True)
@@ -46,6 +62,7 @@ class SemanticIndexSummary:
     dimension: int
     node_count: int
     symbol_count: int
+    centroid_count: int
     engine: str
 
 
@@ -61,6 +78,7 @@ class SemanticIndexManifest:
     built_at: str
     node_count: int
     symbol_count: int
+    centroid_count: int
 
 
 class SemanticIndexPaths:
@@ -73,6 +91,8 @@ class SemanticIndexPaths:
         self.symbol_records_path = self.root_dir / "symbols.records.json"
         self.symbol_vectors_path = self.root_dir / "symbols.vectors.npy"
         self.symbol_index_path = self.root_dir / "symbols.faiss"
+        self.centroid_records_path = self.root_dir / "node_centroids.records.json"
+        self.centroid_vectors_path = self.root_dir / "node_centroids.vectors.npy"
 
 
 class SemanticIndexBuilder:
@@ -91,12 +111,22 @@ class SemanticIndexBuilder:
             db_updated_at = _db_updated_at(conn)
             node_records = _load_node_records(conn, self._config)
             symbol_records = _load_symbol_records(conn, self._config)
+            child_map = _load_rollup_child_map(conn)
 
         self._paths.root_dir.mkdir(parents=True, exist_ok=True)
 
         node_vectors = self._embed_records(node_records)
         symbol_vectors = self._embed_records(symbol_records)
-        engine = _write_vector_artifacts(self._paths, node_records, node_vectors, symbol_records, symbol_vectors)
+        centroid_records, centroid_vectors = _build_node_centroid_records(node_records, node_vectors, child_map, self._config)
+        engine = _write_vector_artifacts(
+            self._paths,
+            node_records,
+            node_vectors,
+            symbol_records,
+            symbol_vectors,
+            centroid_records,
+            centroid_vectors,
+        )
 
         manifest = SemanticIndexManifest(
             version=MANIFEST_VERSION,
@@ -109,13 +139,15 @@ class SemanticIndexBuilder:
             built_at=_utc_now(),
             node_count=len(node_records),
             symbol_count=len(symbol_records),
+            centroid_count=len(centroid_records),
         )
         self._paths.manifest_path.write_text(json.dumps(asdict(manifest), indent=2, sort_keys=True), encoding="utf-8")
         logger.info(
-            "built semantic index at %s: %s nodes, %s symbols, %s-dim via %s",
+            "built semantic index at %s: %s nodes, %s symbols, %s centroids, %s-dim via %s",
             self._paths.root_dir,
             len(node_records),
             len(symbol_records),
+            len(centroid_records),
             self._embedder.dimension,
             engine,
         )
@@ -125,6 +157,7 @@ class SemanticIndexBuilder:
             dimension=self._embedder.dimension,
             node_count=len(node_records),
             symbol_count=len(symbol_records),
+            centroid_count=len(centroid_records),
             engine=engine,
         )
 
@@ -144,10 +177,20 @@ class SemanticIndexStore:
         self.manifest = load_semantic_manifest(self._db_path, index_dir=index_dir)
         self.node_records = _load_records(self._paths.node_records_path)
         self.symbol_records = _load_records(self._paths.symbol_records_path)
+        self.centroid_records = _load_centroid_records(self._paths.centroid_records_path)
         self._node_positions = {record.entity_id: index for index, record in enumerate(self.node_records)}
         self._symbol_positions = {record.entity_id: index for index, record in enumerate(self.symbol_records)}
+        self._centroid_positions = {record.centroid_id: index for index, record in enumerate(self.centroid_records)}
+        self._centroid_ids_by_parent: dict[str, list[str]] = defaultdict(list)
+        for record in self.centroid_records:
+            self._centroid_ids_by_parent[record.parent_id].append(record.centroid_id)
         self._node_vectors = np.load(self._paths.node_vectors_path).astype(np.float32)
         self._symbol_vectors = np.load(self._paths.symbol_vectors_path).astype(np.float32)
+        self._centroid_vectors = (
+            np.load(self._paths.centroid_vectors_path).astype(np.float32)
+            if self._paths.centroid_vectors_path.exists()
+            else np.zeros((0, self.dimension), dtype=np.float32)
+        )
         self._node_index = _load_faiss_index(self._paths.node_index_path)
         self._symbol_index = _load_faiss_index(self._paths.symbol_index_path)
 
@@ -174,6 +217,18 @@ class SemanticIndexStore:
 
     def search_symbol_subset(self, query_vector: np.ndarray, symbol_ids: list[str], *, top_k: int) -> list[tuple[str, float]]:
         return self._search_subset(self._symbol_vectors, self.symbol_records, self._symbol_positions, query_vector, symbol_ids, top_k)
+
+    def search_node_centroids(self, query_vector: np.ndarray, parent_ids: list[str], *, top_k: int) -> list[tuple[str, float]]:
+        centroid_ids: list[str] = []
+        for parent_id in dict.fromkeys(parent_ids):
+            centroid_ids.extend(self._centroid_ids_by_parent.get(parent_id, []))
+        return self._search_centroid_subset(query_vector, centroid_ids, top_k)
+
+    def centroid_member_ids(self, centroid_id: str) -> list[str]:
+        position = self._centroid_positions.get(centroid_id)
+        if position is None:
+            return []
+        return list(self.centroid_records[position].member_ids)
 
     def _search(
         self,
@@ -222,6 +277,20 @@ class SemanticIndexStore:
         ranking = np.argsort(-scores)[: min(top_k, len(unique_positions))]
         return [(records[unique_positions[index]].entity_id, float(scores[index])) for index in ranking]
 
+    def _search_centroid_subset(self, query_vector: np.ndarray, centroid_ids: list[str], top_k: int) -> list[tuple[str, float]]:
+        if not centroid_ids or top_k <= 0 or self._centroid_vectors.size == 0:
+            return []
+
+        unique_positions = [self._centroid_positions[item_id] for item_id in dict.fromkeys(centroid_ids) if item_id in self._centroid_positions]
+        if not unique_positions:
+            return []
+
+        query = np.asarray(query_vector, dtype=np.float32).reshape(1, -1)
+        subset_vectors = self._centroid_vectors[unique_positions]
+        scores = subset_vectors @ query[0]
+        ranking = np.argsort(-scores)[: min(top_k, len(unique_positions))]
+        return [(self.centroid_records[unique_positions[index]].centroid_id, float(scores[index])) for index in ranking]
+
 
 def default_semantic_index_dir(db_path: str | Path, output_dir: str | Path | None = None) -> Path:
     if output_dir is not None:
@@ -247,11 +316,15 @@ def _write_vector_artifacts(
     node_vectors: np.ndarray,
     symbol_records: list[SemanticRecord],
     symbol_vectors: np.ndarray,
+    centroid_records: list[NodeCentroidRecord],
+    centroid_vectors: np.ndarray,
 ) -> str:
     paths.node_records_path.write_text(json.dumps([asdict(record) for record in node_records], indent=2), encoding="utf-8")
     paths.symbol_records_path.write_text(json.dumps([asdict(record) for record in symbol_records], indent=2), encoding="utf-8")
+    paths.centroid_records_path.write_text(json.dumps([asdict(record) for record in centroid_records], indent=2), encoding="utf-8")
     np.save(paths.node_vectors_path, node_vectors)
     np.save(paths.symbol_vectors_path, symbol_vectors)
+    np.save(paths.centroid_vectors_path, centroid_vectors)
 
     faiss = _load_faiss()
     if faiss is None:
@@ -269,6 +342,13 @@ def _write_vector_artifacts(
 def _load_records(path: Path) -> list[SemanticRecord]:
     payload = json.loads(path.read_text(encoding="utf-8"))
     return [SemanticRecord(**item) for item in payload]
+
+
+def _load_centroid_records(path: Path) -> list[NodeCentroidRecord]:
+    if not path.exists():
+        return []
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    return [NodeCentroidRecord(**item) for item in payload]
 
 
 def _load_faiss():
@@ -301,6 +381,7 @@ def _load_node_records(conn: sqlite3.Connection, config: SemanticIndexConfig) ->
     import_map = _group_single_values(conn, "SELECT importer_node_id, imported_module FROM imports ORDER BY start_line, imported_module")
     context_map = _group_pairs(conn, "SELECT node_id, source_path, inherited_summary FROM node_context ORDER BY weight DESC, id")
     child_map = _group_single_values(conn, "SELECT parent_id, name FROM nodes WHERE parent_id IS NOT NULL ORDER BY kind, name")
+    community_member_map = _group_single_values(conn, "SELECT community_node_id, member_node_id FROM community_members ORDER BY membership_rank, member_node_id")
 
     records: list[SemanticRecord] = []
     for row in node_rows:
@@ -340,6 +421,11 @@ def _load_node_records(conn: sqlite3.Connection, config: SemanticIndexConfig) ->
                 lines.append(f"imports: {', '.join(imports[: config.max_imports])}")
             if contexts:
                 lines.append(f"context: {' | '.join(contexts[: config.max_contexts])}")
+        elif row["kind"] == "community":
+            members = community_member_map.get(row["node_id"], [])
+            if members:
+                lines.append(f"members: {', '.join(members[: config.max_child_names])}")
+            lines.append(f"counts: files={row['file_count']} folders={row['folder_count']} symbols={row['symbol_count']}")
         else:
             if children:
                 lines.append(f"children: {', '.join(children[: config.max_child_names])}")
@@ -447,6 +533,122 @@ def _json_list(value: str | None) -> list[str]:
     if not value:
         return []
     return [str(item) for item in json.loads(value)]
+
+
+def _load_rollup_child_map(conn: sqlite3.Connection) -> dict[str, list[str]]:
+    mapping = _group_single_values(conn, "SELECT parent_id, node_id FROM nodes WHERE parent_id IS NOT NULL ORDER BY kind, path")
+    community_mapping = _group_single_values(conn, "SELECT community_node_id, member_node_id FROM community_members ORDER BY membership_rank, member_node_id")
+    for parent_id, member_ids in community_mapping.items():
+        mapping.setdefault(parent_id, []).extend(member_ids)
+        mapping[parent_id] = list(dict.fromkeys(mapping[parent_id]))
+    return mapping
+
+
+def _build_node_centroid_records(
+    node_records: list[SemanticRecord],
+    node_vectors: np.ndarray,
+    child_map: dict[str, list[str]],
+    config: SemanticIndexConfig,
+) -> tuple[list[NodeCentroidRecord], np.ndarray]:
+    positions = {record.entity_id: index for index, record in enumerate(node_records)}
+    records_by_id = {record.entity_id: record for record in node_records}
+    centroid_records: list[NodeCentroidRecord] = []
+    centroid_vectors: list[np.ndarray] = []
+
+    for parent_id, child_ids in sorted(child_map.items()):
+        valid_child_ids = [child_id for child_id in dict.fromkeys(child_ids) if child_id in positions]
+        if len(valid_child_ids) < config.min_centroid_children:
+            continue
+        child_positions = [positions[child_id] for child_id in valid_child_ids]
+        child_vectors = node_vectors[child_positions]
+        centroid_count = min(config.max_centroids_per_parent, max(2, isqrt(len(valid_child_ids))))
+        assignments, centroids = _run_kmeans(child_vectors, centroid_count, config.centroid_iterations)
+        parent_title = records_by_id.get(parent_id).title if parent_id in records_by_id else parent_id
+        for centroid_index in range(len(centroids)):
+            member_indexes = [index for index, assignment in enumerate(assignments) if assignment == centroid_index]
+            if not member_indexes:
+                continue
+            member_ids = [valid_child_ids[index] for index in member_indexes]
+            member_vectors = child_vectors[member_indexes]
+            representative_ids = _representative_member_ids(member_vectors, centroids[centroid_index], member_ids, limit=3)
+            representative_titles = [records_by_id[member_id].title for member_id in representative_ids if member_id in records_by_id]
+            preview_titles = [records_by_id[member_id].title for member_id in member_ids[: config.centroid_preview_members] if member_id in records_by_id]
+            centroid_records.append(
+                NodeCentroidRecord(
+                    centroid_id=f"{parent_id}::centroid::{centroid_index + 1}",
+                    parent_id=parent_id,
+                    member_ids=member_ids,
+                    representative_ids=representative_ids,
+                    title=f"{parent_title} cluster {centroid_index + 1}",
+                    content="\n".join(
+                        [
+                            f"parent: {parent_title}",
+                            f"member_count: {len(member_ids)}",
+                            f"representatives: {', '.join(representative_titles)}",
+                            f"members: {', '.join(preview_titles)}",
+                        ]
+                    ),
+                )
+            )
+            centroid_vectors.append(centroids[centroid_index])
+
+    if not centroid_vectors:
+        empty = np.zeros((0, node_vectors.shape[1]), dtype=np.float32)
+        return centroid_records, empty
+    return centroid_records, np.asarray(centroid_vectors, dtype=np.float32)
+
+
+def _run_kmeans(vectors: np.ndarray, centroid_count: int, iterations: int) -> tuple[np.ndarray, np.ndarray]:
+    if centroid_count >= len(vectors):
+        assignments = np.arange(len(vectors), dtype=np.int32)
+        return assignments, vectors.copy()
+
+    centroids = _initial_centroids(vectors, centroid_count)
+    assignments = np.full(len(vectors), -1, dtype=np.int32)
+    for _ in range(max(iterations, 1)):
+        scores = vectors @ centroids.T
+        next_assignments = np.argmax(scores, axis=1).astype(np.int32)
+        if np.array_equal(assignments, next_assignments):
+            assignments = next_assignments
+            break
+        assignments = next_assignments
+        next_centroids = centroids.copy()
+        for centroid_index in range(len(centroids)):
+            mask = assignments == centroid_index
+            if not np.any(mask):
+                continue
+            centroid = vectors[mask].mean(axis=0)
+            norm = np.linalg.norm(centroid)
+            if norm == 0:
+                continue
+            next_centroids[centroid_index] = centroid / norm
+        centroids = next_centroids
+    return assignments, centroids
+
+
+def _initial_centroids(vectors: np.ndarray, centroid_count: int) -> np.ndarray:
+    selected = [0]
+    while len(selected) < centroid_count:
+        best_index = None
+        best_distance = None
+        for index in range(len(vectors)):
+            if index in selected:
+                continue
+            similarity = max(float(vectors[index] @ vectors[selected_index]) for selected_index in selected)
+            distance = 1.0 - similarity
+            if best_distance is None or distance > best_distance:
+                best_distance = distance
+                best_index = index
+        if best_index is None:
+            break
+        selected.append(best_index)
+    return vectors[selected].copy()
+
+
+def _representative_member_ids(member_vectors: np.ndarray, centroid: np.ndarray, member_ids: list[str], *, limit: int) -> list[str]:
+    scores = member_vectors @ centroid
+    ranking = np.argsort(-scores)[: min(limit, len(member_ids))]
+    return [member_ids[index] for index in ranking]
 
 
 def _utc_now() -> str:

@@ -3,13 +3,14 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import sqlite3
 
 import numpy as np
 
 from cradle.hierarchical_search import axe_hierarchy_search
 from cradle.labeling import LabelingConfig, LabelingEngine
 from cradle.pipeline import CradlePipeline, PipelineConfig
-from cradle.semantic_index import SemanticIndexBuilder
+from cradle.semantic_index import SemanticIndexBuilder, SemanticIndexStore
 from cradle.storage import CradleDatabase
 
 
@@ -116,6 +117,74 @@ class FakeEmbedder:
         norms = np.linalg.norm(vectors, axis=1, keepdims=True)
         norms[norms == 0] = 1.0
         return vectors / norms
+
+
+def _write_phase5_fixture(tmp_path):
+    runtime_dir = tmp_path / "src" / "runtime"
+    tokens_dir = tmp_path / "src" / "tokens"
+    oauth_dir = tmp_path / "src" / "oauth"
+    ui_dir = tmp_path / "src" / "ui"
+    runtime_dir.mkdir(parents=True)
+    tokens_dir.mkdir(parents=True)
+    oauth_dir.mkdir(parents=True)
+    ui_dir.mkdir(parents=True)
+
+    (tokens_dir / "loader.py").write_text(
+        """
+from src.runtime.session import build_session
+
+
+def load_token(token: str) -> str:
+    return build_session(token)
+""".strip(),
+        encoding="utf-8",
+    )
+    (runtime_dir / "session.py").write_text(
+        """
+from src.tokens.loader import load_token
+
+
+def build_session(token: str) -> str:
+    return f"session:{load_token(token)}"
+""".strip(),
+        encoding="utf-8",
+    )
+    (oauth_dir / "device_flow.py").write_text(
+        """
+from src.runtime.session import build_session
+
+
+def refresh_device_session(token: str) -> str:
+    return build_session(token)
+""".strip(),
+        encoding="utf-8",
+    )
+    (oauth_dir / "refresh.py").write_text(
+        """
+from src.tokens.loader import load_token
+
+
+def refresh_token(token: str) -> str:
+    return load_token(token)
+""".strip(),
+        encoding="utf-8",
+    )
+    (ui_dir / "render.py").write_text(
+        """
+def render_screen() -> str:
+    return "screen"
+""".strip(),
+        encoding="utf-8",
+    )
+
+    return {
+        "target_paths": {
+            "src/tokens/loader.py",
+            "src/runtime/session.py",
+            "src/oauth/device_flow.py",
+            "src/oauth/refresh.py",
+        }
+    }
 
 
 def test_hierarchy_search_routes_natural_language_query_through_folder_branch(tmp_path):
@@ -296,3 +365,49 @@ def stream_bedrock() -> str:
 
     assert result.node_hits
     assert result.node_hits[0].node.path == "src/providers/amazon_bedrock.py"
+
+
+def test_pipeline_persists_louvain_communities(tmp_path):
+    fixture = _write_phase5_fixture(tmp_path)
+
+    engine = LabelingEngine(FakeClient(), LabelingConfig())
+    graph = CradlePipeline(config=PipelineConfig(), labeling_engine=engine).analyze(tmp_path)
+
+    community_nodes = [node for node in graph.nodes if node.kind == "community"]
+    assert community_nodes
+    assert graph.community_members
+    assert fixture["target_paths"].issuperset({record.member_node_id for record in graph.community_members})
+
+    db_path = tmp_path / "index.db"
+    CradleDatabase(db_path).replace_graph(graph)
+
+    with sqlite3.connect(db_path) as conn:
+        community_count = conn.execute("SELECT COUNT(*) FROM nodes WHERE kind = 'community'").fetchone()[0]
+        membership_count = conn.execute("SELECT COUNT(*) FROM community_members").fetchone()[0]
+
+    assert community_count >= 1
+    assert membership_count >= 4
+
+
+def test_semantic_index_builds_centroids_and_hierarchy_uses_community_branch(tmp_path):
+    fixture = _write_phase5_fixture(tmp_path)
+
+    engine = LabelingEngine(FakeClient(), LabelingConfig())
+    graph = CradlePipeline(config=PipelineConfig(), labeling_engine=engine).analyze(tmp_path)
+    community_ids = [node.node_id for node in graph.nodes if node.kind == "community"]
+    assert community_ids
+
+    db_path = tmp_path / "index.db"
+    CradleDatabase(db_path).replace_graph(graph)
+    SemanticIndexBuilder(db_path, embedder=FakeEmbedder()).build()
+    store = SemanticIndexStore(db_path)
+
+    query_vector = FakeEmbedder().encode(["token session refresh flow"])[0]
+    centroid_hits = store.search_node_centroids(query_vector, community_ids, top_k=2)
+    assert centroid_hits
+
+    result = axe_hierarchy_search(db_path, "token session refresh flow", embedder=FakeEmbedder(), limit=3)
+
+    assert any(candidate.node.kind == "community" for step in result.steps for candidate in step.candidates)
+    assert result.node_hits
+    assert result.node_hits[0].node.path in fixture["target_paths"]

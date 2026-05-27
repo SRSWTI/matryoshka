@@ -15,6 +15,7 @@ TABLE_NAMES = [
     "symbol_references",
     "references",
     "node_context",
+    "community_members",
     "edges",
 ]
 

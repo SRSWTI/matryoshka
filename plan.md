@@ -5,7 +5,7 @@
 
 ## Current Status
 
-This document started as the target architecture. The project now has a real working foundation for code extraction, graph storage, deterministic retrieval, SQLite-backed inspection, exact DB lookup tools, flat semantic retrieval, a first top-down hierarchy search over the existing repo/folder/file tree, a grounded `axe_question` answer layer, and focused graph visualization. Matryoshka routing and deeper clustering are still next.
+This document started as the target architecture. The project now has a real working foundation for code extraction, graph storage, deterministic retrieval, SQLite-backed inspection, exact DB lookup tools, flat semantic retrieval, louvain community storage, centroid rollups, a top-down hierarchy search over both the existing repo/folder/file tree and stored communities, a grounded `axe_question` answer layer, and focused graph visualization. Matryoshka routing and deeper clustering are still next.
 
 ### What Is Implemented Now
 
@@ -15,10 +15,12 @@ This document started as the target architecture. The project now has a real wor
 - Call-site extraction and symbol reference extraction
 - SQLite graph storage instead of JSON output
 - Repo, folder, file, symbol, import, call, reference, context, and edge tables
+- SQLite community-membership storage for louvain clusters discovered from the internal import graph
 - LLM-generated summaries, descriptions, tags, and categories persisted into the graph
 - Deterministic retrieval over the SQLite DB
 - MLX EmbeddingGemma semantic indexing over graph-backed files and symbols
 - Sidecar semantic index artifacts: manifest, record maps, and normalized vector arrays
+- Sidecar node-centroid rollups for structural parents and community branches
 - Semantic retrieval with lexical reranking plus caller/callee expansion
 - Exact `axe_*` DB lookup tools for file, symbol, import, module, call, and reference queries
 - Top-down hierarchy search over existing repo/folder/file graph nodes
@@ -28,7 +30,7 @@ This document started as the target architecture. The project now has a real wor
 - CLI commands for `cradle semantic-index`, `cradle semantic-search`, `cradle hierarchy-search`, `cradle question`, and `cradle visualize-focus`
 - DB visualization report with schema and sample stored rows
 - Real semantic and AXE evaluation artifacts for the Pi AI package
-- Full local test suite currently passing with 32 tests
+- Full local test suite currently passing with 34 tests
 
 ### Why We Implemented This First
 
@@ -58,6 +60,7 @@ Current analysis output is a SQLite graph with these main tables:
 - `symbol_references`
 - `references`
 - `node_context`
+- `community_members`
 - `edges`
 
 Semantic retrieval currently adds a sidecar directory beside the SQLite DB rather than new graph tables. The current sidecar shape is:
@@ -65,6 +68,8 @@ Semantic retrieval currently adds a sidecar directory beside the SQLite DB rathe
 - `manifest.json`
 - `nodes.records.json`
 - `nodes.vectors.npy`
+- `node_centroids.records.json`
+- `node_centroids.vectors.npy`
 - `symbols.records.json`
 - `symbols.vectors.npy`
 
@@ -79,6 +84,7 @@ Examples:
 - `symbols` stores exact symbol identities and positions
 - `imports`, `call_sites`, and `symbol_references` store navigational relationships
 - `node_context` stores inherited internal context from neighboring files
+- `community_members` stores louvain-discovered virtual memberships from community nodes to file nodes
 - `edges` gives a generic graph surface for visualization and future traversal
 
 ### Current Retrieval Shape
@@ -100,8 +106,9 @@ The current deterministic lane is a practical hybrid of:
 
 The current hierarchy lane uses:
 
-- semantic beam search over existing repo/folder/file nodes via `parent_id`
+- semantic beam search over existing repo/folder/file nodes plus stored community nodes
 - branch-local subset vector search over nodes and symbols
+- centroid-based narrowing for large structural child sets before final child scoring
 - lexical path/name boosts on top of semantic similarity
 - wrapper/declaration penalties for implementation-style queries
 - mixed folder/file traversal so strong direct files can still win
@@ -158,13 +165,16 @@ The semantic sidecar for that DB now lives in `.cradle/pi-ai-semantic`, the sema
 
 That run shows the storage model is already large enough and structured enough to support the next phase:
 
-- 142 nodes
+- 146 nodes
+- 4 community nodes
 - 1065 symbols
 - 615 imports
 - 2767 call sites
 - 3657 references
 - 430 node-context rows
-- 3523 edges
+- 130 community memberships
+- 3657 edges
+- 35 centroid rollups in the semantic sidecar
 
 The current implementation can already answer queries like:
 
@@ -175,6 +185,7 @@ The current implementation can already answer queries like:
 - `bedrock streaming provider implementation` now ranks `src/providers/amazon-bedrock.ts` ahead of wrapper registration files
 - `how is the openai prompt cache key truncated` surfaces `src/providers/openai-prompt-cache.ts`
 - `how are api keys loaded from environment` answers from `findEnvKeys` in `src/env-api-keys.ts`
+- `how are api keys loaded from environment` can now traverse through `communities/03-llm-integration` before landing on `src/env-api-keys.ts`
 - `who calls streamBedrock` returns grounded callers plus the provider implementation excerpt
 
 The current visualization layer can already show:
@@ -188,8 +199,6 @@ The current visualization layer can already show:
 ### What Is Not Implemented Yet
 
 - Matryoshka multi-resolution retrieval
-- Louvain/K-means based retrieval routing
-- K-centroid rollups over discovered communities
 - better branch-path labeling for ambiguous hierarchy queries
 - better summary/category quality
 - incremental re-indexing and watchdog flow
@@ -203,7 +212,7 @@ Cradle is a local, in-process code intelligence system that lets a developer ask
 
 The core idea: **index bottom-up, retrieve top-down.**
 
-Today, the bottom-up indexing, graph persistence, exact DB tooling, first semantic retrieval lane, first tree-based top-down hierarchy traversal, grounded answer layer, and focused visualization are real. The next layer is top-down Matryoshka routing over repo/folder/module communities discovered by clustering instead of only the existing path tree.
+Today, the bottom-up indexing, graph persistence, exact DB tooling, semantic retrieval, stored louvain communities, centroid rollups, community-aware top-down hierarchy traversal, grounded answer layer, and focused visualization are real. The next layer is top-down Matryoshka routing over deeper repo/folder/module communities beyond this first louvain + centroid implementation.
 
 During pre-warming, Cradle builds a nested semantic index of the entire codebase — from raw AST symbols at the bottom, up through files, modules, folders, and the full repository — using graph community detection, Matryoshka embeddings, and call graph analysis. The result is a self-describing map of the codebase that the code itself drew.
 

@@ -330,6 +330,7 @@ def _summarize_semantic_index(summary) -> str:
             f"engine: {summary.engine}",
             f"nodes: {summary.node_count}",
             f"symbols: {summary.symbol_count}",
+            f"centroids: {summary.centroid_count}",
         ]
     )
 
