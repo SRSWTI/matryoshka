@@ -1,0 +1,49 @@
+diff --git a/src/cradle/hierarchical_search.py b/src/cradle/hierarchical_search.py
+index 1926582..6670381 100644
+--- a/src/cradle/hierarchical_search.py
++++ b/src/cradle/hierarchical_search.py
+@@ -68,5 +68,5 @@ class AxeHierarchySearcher:
+                 ).fetchall()
+             }
+-            children_by_parent = _children_by_parent(node_rows, _community_members_by_parent(conn))
++            children_by_parent = _children_by_parent(node_rows, _virtual_members_by_parent(conn))
+             symbol_ids_by_node = _symbol_ids_by_node(conn)
+ 
+@@ -103,5 +103,5 @@ class AxeHierarchySearcher:
+                 break
+ 
+-            structural_child_ids = [node_id for node_id in child_ids if node_rows[node_id]["kind"] in {"repo", "folder", "community"}]
++            structural_child_ids = [node_id for node_id in child_ids if node_rows[node_id]["kind"] in {"repo", "folder", "community", "theme"}]
+             file_child_ids = [node_id for node_id in child_ids if node_rows[node_id]["kind"] == "file"]
+             if structural_child_ids and file_child_ids:
+@@ -138,5 +138,5 @@ class AxeHierarchySearcher:
+             steps.append(TraversalStep(level=level, parent_node_ids=list(frontier), candidates=candidates))
+ 
+-            next_frontier = [node_id for node_id, _ in selected if node_rows[node_id]["kind"] in {"repo", "folder", "community"}]
++            next_frontier = [node_id for node_id, _ in selected if node_rows[node_id]["kind"] in {"repo", "folder", "community", "theme"}]
+             if not next_frontier:
+                 break
+@@ -257,8 +257,10 @@ def _children_by_parent(node_rows: dict[str, sqlite3.Row], extra_children: dict[
+ 
+ 
+-def _community_members_by_parent(conn: sqlite3.Connection) -> dict[str, list[str]]:
++def _virtual_members_by_parent(conn: sqlite3.Connection) -> dict[str, list[str]]:
+     mapping: dict[str, list[str]] = defaultdict(list)
+     for row in conn.execute("SELECT community_node_id, member_node_id FROM community_members ORDER BY membership_rank, member_node_id").fetchall():
+         mapping[row["community_node_id"]].append(row["member_node_id"])
++    for row in conn.execute("SELECT theme_node_id, member_node_id FROM theme_members ORDER BY membership_rank, member_node_id").fetchall():
++        mapping[row["theme_node_id"]].append(row["member_node_id"])
+     return mapping
+ 
+@@ -292,8 +294,10 @@ def _hierarchy_node_bonus(plan, row: sqlite3.Row, *, prefer_structure: bool) ->
+     summary_matches = sum(1 for token in plan.tokens if token in descriptive_text)
+     score = path_matches * 8.0 + summary_matches * 6.0
+-    if prefer_structure and row["kind"] in {"repo", "folder", "community"}:
++    if prefer_structure and row["kind"] in {"repo", "folder", "community", "theme"}:
+         score += 4.0
+     if row["kind"] == "community":
+         score += 2.0
++    if row["kind"] == "theme":
++        score += 6.0
+     if not prefer_structure and row["kind"] == "file":
+         score += 4.0

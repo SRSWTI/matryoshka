@@ -4,7 +4,7 @@ import json
 import logging
 import sqlite3
 from collections import defaultdict
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from math import isqrt
 from pathlib import Path
@@ -36,6 +36,9 @@ class NodeCentroidRecord:
     representative_ids: list[str]
     title: str
     content: str
+    summary: str = ""
+    categories: list[str] = field(default_factory=list)
+    tags: list[str] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -382,6 +385,7 @@ def _load_node_records(conn: sqlite3.Connection, config: SemanticIndexConfig) ->
     context_map = _group_pairs(conn, "SELECT node_id, source_path, inherited_summary FROM node_context ORDER BY weight DESC, id")
     child_map = _group_single_values(conn, "SELECT parent_id, name FROM nodes WHERE parent_id IS NOT NULL ORDER BY kind, name")
     community_member_map = _group_single_values(conn, "SELECT community_node_id, member_node_id FROM community_members ORDER BY membership_rank, member_node_id")
+    theme_member_map = _group_single_values(conn, "SELECT theme_node_id, member_node_id FROM theme_members ORDER BY membership_rank, member_node_id")
 
     records: list[SemanticRecord] = []
     for row in node_rows:
@@ -425,6 +429,11 @@ def _load_node_records(conn: sqlite3.Connection, config: SemanticIndexConfig) ->
             members = community_member_map.get(row["node_id"], [])
             if members:
                 lines.append(f"members: {', '.join(members[: config.max_child_names])}")
+            lines.append(f"counts: files={row['file_count']} folders={row['folder_count']} symbols={row['symbol_count']}")
+        elif row["kind"] == "theme":
+            members = theme_member_map.get(row["node_id"], [])
+            if members:
+                lines.append(f"theme_members: {', '.join(members[: config.max_child_names])}")
             lines.append(f"counts: files={row['file_count']} folders={row['folder_count']} symbols={row['symbol_count']}")
         else:
             if children:
@@ -538,7 +547,11 @@ def _json_list(value: str | None) -> list[str]:
 def _load_rollup_child_map(conn: sqlite3.Connection) -> dict[str, list[str]]:
     mapping = _group_single_values(conn, "SELECT parent_id, node_id FROM nodes WHERE parent_id IS NOT NULL ORDER BY kind, path")
     community_mapping = _group_single_values(conn, "SELECT community_node_id, member_node_id FROM community_members ORDER BY membership_rank, member_node_id")
+    theme_mapping = _group_single_values(conn, "SELECT theme_node_id, member_node_id FROM theme_members ORDER BY membership_rank, member_node_id")
     for parent_id, member_ids in community_mapping.items():
+        mapping.setdefault(parent_id, []).extend(member_ids)
+        mapping[parent_id] = list(dict.fromkeys(mapping[parent_id]))
+    for parent_id, member_ids in theme_mapping.items():
         mapping.setdefault(parent_id, []).extend(member_ids)
         mapping[parent_id] = list(dict.fromkeys(mapping[parent_id]))
     return mapping
@@ -573,6 +586,9 @@ def _build_node_centroid_records(
             representative_ids = _representative_member_ids(member_vectors, centroids[centroid_index], member_ids, limit=3)
             representative_titles = [records_by_id[member_id].title for member_id in representative_ids if member_id in records_by_id]
             preview_titles = [records_by_id[member_id].title for member_id in member_ids[: config.centroid_preview_members] if member_id in records_by_id]
+            categories = _top_record_fields(member_ids, records_by_id, field_name="categories", limit=4)
+            tags = _top_record_fields(member_ids, records_by_id, field_name="tags", limit=6)
+            summary = _centroid_summary(parent_title, representative_ids, records_by_id, categories, tags)
             centroid_records.append(
                 NodeCentroidRecord(
                     centroid_id=f"{parent_id}::centroid::{centroid_index + 1}",
@@ -583,11 +599,17 @@ def _build_node_centroid_records(
                     content="\n".join(
                         [
                             f"parent: {parent_title}",
+                            f"summary: {summary}",
                             f"member_count: {len(member_ids)}",
+                            f"categories: {', '.join(categories)}",
+                            f"tags: {', '.join(tags)}",
                             f"representatives: {', '.join(representative_titles)}",
                             f"members: {', '.join(preview_titles)}",
                         ]
                     ),
+                    summary=summary,
+                    categories=categories,
+                    tags=tags,
                 )
             )
             centroid_vectors.append(centroids[centroid_index])
@@ -649,6 +671,66 @@ def _representative_member_ids(member_vectors: np.ndarray, centroid: np.ndarray,
     scores = member_vectors @ centroid
     ranking = np.argsort(-scores)[: min(limit, len(member_ids))]
     return [member_ids[index] for index in ranking]
+
+
+def _top_record_fields(
+    member_ids: list[str],
+    records_by_id: dict[str, SemanticRecord],
+    *,
+    field_name: str,
+    limit: int,
+) -> list[str]:
+    counter: defaultdict[str, int] = defaultdict(int)
+    for member_id in member_ids:
+        record = records_by_id.get(member_id)
+        if record is None:
+            continue
+        values = _record_field_values(record.content, field_name)
+        for value in values:
+            counter[value] += 1
+    return [name for name, _ in sorted(counter.items(), key=lambda item: (-item[1], item[0]))[:limit]]
+
+
+def _centroid_summary(
+    parent_title: str,
+    representative_ids: list[str],
+    records_by_id: dict[str, SemanticRecord],
+    categories: list[str],
+    tags: list[str],
+) -> str:
+    representative_titles = [records_by_id[member_id].title for member_id in representative_ids if member_id in records_by_id]
+    representative_summaries = []
+    for member_id in representative_ids:
+        record = records_by_id.get(member_id)
+        if record is None:
+            continue
+        summary_values = _record_field_values(record.content, "summary")
+        if summary_values:
+            representative_summaries.append(summary_values[0])
+    parts: list[str] = [f"Semantic routing summary for {parent_title}"]
+    if categories:
+        parts.append(f"categories: {', '.join(categories[:3])}")
+    if tags:
+        parts.append(f"tags: {', '.join(tags[:4])}")
+    if representative_titles:
+        parts.append(f"representatives: {', '.join(representative_titles[:3])}")
+    if representative_summaries:
+        parts.append(f"focus: {' | '.join(representative_summaries[:2])}")
+    return "; ".join(parts)
+
+
+def _record_field_values(content: str, field_name: str) -> list[str]:
+    prefix = f"{field_name}:"
+    for line in content.splitlines():
+        if not line.startswith(prefix):
+            continue
+        value = line[len(prefix) :].strip()
+        if not value:
+            return []
+        if field_name in {"categories", "tags"}:
+            return [item.strip() for item in value.split(",") if item.strip()]
+        return [value]
+    return []
 
 
 def _utc_now() -> str:

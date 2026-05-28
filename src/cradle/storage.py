@@ -53,6 +53,7 @@ class CradleDatabase:
             DROP TABLE IF EXISTS imports;
             DROP TABLE IF EXISTS node_context;
             DROP TABLE IF EXISTS community_members;
+            DROP TABLE IF EXISTS theme_members;
             DROP TABLE IF EXISTS symbols;
             DROP TABLE IF EXISTS node_tags;
             DROP TABLE IF EXISTS node_categories;
@@ -157,6 +158,7 @@ class CradleDatabase:
                 imported_module TEXT NOT NULL,
                 target_node_id TEXT,
                 is_internal INTEGER NOT NULL,
+                is_out_of_scope INTEGER NOT NULL DEFAULT 0,
                 strength_label TEXT NOT NULL,
                 strength_weight REAL NOT NULL,
                 names_json TEXT NOT NULL,
@@ -237,6 +239,16 @@ class CradleDatabase:
                 updated_at TEXT NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS theme_members (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                repo_id TEXT NOT NULL,
+                theme_node_id TEXT NOT NULL,
+                member_node_id TEXT NOT NULL,
+                membership_rank INTEGER NOT NULL,
+                membership_weight REAL NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS edges (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 repo_id TEXT NOT NULL,
@@ -267,6 +279,7 @@ class CradleDatabase:
             CREATE INDEX IF NOT EXISTS idx_symbols_symbol_key ON symbols(symbol_key);
             CREATE INDEX IF NOT EXISTS idx_imports_importer ON imports(importer_node_id);
             CREATE INDEX IF NOT EXISTS idx_imports_target ON imports(target_node_id);
+            CREATE INDEX IF NOT EXISTS idx_imports_out_of_scope ON imports(is_out_of_scope);
             CREATE INDEX IF NOT EXISTS idx_calls_caller ON call_sites(caller_symbol_id);
             CREATE INDEX IF NOT EXISTS idx_calls_target ON call_sites(target_symbol_id);
             CREATE INDEX IF NOT EXISTS idx_refs_target ON symbol_references(target_symbol_id, target_name);
@@ -278,6 +291,8 @@ class CradleDatabase:
             CREATE INDEX IF NOT EXISTS idx_context_repo ON node_context(repo_id);
             CREATE INDEX IF NOT EXISTS idx_community_members_community ON community_members(community_node_id, membership_rank);
             CREATE INDEX IF NOT EXISTS idx_community_members_member ON community_members(member_node_id);
+            CREATE INDEX IF NOT EXISTS idx_theme_members_theme ON theme_members(theme_node_id, membership_rank);
+            CREATE INDEX IF NOT EXISTS idx_theme_members_member ON theme_members(member_node_id);
             CREATE INDEX IF NOT EXISTS idx_edges_repo ON edges(repo_id);
             CREATE INDEX IF NOT EXISTS idx_edges_from ON edges(from_id, edge_type);
             CREATE INDEX IF NOT EXISTS idx_edges_to ON edges(to_id, edge_type);
@@ -324,6 +339,7 @@ class CradleDatabase:
             "DELETE FROM \"references\"",
             "DELETE FROM node_context",
             "DELETE FROM community_members",
+            "DELETE FROM theme_members",
             "DELETE FROM symbol_references",
             "DELETE FROM call_sites",
             "DELETE FROM imports",
@@ -416,7 +432,7 @@ class CradleDatabase:
             [
                 (node.node_id, category, rank)
                 for node in graph.nodes
-                for rank, category in enumerate(node.categories)
+                for rank, category in enumerate(_unique_ordered(node.categories))
             ],
         )
         conn.executemany(
@@ -424,7 +440,7 @@ class CradleDatabase:
             [
                 (node.node_id, tag, rank)
                 for node in graph.nodes
-                for rank, tag in enumerate(node.tags)
+                for rank, tag in enumerate(_unique_ordered(node.tags))
             ],
         )
 
@@ -471,9 +487,9 @@ class CradleDatabase:
         conn.executemany(
             """
             INSERT INTO imports(
-                repo_id, importer_node_id, imported_module, target_node_id, is_internal, strength_label,
-                strength_weight, names_json, start_line, start_column, end_line, end_column, updated_at
-            ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                repo_id, importer_node_id, imported_module, target_node_id, is_internal, is_out_of_scope,
+                strength_label, strength_weight, names_json, start_line, start_column, end_line, end_column, updated_at
+            ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             [
                 (
@@ -482,6 +498,7 @@ class CradleDatabase:
                     record.imported_module,
                     record.target_node_id,
                     1 if record.is_internal else 0,
+                    1 if record.is_out_of_scope else 0,
                     record.strength_label,
                     record.strength_weight,
                     _json(record.names),
@@ -621,6 +638,25 @@ class CradleDatabase:
             ],
         )
 
+        conn.executemany(
+            """
+            INSERT INTO theme_members(
+                repo_id, theme_node_id, member_node_id, membership_rank, membership_weight, updated_at
+            ) VALUES(?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    repo_id,
+                    record.theme_node_id,
+                    record.member_node_id,
+                    record.membership_rank,
+                    record.membership_weight,
+                    timestamp,
+                )
+                for record in graph.theme_members
+            ],
+        )
+
         edge_rows: list[tuple[str, str, str, str, str, int | None, int | None, str | None, str]] = []
         for node in graph.nodes:
             if node.parent_id is None:
@@ -628,16 +664,17 @@ class CradleDatabase:
             edge_rows.append((repo_id, node.parent_id, node.node_id, "child", "structural", None, node.start_line, None, timestamp))
 
         for record in graph.imports:
+            edge_type = "out_of_scope_import" if record.is_out_of_scope else "import"
             edge_rows.append(
                 (
                     repo_id,
                     record.importer_node_id,
                     record.target_node_id or record.imported_module,
-                    "import",
+                    edge_type,
                     record.strength_label,
                     record.start_line,
                     None,
-                    _json({"module": record.imported_module, "names": record.names, "is_internal": record.is_internal}),
+                    _json({"module": record.imported_module, "names": record.names, "is_internal": record.is_internal, "is_out_of_scope": record.is_out_of_scope}),
                     timestamp,
                 )
             )
@@ -665,6 +702,21 @@ class CradleDatabase:
                     record.member_node_id,
                     "community_member",
                     "structural",
+                    None,
+                    None,
+                    _json({"membership_rank": record.membership_rank, "membership_weight": record.membership_weight}),
+                    timestamp,
+                )
+            )
+
+        for record in graph.theme_members:
+            edge_rows.append(
+                (
+                    repo_id,
+                    record.theme_node_id,
+                    record.member_node_id,
+                    "theme_member",
+                    "semantic",
                     None,
                     None,
                     _json({"membership_rank": record.membership_rank, "membership_weight": record.membership_weight}),
@@ -773,6 +825,17 @@ def _json(value: object) -> str:
 def _table_exists(conn: sqlite3.Connection, table_name: str) -> bool:
     row = conn.execute("SELECT 1 FROM sqlite_master WHERE type IN ('table', 'view') AND name = ?", (table_name,)).fetchone()
     return row is not None
+
+
+def _unique_ordered(values: list[str]) -> list[str]:
+    seen: set[str] = set()
+    unique_values: list[str] = []
+    for value in values:
+        if value in seen:
+            continue
+        seen.add(value)
+        unique_values.append(value)
+    return unique_values
 
 
 def _utc_now() -> str:

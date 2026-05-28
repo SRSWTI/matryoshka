@@ -17,6 +17,7 @@ from cradle.question_answering import axe_question
 from cradle.retrieval import axe_retrieval
 from cradle.semantic_index import SemanticIndexBuilder, SemanticIndexConfig, load_semantic_manifest
 from cradle.semantic_search import axe_semantic_search
+from cradle.dashboard import run_dashboard
 from cradle.storage import CradleDatabase
 
 logger = logging.getLogger(__name__)
@@ -134,6 +135,13 @@ def main() -> int:
     question_parser.add_argument("--backend", default="auto", choices=["auto", "mlx", "sentence-transformers"])
     question_parser.add_argument("--log-level", default="INFO")
 
+    serve_parser = subparsers.add_parser("serve", help="Launch the Cradle web dashboard")
+    serve_parser.add_argument("db_path")
+    serve_parser.add_argument("--index-dir", default=None, help="Semantic sidecar directory (default: auto-detect)")
+    serve_parser.add_argument("--port", type=int, default=8765)
+    serve_parser.add_argument("--no-browser", action="store_true", help="Do not open a browser tab automatically")
+    serve_parser.add_argument("--log-level", default="INFO")
+
     args = parser.parse_args()
     if args.command == "analyze":
         return _run_analyze(args)
@@ -163,6 +171,8 @@ def main() -> int:
         return _run_hierarchy_search(args)
     if args.command == "question":
         return _run_question(args)
+    if args.command == "serve":
+        return _run_serve(args)
     return 1
 
 
@@ -310,6 +320,17 @@ def _run_question(args: argparse.Namespace) -> int:
     )
     result = axe_question(args.db_path, args.query, index_dir=args.index_dir, embedder=embedder)
     print(_format_question_result(result))
+    return 0
+
+
+def _run_serve(args: argparse.Namespace) -> int:
+    _configure_logging(args.log_level)
+    run_dashboard(
+        db_path=args.db_path,
+        index_dir=args.index_dir,
+        port=args.port,
+        open_browser=not args.no_browser,
+    )
     return 0
 
 

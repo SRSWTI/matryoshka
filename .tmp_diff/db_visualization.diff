@@ -1,0 +1,83 @@
+diff --git a/src/cradle/db_visualization.py b/src/cradle/db_visualization.py
+index cce1ea7..978c943 100644
+--- a/src/cradle/db_visualization.py
++++ b/src/cradle/db_visualization.py
+@@ -17,4 +17,5 @@ TABLE_NAMES = [
+     "node_context",
+     "community_members",
++    "theme_members",
+     "edges",
+ ]
+@@ -86,4 +87,33 @@ def build_db_visualization(db_path: str | Path, *, sample_limit: int = 10) -> st
+             (sample_limit,),
+         ).fetchall()
++        # Out-of-scope: internal imports whose target lies outside the analyzed root.
++        # These are real dependencies Cradle could not resolve to a file in the graph.
++        # Guard against older DBs that predate the is_out_of_scope column.
++        import_columns = {row[1] for row in conn.execute("PRAGMA table_info(imports)").fetchall()}
++        _has_scope_col = "is_out_of_scope" in import_columns
++        if _has_scope_col:
++            out_of_scope_counts = conn.execute(
++                '''
++                SELECT imported_module, COUNT(*) AS count
++                FROM imports
++                WHERE is_out_of_scope = 1
++                GROUP BY imported_module
++                ORDER BY count DESC, imported_module ASC
++                LIMIT ?
++                ''',
++                (sample_limit,),
++            ).fetchall()
++            import_scope_summary = conn.execute(
++                '''
++                SELECT
++                    SUM(CASE WHEN is_internal = 1 AND target_node_id IS NOT NULL THEN 1 ELSE 0 END) AS resolved_internal,
++                    SUM(CASE WHEN is_out_of_scope = 1 THEN 1 ELSE 0 END) AS out_of_scope,
++                    SUM(CASE WHEN is_internal = 0 THEN 1 ELSE 0 END) AS external
++                FROM imports
++                '''
++            ).fetchone()
++        else:
++            out_of_scope_counts = []
++            import_scope_summary = None
+         top_call_edges = conn.execute(
+             '''
+@@ -138,4 +168,38 @@ def build_db_visualization(db_path: str | Path, *, sample_limit: int = 10) -> st
+         *[f"| {row['strength_label']} | {row['count']} |" for row in import_strength_counts],
+         "",
++        "## Import Scope",
++        "",
++        "Resolved internal imports point to a file inside the analyzed root.  "
++        "Out-of-scope imports are real internal dependencies whose target lies **outside** "
++        "the portion of the repository that Cradle analysed.  "
++        "External imports are third-party or stdlib packages.",
++        "",
++        *(
++            [
++                "| Category | Count |",
++                "| --- | ---: |",
++                f"| resolved internal | {import_scope_summary['resolved_internal'] or 0} |",
++                f"| **out of scope** | {import_scope_summary['out_of_scope'] or 0} |",
++                f"| external (stdlib / third-party) | {import_scope_summary['external'] or 0} |",
++                "",
++            ]
++            if import_scope_summary is not None
++            else ["_Import scope data not available (older database schema)._", ""]
++        ),
++        *(
++            [
++                "### Out-of-Scope Modules",
++                "",
++                "These modules were detected as internal (same package / relative path) "
++                "but could not be resolved to any file in the analyzed root.",
++                "",
++                "| Module | Importers |",
++                "| --- | ---: |",
++                *[f"| `{row['imported_module']}` | {row['count']} |" for row in out_of_scope_counts],
++                "",
++            ]
++            if out_of_scope_counts
++            else []
++        ),
+         "## Top Files",
+         "",

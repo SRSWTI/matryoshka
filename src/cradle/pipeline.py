@@ -10,7 +10,7 @@ from typing import Callable, Iterable
 from pathspec import GitIgnoreSpec
 
 from cradle.ast_extractor import FileExtraction, SymbolRecord, extract_file
-from cradle.community_detection import build_louvain_communities
+from cradle.community_detection import build_louvain_communities, build_theme_domains
 from cradle.graph_builder import RepositoryGraphBuilder
 from cradle.graph_models import RepositoryGraph
 from cradle.labeling import LabelingEngine
@@ -212,10 +212,14 @@ class CradlePipeline:
             repo_packet,
             repo_label,
         )
-        community_nodes, community_members = build_louvain_communities(graph.nodes, graph.imports)
+        community_nodes, community_members = build_louvain_communities(graph.nodes, graph.imports, graph.calls)
         if community_nodes:
             graph.nodes.extend(community_nodes)
             graph.community_members.extend(community_members)
+        theme_nodes, theme_members = build_theme_domains(graph.nodes)
+        if theme_nodes:
+            graph.nodes.extend(theme_nodes)
+            graph.theme_members.extend(theme_members)
         _emit_progress(progress, f"built graph with {len(graph.nodes)} nodes and {len(graph.symbols)} symbols")
         return graph
 

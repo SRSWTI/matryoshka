@@ -58,6 +58,10 @@ class ImportRecord:
     is_internal: bool
     strength_label: str
     strength_weight: float
+    # True when the import looks internal (same package / relative) but the
+    # target file does not exist within the analyzed root.  The dependency is
+    # real but lives outside the Cradle analysis scope.
+    is_out_of_scope: bool = False
     names: list[str] = field(default_factory=list)
     start_line: int | None = None
     start_column: int | None = None
@@ -112,6 +116,14 @@ class CommunityMemberRecord:
 
 
 @dataclass(slots=True)
+class ThemeMemberRecord:
+    theme_node_id: str
+    member_node_id: str
+    membership_rank: int
+    membership_weight: float
+
+
+@dataclass(slots=True)
 class RepositoryGraph:
     repo_root: str
     nodes: list[CodeNode] = field(default_factory=list)
@@ -121,6 +133,7 @@ class RepositoryGraph:
     references: list[SymbolReferenceRecord] = field(default_factory=list)
     node_context: list[NodeContextRecord] = field(default_factory=list)
     community_members: list[CommunityMemberRecord] = field(default_factory=list)
+    theme_members: list[ThemeMemberRecord] = field(default_factory=list)
 
 
 @dataclass(slots=True)

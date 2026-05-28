@@ -401,6 +401,7 @@ def test_semantic_index_builds_centroids_and_hierarchy_uses_community_branch(tmp
     CradleDatabase(db_path).replace_graph(graph)
     SemanticIndexBuilder(db_path, embedder=FakeEmbedder()).build()
     store = SemanticIndexStore(db_path)
+    assert any(record.summary.startswith("Semantic routing summary") for record in store.centroid_records)
 
     query_vector = FakeEmbedder().encode(["token session refresh flow"])[0]
     centroid_hits = store.search_node_centroids(query_vector, community_ids, top_k=2)
@@ -411,3 +412,70 @@ def test_semantic_index_builds_centroids_and_hierarchy_uses_community_branch(tmp
     assert any(candidate.node.kind == "community" for step in result.steps for candidate in step.candidates)
     assert result.node_hits
     assert result.node_hits[0].node.path in fixture["target_paths"]
+
+
+def test_hierarchy_search_can_route_through_theme_domain(tmp_path):
+    class ThemeClient(FakeClient):
+        def _respond(self, messages):
+            payload = json.loads(messages[1]["content"])
+            if "file_packet" in payload:
+                path = payload["file_packet"]["path"]
+                if "security" in path or "identity" in path:
+                    return {
+                        "summary": "Authentication and identity management logic.",
+                        "description": "Implements login checks, token validation, and session assembly.",
+                        "tags": ["auth", "identity", "session"],
+                        "categories": ["authentication"],
+                        "confidence": 0.95,
+                        "evidence": [path],
+                    }
+                return super()._respond(messages)
+
+            node_packet = payload["node_packet"]
+            node_id = node_packet["node_id"]
+            if node_id in {"src/security", "src/identity"}:
+                return {
+                    "summary": "Authentication branch.",
+                    "description": "Contains auth and identity code.",
+                    "tags": ["auth", "identity"],
+                    "categories": ["authentication"],
+                    "confidence": 0.92,
+                    "evidence": [node_id],
+                }
+            return super()._respond(messages)
+
+    security_dir = tmp_path / "src" / "security"
+    identity_dir = tmp_path / "src" / "identity"
+    security_dir.mkdir(parents=True)
+    identity_dir.mkdir(parents=True)
+
+    (security_dir / "tokens.py").write_text(
+        """
+def validate_token(token: str) -> bool:
+    return token.startswith("sig-")
+""".strip(),
+        encoding="utf-8",
+    )
+    (identity_dir / "session.py").write_text(
+        """
+from src.security.tokens import validate_token
+
+
+def create_session(token: str) -> str:
+    return token if validate_token(token) else "invalid"
+""".strip(),
+        encoding="utf-8",
+    )
+
+    engine = LabelingEngine(ThemeClient(), LabelingConfig())
+    graph = CradlePipeline(config=PipelineConfig(), labeling_engine=engine).analyze(tmp_path)
+    db_path = tmp_path / "index.db"
+    CradleDatabase(db_path).replace_graph(graph)
+    SemanticIndexBuilder(db_path, embedder=FakeEmbedder()).build()
+
+    result = axe_hierarchy_search(db_path, "auth login session", embedder=FakeEmbedder(), limit=3)
+
+    assert result.steps
+    assert any(candidate.node.node_id == "theme::authentication" for step in result.steps for candidate in step.candidates)
+    assert result.node_hits
+    assert result.node_hits[0].node.path in {"src/identity/session.py", "src/security/tokens.py"}

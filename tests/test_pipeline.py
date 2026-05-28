@@ -197,3 +197,124 @@ def test_repository_walker_honors_root_gitignore(tmp_path):
     files = [path.relative_to(tmp_path).as_posix() for path in walker.collect_source_files(tmp_path)]
 
     assert files == ["src/keep.py"]
+
+
+def test_pipeline_persists_duplicate_tags_and_categories_without_conflict(tmp_path):
+    src_dir = tmp_path / "src"
+    src_dir.mkdir(parents=True)
+    (src_dir / "dup.py").write_text("def dup() -> bool:\n    return True\n", encoding="utf-8")
+
+    class DuplicateLabelClient(FakeClient):
+        def _respond(self, messages):
+            payload = json.loads(messages[1]["content"])
+            if "file_packet" in payload:
+                return {
+                    "summary": "Duplicate label file.",
+                    "description": "Returns repeated tags and categories.",
+                    "tags": ["dup", "dup", "shared"],
+                    "categories": ["repeat", "repeat", "mixed"],
+                    "confidence": 0.9,
+                    "evidence": [payload["file_packet"]["path"]],
+                }
+            return {
+                "summary": "Duplicate label folder.",
+                "description": "Returns repeated tags and categories.",
+                "tags": ["dup", "dup", "shared"],
+                "categories": ["repeat", "repeat", "mixed"],
+                "confidence": 0.9,
+                "evidence": [payload["node_packet"]["node_id"]],
+            }
+
+    engine = LabelingEngine(DuplicateLabelClient(), LabelingConfig())
+    pipeline = CradlePipeline(config=PipelineConfig(), labeling_engine=engine)
+
+    graph = pipeline.analyze(tmp_path)
+
+    nodes = [node for node in graph.nodes if node.node_id == "src/dup.py"]
+    assert nodes
+
+
+def test_pipeline_builds_structural_communities_and_semantic_themes(tmp_path):
+    auth_dir = tmp_path / "src" / "auth"
+    auth_dir.mkdir(parents=True)
+
+    (auth_dir / "tokens.py").write_text(
+        """
+def verify_token(token: str) -> bool:
+    return token.startswith("sig-")
+""".strip(),
+        encoding="utf-8",
+    )
+    (auth_dir / "session.py").write_text(
+        """
+from src.auth.tokens import verify_token
+
+
+def build_session(token: str) -> str:
+    return token if verify_token(token) else "invalid"
+""".strip(),
+        encoding="utf-8",
+    )
+
+    engine = LabelingEngine(FakeClient(), LabelingConfig())
+    pipeline = CradlePipeline(config=PipelineConfig(), labeling_engine=engine)
+
+    graph = pipeline.analyze(tmp_path)
+
+    community_nodes = [node for node in graph.nodes if node.kind == "community"]
+    theme_nodes = [node for node in graph.nodes if node.kind == "theme"]
+    assert community_nodes
+    assert any(node.summary.startswith("Structural import/call community") for node in community_nodes)
+    assert any(node.node_id == "theme::authentication" for node in theme_nodes)
+    assert graph.theme_members
+    assert {record.member_node_id for record in graph.theme_members if record.theme_node_id == "theme::authentication"} == {
+        "src/auth/session.py",
+        "src/auth/tokens.py",
+    }
+
+
+def test_pipeline_marks_unresolvable_internal_imports_as_out_of_scope(tmp_path):
+    """An internal import whose target does not exist in the analyzed root must
+    be flagged is_out_of_scope=True so the UI can render it as a boundary edge
+    rather than silently treating it as a missing/unresolved file."""
+    src_dir = tmp_path / "src"
+    src_dir.mkdir(parents=True)
+
+    # This file imports from 'src.external_pkg.utils', which looks internal (the
+    # first path segment 'src' exists in the repo) but the target file does NOT
+    # exist anywhere under tmp_path.
+    (src_dir / "service.py").write_text(
+        "from src.external_pkg.utils import helper\n\ndef run(): helper()\n",
+        encoding="utf-8",
+    )
+    # This file imports from a sibling that DOES exist — must NOT be out_of_scope.
+    (src_dir / "utils.py").write_text("def helper(): pass\n", encoding="utf-8")
+    (src_dir / "consumer.py").write_text(
+        "from src.utils import helper\n\ndef consume(): helper()\n",
+        encoding="utf-8",
+    )
+
+    engine = LabelingEngine(FakeClient(), LabelingConfig())
+    pipeline = CradlePipeline(config=PipelineConfig(), labeling_engine=engine)
+
+    graph = pipeline.analyze(tmp_path)
+
+    # The import of the missing module must be flagged out-of-scope.
+    oos = [
+        record
+        for record in graph.imports
+        if record.importer_node_id == "src/service.py" and record.imported_module == "src.external_pkg.utils"
+    ]
+    assert oos, "expected an import record for src.external_pkg.utils"
+    assert oos[0].is_out_of_scope is True
+    assert oos[0].target_node_id is None
+
+    # The resolvable sibling import must NOT be out-of-scope.
+    resolved = [
+        record
+        for record in graph.imports
+        if record.importer_node_id == "src/consumer.py" and record.imported_module == "src.utils"
+    ]
+    assert resolved, "expected an import record for src.utils"
+    assert resolved[0].is_out_of_scope is False
+    assert resolved[0].target_node_id is not None

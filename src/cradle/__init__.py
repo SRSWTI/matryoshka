@@ -4,7 +4,7 @@ from cradle.embeddings import DEFAULT_EMBEDDING_MODEL, DEFAULT_QUERY_TASK, MLXEm
 from cradle.db_visualization import build_db_visualization
 from cradle.exact_search import AxeExactSearcher, axe_call_search, axe_file_search, axe_import_search, axe_module_search, axe_reference_search, axe_symbol_search
 from cradle.focus_visualization import build_focus_visualization
-from cradle.graph_models import AnalysisSummary, CallRecord, CodeExcerpt, CodeNode, CodeSymbol, ExactCallHit, ExactImportHit, ExactReferenceHit, ExactSearchResult, HierarchicalSearchResult, ImportRecord, NodeContextRecord, QuestionResult, RepositoryGraph, RetrievalNodeHit, RetrievalResult, RetrievalSymbolHit, SymbolReferenceRecord, TraversalCandidate, TraversalStep
+from cradle.graph_models import AnalysisSummary, CallRecord, CodeExcerpt, CodeNode, CodeSymbol, ExactCallHit, ExactImportHit, ExactReferenceHit, ExactSearchResult, HierarchicalSearchResult, ImportRecord, NodeContextRecord, QuestionResult, RepositoryGraph, RetrievalNodeHit, RetrievalResult, RetrievalSymbolHit, SymbolReferenceRecord, ThemeMemberRecord, TraversalCandidate, TraversalStep
 from cradle.hierarchical_search import AxeHierarchySearcher, HierarchySearchConfig, axe_hierarchy_search
 from cradle.labeling import LabelingConfig, LabelingEngine
 from cradle.llm_client import LLMClientConfig, LLMClientError, OpenAICompatibleClient
@@ -73,6 +73,7 @@ __all__ = [
 	"SemanticSearchConfig",
 	"SentenceTransformerEmbedder",
 	"SymbolReferenceRecord",
+	"ThemeMemberRecord",
 	"TraversalCandidate",
 	"TraversalStep",
 	"axe_call_search",

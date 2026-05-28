@@ -67,7 +67,7 @@ class AxeHierarchySearcher:
                     "SELECT node_id, parent_id, kind, path, name, summary, description, primary_category, symbol_count FROM nodes ORDER BY path"
                 ).fetchall()
             }
-            children_by_parent = _children_by_parent(node_rows, _community_members_by_parent(conn))
+            children_by_parent = _children_by_parent(node_rows, _virtual_members_by_parent(conn))
             symbol_ids_by_node = _symbol_ids_by_node(conn)
 
             root_ids = sorted(node_id for node_id, row in node_rows.items() if row["parent_id"] is None)
@@ -102,7 +102,7 @@ class AxeHierarchySearcher:
             if not child_ids:
                 break
 
-            structural_child_ids = [node_id for node_id in child_ids if node_rows[node_id]["kind"] in {"repo", "folder", "community"}]
+            structural_child_ids = [node_id for node_id in child_ids if node_rows[node_id]["kind"] in {"repo", "folder", "community", "theme"}]
             file_child_ids = [node_id for node_id in child_ids if node_rows[node_id]["kind"] == "file"]
             if structural_child_ids and file_child_ids:
                 structural_scores = self._score_node_subset(node_rows, query_vector, plan, structural_child_ids, prefer_structure=True)
@@ -137,7 +137,7 @@ class AxeHierarchySearcher:
             level = "file" if all(node_rows[node_id]["kind"] == "file" for node_id, _ in selected) else "branch"
             steps.append(TraversalStep(level=level, parent_node_ids=list(frontier), candidates=candidates))
 
-            next_frontier = [node_id for node_id, _ in selected if node_rows[node_id]["kind"] in {"repo", "folder", "community"}]
+            next_frontier = [node_id for node_id, _ in selected if node_rows[node_id]["kind"] in {"repo", "folder", "community", "theme"}]
             if not next_frontier:
                 break
             frontier = next_frontier
@@ -256,10 +256,12 @@ def _children_by_parent(node_rows: dict[str, sqlite3.Row], extra_children: dict[
     return children
 
 
-def _community_members_by_parent(conn: sqlite3.Connection) -> dict[str, list[str]]:
+def _virtual_members_by_parent(conn: sqlite3.Connection) -> dict[str, list[str]]:
     mapping: dict[str, list[str]] = defaultdict(list)
     for row in conn.execute("SELECT community_node_id, member_node_id FROM community_members ORDER BY membership_rank, member_node_id").fetchall():
         mapping[row["community_node_id"]].append(row["member_node_id"])
+    for row in conn.execute("SELECT theme_node_id, member_node_id FROM theme_members ORDER BY membership_rank, member_node_id").fetchall():
+        mapping[row["theme_node_id"]].append(row["member_node_id"])
     return mapping
 
 
@@ -291,10 +293,12 @@ def _hierarchy_node_bonus(plan, row: sqlite3.Row, *, prefer_structure: bool) -> 
     path_matches = sum(1 for token in plan.tokens if token in path_text)
     summary_matches = sum(1 for token in plan.tokens if token in descriptive_text)
     score = path_matches * 8.0 + summary_matches * 6.0
-    if prefer_structure and row["kind"] in {"repo", "folder", "community"}:
+    if prefer_structure and row["kind"] in {"repo", "folder", "community", "theme"}:
         score += 4.0
     if row["kind"] == "community":
         score += 2.0
+    if row["kind"] == "theme":
+        score += 6.0
     if not prefer_structure and row["kind"] == "file":
         score += 4.0
     if plan.wants_implementation and row["kind"] == "file":

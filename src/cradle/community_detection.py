@@ -6,10 +6,14 @@ from collections import Counter, defaultdict
 
 import networkx as nx
 
-from cradle.graph_models import CodeNode, CommunityMemberRecord, ImportRecord
+from cradle.graph_models import CallRecord, CodeNode, CommunityMemberRecord, ImportRecord, ThemeMemberRecord
 
 
-def build_louvain_communities(nodes: list[CodeNode], imports: list[ImportRecord]) -> tuple[list[CodeNode], list[CommunityMemberRecord]]:
+def build_louvain_communities(
+    nodes: list[CodeNode],
+    imports: list[ImportRecord],
+    calls: list[CallRecord] | None = None,
+) -> tuple[list[CodeNode], list[CommunityMemberRecord]]:
     file_nodes = {node.node_id: node for node in nodes if node.kind == "file"}
     if len(file_nodes) < 2:
         return [], []
@@ -28,6 +32,17 @@ def build_louvain_communities(nodes: list[CodeNode], imports: list[ImportRecord]
             graph[record.importer_node_id][record.target_node_id]["weight"] += weight
         else:
             graph.add_edge(record.importer_node_id, record.target_node_id, weight=weight)
+
+    for record in calls or []:
+        if record.caller_node_id not in file_nodes or record.target_node_id not in file_nodes:
+            continue
+        if record.caller_node_id == record.target_node_id:
+            continue
+        weight = 0.35
+        if graph.has_edge(record.caller_node_id, record.target_node_id):
+            graph[record.caller_node_id][record.target_node_id]["weight"] += weight
+        else:
+            graph.add_edge(record.caller_node_id, record.target_node_id, weight=weight)
 
     if graph.number_of_edges() == 0:
         return [], []
@@ -105,10 +120,10 @@ def _folder_label(path: str) -> str:
 
 def _community_summary(dominant_category: str | None, representative_paths: list[str], member_count: int) -> str:
     if dominant_category and representative_paths:
-        return f"Louvain community of {member_count} related files in {dominant_category}, including {', '.join(representative_paths)}."
+        return f"Structural import/call community of {member_count} related files in {dominant_category}, including {', '.join(representative_paths)}."
     if representative_paths:
-        return f"Louvain community of {member_count} related files, including {', '.join(representative_paths)}."
-    return f"Louvain community of {member_count} related files."
+        return f"Structural import/call community of {member_count} related files, including {', '.join(representative_paths)}."
+    return f"Structural import/call community of {member_count} related files."
 
 
 def _community_description(
@@ -121,12 +136,77 @@ def _community_description(
     representative_text = ", ".join(representative_paths) if representative_paths else "no representative files"
     if dominant_category:
         return (
-            f"Community discovered from the internal import graph with {member_count} files clustered around {dominant_category}. "
+            f"Structural community discovered from internal import and call coupling with {member_count} files clustered around {dominant_category}. "
             f"Dominant folders: {folder_text}. Representative files: {representative_text}."
         )
     return (
-        f"Community discovered from the internal import graph with {member_count} related files. "
+        f"Structural community discovered from internal import and call coupling with {member_count} related files. "
         f"Dominant folders: {folder_text}. Representative files: {representative_text}."
+    )
+
+
+def build_theme_domains(nodes: list[CodeNode]) -> tuple[list[CodeNode], list[ThemeMemberRecord]]:
+    file_nodes = [node for node in nodes if node.kind == "file" and node.primary_category]
+    if len(file_nodes) < 2:
+        return [], []
+
+    members_by_category: dict[str, list[CodeNode]] = defaultdict(list)
+    for node in file_nodes:
+        members_by_category[node.primary_category or ""].append(node)
+
+    theme_nodes: list[CodeNode] = []
+    theme_members: list[ThemeMemberRecord] = []
+    for category, members in sorted(members_by_category.items()):
+        if not category or len(members) < 2:
+            continue
+        tag_counter = Counter(tag for member in members for tag in member.tags)
+        representative_paths = [member.path for member in sorted(members, key=lambda item: (-item.confidence, -item.symbol_count, item.path))[:4]]
+        theme_id = f"theme::{_slugify(category)}"
+        theme_nodes.append(
+            CodeNode(
+                node_id=theme_id,
+                path=f"themes/{_slugify(category)}",
+                name=category,
+                kind="theme",
+                parent_id="repo",
+                summary=_theme_summary(category, representative_paths, len(members)),
+                description=_theme_description(category, representative_paths, len(members), tag_counter),
+                primary_category=category,
+                categories=[category],
+                tags=[tag for tag, _ in tag_counter.most_common(8)],
+                confidence=round(sum(member.confidence for member in members) / len(members), 3),
+                symbol_count=sum(member.symbol_count for member in members),
+                import_count=sum(member.import_count for member in members),
+                file_count=len(members),
+                folder_count=len({member.path.rsplit("/", 1)[0] if "/" in member.path else "" for member in members}),
+            )
+        )
+        ranked_members = sorted(members, key=lambda item: (-max(item.confidence, 0.1), -item.symbol_count, item.path))
+        for rank, member in enumerate(ranked_members, start=1):
+            theme_members.append(
+                ThemeMemberRecord(
+                    theme_node_id=theme_id,
+                    member_node_id=member.node_id,
+                    membership_rank=rank,
+                    membership_weight=max(member.confidence, 0.1),
+                )
+            )
+
+    return theme_nodes, theme_members
+
+
+def _theme_summary(category: str, representative_paths: list[str], member_count: int) -> str:
+    if representative_paths:
+        return f"Semantic theme for {category} across {member_count} files, including {', '.join(representative_paths[:3])}."
+    return f"Semantic theme for {category} across {member_count} files."
+
+
+def _theme_description(category: str, representative_paths: list[str], member_count: int, tag_counter: Counter[str]) -> str:
+    representatives = ", ".join(representative_paths[:4]) if representative_paths else "no representative files"
+    top_tags = ", ".join(tag for tag, _ in tag_counter.most_common(6)) if tag_counter else "no dominant tags"
+    return (
+        f"Semantic theme/domain grouping for {category} built from labeled file categories. "
+        f"It spans {member_count} files with representative files {representatives}. Dominant tags: {top_tags}."
     )
 
 

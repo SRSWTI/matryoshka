@@ -183,6 +183,11 @@ class RepositoryGraphBuilder:
                         file_node_ids=file_node_ids,
                         folder_node_ids=folder_node_ids,
                     )
+                # An import classified as internal but whose target cannot be
+                # resolved to any file or folder within the analyzed root is
+                # "out of scope": the dependency is real but lives outside the
+                # portion of the repository that Cradle analysed.
+                is_out_of_scope = edge.is_internal and target_node_id is None
                 strength_label, strength_weight = classify_import_strength(relative_path, target_node_id, edge.is_internal)
                 imports.append(
                     ImportRecord(
@@ -190,6 +195,7 @@ class RepositoryGraphBuilder:
                         imported_module=edge.imported_module,
                         target_node_id=target_node_id,
                         is_internal=edge.is_internal,
+                        is_out_of_scope=is_out_of_scope,
                         strength_label=strength_label,
                         strength_weight=strength_weight,
                         names=list(edge.names),
