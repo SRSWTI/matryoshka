@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 from collections import Counter
-from dataclasses import dataclass, field, asdict
+from dataclasses import asdict, dataclass, field
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, NamedTuple
 
 import tree_sitter_python as tree_sitter_python
+import tree_sitter_rust as tree_sitter_rust
 import tree_sitter_typescript as tree_sitter_typescript
 from tree_sitter import Language, Node, Parser
 
@@ -72,15 +73,21 @@ class FileExtraction:
 
 PYTHON_LANGUAGE = Language(tree_sitter_python.language())
 TYPESCRIPT_LANGUAGE = Language(tree_sitter_typescript.language_typescript())
+RUST_LANGUAGE = Language(tree_sitter_rust.language())
 
 PARSERS = {
     ".py": ("python", Parser(PYTHON_LANGUAGE)),
     ".ts": ("typescript", Parser(TYPESCRIPT_LANGUAGE)),
     ".tsx": ("typescript", Parser(TYPESCRIPT_LANGUAGE)),
+    ".rs": ("rust", Parser(RUST_LANGUAGE)),
 }
 
 
-def extract_file(file_path: str | Path, source: str | None = None, repo_root: str | Path | None = None) -> FileExtraction:
+def extract_file(
+    file_path: str | Path,
+    source: str | None = None,
+    repo_root: str | Path | None = None,
+) -> FileExtraction:
     path = Path(file_path)
     suffix = path.suffix.lower()
     if suffix not in PARSERS:
@@ -94,10 +101,14 @@ def extract_file(file_path: str | Path, source: str | None = None, repo_root: st
 
     if language_name == "python":
         return _extract_python(path, source_text, root, root_dir)
+    if language_name == "rust":
+        return _extract_rust(path, source_text, root, root_dir)
     return _extract_typescript(path, source_text, root, root_dir)
 
 
-def _extract_python(path: Path, source: str, root: Node, repo_root: Path) -> FileExtraction:
+def _extract_python(
+    path: Path, source: str, root: Node, repo_root: Path
+) -> FileExtraction:
     captures: list[SymbolCapture] = []
     imports: list[ImportEdge] = []
 
@@ -105,11 +116,17 @@ def _extract_python(path: Path, source: str, root: Node, repo_root: Path) -> Fil
         if child.type == "import_statement":
             imports.extend(_python_import_statement(path, source, child, repo_root))
         elif child.type == "import_from_statement":
-            imports.extend(_python_import_from_statement(path, source, child, repo_root))
+            imports.extend(
+                _python_import_from_statement(path, source, child, repo_root)
+            )
         elif child.type == "decorated_definition":
             captures.extend(_python_decorated_symbols(source, child))
         elif child.type == "function_definition":
-            captures.append(SymbolCapture(_python_function_symbol(source, child, parent=None), child))
+            captures.append(
+                SymbolCapture(
+                    _python_function_symbol(source, child, parent=None), child
+                )
+            )
         elif child.type == "class_definition":
             captures.extend(_python_class_symbols(source, child))
         elif child.type == "expression_statement":
@@ -120,11 +137,21 @@ def _extract_python(path: Path, source: str, root: Node, repo_root: Path) -> Fil
                     captures.append(SymbolCapture(symbol, assignment))
 
     symbols, call_sites = _annotate_call_graph(source, captures, "python")
-    external_packages = sorted({edge.imported_module.split(".", 1)[0] for edge in imports if not edge.is_internal})
-    return FileExtraction("python", str(path), symbols, imports, external_packages, call_sites)
+    external_packages = sorted(
+        {
+            edge.imported_module.split(".", 1)[0]
+            for edge in imports
+            if not edge.is_internal
+        }
+    )
+    return FileExtraction(
+        "python", str(path), symbols, imports, external_packages, call_sites
+    )
 
 
-def _extract_typescript(path: Path, source: str, root: Node, repo_root: Path) -> FileExtraction:
+def _extract_typescript(
+    path: Path, source: str, root: Node, repo_root: Path
+) -> FileExtraction:
     captures: list[SymbolCapture] = []
     imports: list[ImportEdge] = []
 
@@ -138,29 +165,57 @@ def _extract_typescript(path: Path, source: str, root: Node, repo_root: Path) ->
             if edge is not None:
                 imports.append(edge)
             captures.extend(_typescript_export_symbols(source, child))
-        elif child.type in {"function_declaration", "class_declaration", "interface_declaration", "enum_declaration", "type_alias_declaration"}:
+        elif child.type in {
+            "function_declaration",
+            "class_declaration",
+            "interface_declaration",
+            "enum_declaration",
+            "type_alias_declaration",
+        }:
             symbol = _typescript_declaration_symbol(source, child, parent=None)
             if symbol is not None:
                 captures.append(SymbolCapture(symbol, child))
                 if child.type == "class_declaration":
-                    captures.extend(_typescript_class_members(source, child, symbol.name))
+                    captures.extend(
+                        _typescript_class_members(source, child, symbol.name)
+                    )
         elif child.type == "lexical_declaration":
             captures.extend(_typescript_variable_symbols(source, child))
 
     symbols, call_sites = _annotate_call_graph(source, captures, "typescript")
-    external_packages = sorted({edge.imported_module.split("/", 1)[0] for edge in imports if not edge.is_internal})
-    return FileExtraction("typescript", str(path), symbols, imports, external_packages, call_sites)
+    external_packages = sorted(
+        {
+            edge.imported_module.split("/", 1)[0]
+            for edge in imports
+            if not edge.is_internal
+        }
+    )
+    return FileExtraction(
+        "typescript", str(path), symbols, imports, external_packages, call_sites
+    )
 
 
-def _python_import_statement(path: Path, source: str, node: Node, repo_root: Path) -> list[ImportEdge]:
+def _python_import_statement(
+    path: Path, source: str, node: Node, repo_root: Path
+) -> list[ImportEdge]:
     edges: list[ImportEdge] = []
     for child in node.children:
         if child.type == "dotted_name":
             module = _text(source, child)
-            edges.append(ImportEdge(str(path), module, _is_python_internal(module, repo_root), names=[module], line_range=_line_range(child)))
+            edges.append(
+                ImportEdge(
+                    str(path),
+                    module,
+                    _is_python_internal(module, repo_root),
+                    names=[module],
+                    line_range=_line_range(child),
+                )
+            )
         elif child.type == "aliased_import":
             name_node = child.child_by_field_name("name") or child.child(0)
-            alias_node = child.child_by_field_name("alias") or child.child(child.child_count - 1)
+            alias_node = child.child_by_field_name("alias") or child.child(
+                child.child_count - 1
+            )
             if name_node is None:
                 continue
             module = _text(source, name_node)
@@ -178,7 +233,9 @@ def _python_import_statement(path: Path, source: str, node: Node, repo_root: Pat
     return edges
 
 
-def _python_import_from_statement(path: Path, source: str, node: Node, repo_root: Path) -> list[ImportEdge]:
+def _python_import_from_statement(
+    path: Path, source: str, node: Node, repo_root: Path
+) -> list[ImportEdge]:
     module_name = ""
     imported_names: list[str] = []
     for child in node.children:
@@ -210,15 +267,28 @@ def _python_import_from_statement(path: Path, source: str, node: Node, repo_root
 
 
 def _python_decorated_symbols(source: str, node: Node) -> list[SymbolCapture]:
-    definition = next((child for child in node.children if child.type in {"function_definition", "class_definition"}), None)
+    definition = next(
+        (
+            child
+            for child in node.children
+            if child.type in {"function_definition", "class_definition"}
+        ),
+        None,
+    )
     if definition is None:
         return []
     if definition.type == "function_definition":
-        return [SymbolCapture(_python_function_symbol(source, definition, parent=None), definition)]
+        return [
+            SymbolCapture(
+                _python_function_symbol(source, definition, parent=None), definition
+            )
+        ]
     return _python_class_symbols(source, definition)
 
 
-def _python_function_symbol(source: str, node: Node, parent: str | None) -> SymbolRecord:
+def _python_function_symbol(
+    source: str, node: Node, parent: str | None
+) -> SymbolRecord:
     name_node = node.child_by_field_name("name")
     params_node = node.child_by_field_name("parameters")
     return_node = node.child_by_field_name("return_type")
@@ -248,7 +318,11 @@ def _python_class_symbols(source: str, node: Node) -> list[SymbolCapture]:
     class_name = _text(source, name_node)
     bases = []
     if superclasses_node is not None:
-        bases = [_text(source, child) for child in superclasses_node.children if child.type not in {"(", ")", ","}]
+        bases = [
+            _text(source, child)
+            for child in superclasses_node.children
+            if child.type not in {"(", ")", ","}
+        ]
 
     class_symbol = SymbolRecord(
         name=class_name,
@@ -267,28 +341,51 @@ def _python_class_symbols(source: str, node: Node) -> list[SymbolCapture]:
 
     for child in body.children:
         if child.type == "decorated_definition":
-            nested_symbols.extend(_python_class_decorated_symbols(source, child, class_name))
+            nested_symbols.extend(
+                _python_class_decorated_symbols(source, child, class_name)
+            )
         if child.type == "function_definition":
-            nested_symbols.append(SymbolCapture(_python_function_symbol(source, child, parent=class_name), child))
+            nested_symbols.append(
+                SymbolCapture(
+                    _python_function_symbol(source, child, parent=class_name), child
+                )
+            )
         elif child.type == "expression_statement":
             assignment = child.child(0)
             if assignment is not None and assignment.type == "assignment":
-                symbol = _python_assignment_symbol(source, assignment, parent=class_name)
+                symbol = _python_assignment_symbol(
+                    source, assignment, parent=class_name
+                )
                 if symbol is not None:
                     nested_symbols.append(SymbolCapture(symbol, assignment))
     return nested_symbols
 
 
-def _python_class_decorated_symbols(source: str, node: Node, parent: str) -> list[SymbolCapture]:
-    definition = next((child for child in node.children if child.type in {"function_definition", "class_definition"}), None)
+def _python_class_decorated_symbols(
+    source: str, node: Node, parent: str
+) -> list[SymbolCapture]:
+    definition = next(
+        (
+            child
+            for child in node.children
+            if child.type in {"function_definition", "class_definition"}
+        ),
+        None,
+    )
     if definition is None:
         return []
     if definition.type == "function_definition":
-        return [SymbolCapture(_python_function_symbol(source, definition, parent=parent), definition)]
+        return [
+            SymbolCapture(
+                _python_function_symbol(source, definition, parent=parent), definition
+            )
+        ]
     return _python_class_symbols(source, definition)
 
 
-def _python_assignment_symbol(source: str, node: Node, parent: str | None = None) -> SymbolRecord | None:
+def _python_assignment_symbol(
+    source: str, node: Node, parent: str | None = None
+) -> SymbolRecord | None:
     left = node.child_by_field_name("left")
     right = node.child_by_field_name("right")
     if left is None or left.type != "identifier":
@@ -306,7 +403,11 @@ def _python_assignment_symbol(source: str, node: Node, parent: str | None = None
 def _python_parameter_list(source: str, node: Node | None) -> list[str]:
     if node is None:
         return []
-    return [_text(source, child) for child in node.children if child.type not in {"(", ")", ","}]
+    return [
+        _text(source, child)
+        for child in node.children
+        if child.type not in {"(", ")", ","}
+    ]
 
 
 def _python_decorators(source: str, node: Node) -> list[str]:
@@ -332,17 +433,23 @@ def _python_docstring(source: str, node: Node) -> str | None:
     return _clean_string_literal(_text(source, literal))
 
 
-def _typescript_import_statement(path: Path, source: str, node: Node, repo_root: Path) -> ImportEdge | None:
+def _typescript_import_statement(
+    path: Path, source: str, node: Node, repo_root: Path
+) -> ImportEdge | None:
     source_node = node.child_by_field_name("source")
     if source_node is None:
-        source_node = next((child for child in node.children if child.type == "string"), None)
+        source_node = next(
+            (child for child in node.children if child.type == "string"), None
+        )
     if source_node is None:
         return None
     module_name = _clean_string_literal(_text(source, source_node))
     names: list[str] = []
     import_clause = node.child_by_field_name("import_clause")
     if import_clause is None:
-        import_clause = next((child for child in node.children if child.type == "import_clause"), None)
+        import_clause = next(
+            (child for child in node.children if child.type == "import_clause"), None
+        )
     if import_clause is not None:
         names.extend(_typescript_import_names(source, import_clause))
     return ImportEdge(
@@ -354,10 +461,14 @@ def _typescript_import_statement(path: Path, source: str, node: Node, repo_root:
     )
 
 
-def _typescript_export_statement(path: Path, source: str, node: Node) -> ImportEdge | None:
+def _typescript_export_statement(
+    path: Path, source: str, node: Node
+) -> ImportEdge | None:
     source_node = node.child_by_field_name("source")
     if source_node is None:
-        source_node = next((child for child in node.children if child.type == "string"), None)
+        source_node = next(
+            (child for child in node.children if child.type == "string"), None
+        )
     if source_node is None:
         return None
     module_name = _clean_string_literal(_text(source, source_node))
@@ -377,7 +488,15 @@ def _typescript_export_symbols(source: str, node: Node) -> list[SymbolCapture]:
         (
             child
             for child in node.children
-            if child.type in {"lexical_declaration", "function_declaration", "class_declaration", "interface_declaration", "enum_declaration", "type_alias_declaration"}
+            if child.type
+            in {
+                "lexical_declaration",
+                "function_declaration",
+                "class_declaration",
+                "interface_declaration",
+                "enum_declaration",
+                "type_alias_declaration",
+            }
         ),
         None,
     )
@@ -408,7 +527,9 @@ def _typescript_import_names(source: str, node: Node) -> list[str]:
 
 
 def _typescript_export_names(source: str, node: Node) -> list[str]:
-    export_clause = next((child for child in node.children if child.type == "export_clause"), None)
+    export_clause = next(
+        (child for child in node.children if child.type == "export_clause"), None
+    )
     if export_clause is None:
         if any(child.type == "*" for child in node.children):
             return ["*"]
@@ -420,7 +541,9 @@ def _typescript_export_names(source: str, node: Node) -> list[str]:
     return names
 
 
-def _typescript_declaration_symbol(source: str, node: Node, parent: str | None) -> SymbolRecord | None:
+def _typescript_declaration_symbol(
+    source: str, node: Node, parent: str | None
+) -> SymbolRecord | None:
     name_node = node.child_by_field_name("name")
     if name_node is None:
         return None
@@ -443,7 +566,9 @@ def _typescript_declaration_symbol(source: str, node: Node, parent: str | None) 
     )
 
 
-def _typescript_class_members(source: str, node: Node, parent: str) -> list[SymbolCapture]:
+def _typescript_class_members(
+    source: str, node: Node, parent: str
+) -> list[SymbolCapture]:
     members: list[SymbolCapture] = []
     body = node.child_by_field_name("body")
     if body is None:
@@ -464,13 +589,13 @@ def _typescript_class_members(source: str, node: Node, parent: str) -> list[Symb
             members.append(
                 SymbolCapture(
                     SymbolRecord(
-                    name=name,
-                    kind="method",
-                    signature=signature,
-                    line_range=_line_range(child),
-                    parent=parent,
-                    return_type=normalized_return_type,
-                    parameters=params,
+                        name=name,
+                        kind="method",
+                        signature=signature,
+                        line_range=_line_range(child),
+                        parent=parent,
+                        return_type=normalized_return_type,
+                        parameters=params,
                     ),
                     child,
                 )
@@ -483,11 +608,11 @@ def _typescript_class_members(source: str, node: Node, parent: str) -> list[Symb
             members.append(
                 SymbolCapture(
                     SymbolRecord(
-                    name=name,
-                    kind="field",
-                    signature=_single_line(_text(source, child)),
-                    line_range=_line_range(child),
-                    parent=parent,
+                        name=name,
+                        kind="field",
+                        signature=_single_line(_text(source, child)),
+                        line_range=_line_range(child),
+                        parent=parent,
                     ),
                     child,
                 )
@@ -508,10 +633,10 @@ def _typescript_variable_symbols(source: str, node: Node) -> list[SymbolCapture]
         symbols.append(
             SymbolCapture(
                 SymbolRecord(
-                name=name,
-                kind="constant" if name.isupper() else "variable",
-                signature=f"{name} = {_typescript_variable_signature(source, value_node) if value_node is not None else ''}".strip(),
-                line_range=_line_range(child),
+                    name=name,
+                    kind="constant" if name.isupper() else "variable",
+                    signature=f"{name} = {_typescript_variable_signature(source, value_node) if value_node is not None else ''}".strip(),
+                    line_range=_line_range(child),
                 ),
                 child,
             )
@@ -524,7 +649,10 @@ def _typescript_variable_signature(source: str, value_node: Node) -> str:
     if value_node.type in {"arrow_function", "function_expression"}:
         body_node = value_node.child_by_field_name("body")
         if body_node is not None and body_node.type == "statement_block":
-            return _single_line(_text(source, value_node).split("{", 1)[0].strip()) + " { ... }"
+            return (
+                _single_line(_text(source, value_node).split("{", 1)[0].strip())
+                + " { ... }"
+            )
         return text
     if value_node.type == "object":
         return "{ ... }"
@@ -539,6 +667,331 @@ def _typescript_parameter_list(source: str, node: Node | None) -> list[str]:
     if node is None:
         return []
     return [_text(source, child) for child in node.named_children]
+
+
+def _is_rust_internal(module_name: str, repo_root: Path) -> bool:
+    """Check if a Rust module path is internal to the repo."""
+    if module_name.startswith(("crate::", "self::", "super::")):
+        return True
+    first_segment = module_name.split("::", 1)[0]
+    # Check for .rs file or module directory
+    dotted_path = repo_root / Path(*module_name.split("::"))
+    return (
+        (repo_root / f"{first_segment}.rs").exists()
+        or (repo_root / first_segment).is_dir()
+        or dotted_path.with_suffix(".rs").exists()
+        or dotted_path.is_dir()
+    )
+
+
+def _extract_rust(
+    path: Path, source: str, root: Node, repo_root: Path
+) -> FileExtraction:
+    """Extract symbols, imports and calls from a Rust source file."""
+    captures: list[SymbolCapture] = []
+    imports: list[ImportEdge] = []
+
+    for child in root.children:
+        # use statements (imports)
+        if child.type == "use_declaration":
+            imports.extend(_rust_use_declaration(path, source, child, repo_root))
+        # function definitions
+        elif child.type == "function_item":
+            symbol = _rust_function_symbol(source, child, parent=None)
+            captures.append(SymbolCapture(symbol, child))
+        # struct definitions
+        elif child.type == "struct_item":
+            captures.extend(_rust_struct_symbol(source, child, parent=None))
+        # enum definitions
+        elif child.type == "enum_item":
+            captures.extend(_rust_enum_symbol(source, child, parent=None))
+        # impl blocks
+        elif child.type == "impl_item":
+            captures.extend(_rust_impl_block(source, child, repo_root))
+        # mod declarations (treated as namespace markers)
+        elif child.type == "mod_item":
+            mod_name = _text(source, child.child_by_field_name("name"))
+            if mod_name:
+                captures.append(
+                    SymbolCapture(
+                        SymbolRecord(
+                            name=mod_name,
+                            kind="module",
+                            signature=f"mod {mod_name}",
+                            line_range=_line_range(child),
+                        ),
+                        child,
+                    )
+                )
+
+    symbols, call_sites = _annotate_call_graph(source, captures, "rust")
+    external_packages = sorted(
+        {
+            edge.imported_module.split("::", 1)[0]
+            for edge in imports
+            if not edge.is_internal
+        }
+    )
+    return FileExtraction(
+        "rust", str(path), symbols, imports, external_packages, call_sites
+    )
+
+
+def _rust_use_declaration(
+    path: Path, source: str, node: Node, repo_root: Path
+) -> list[ImportEdge]:
+    """Extract import edges from Rust `use` statements."""
+    edges: list[ImportEdge] = []
+    use_tree = node.child_by_field_name("tree")
+    if use_tree is None:
+        return edges
+
+    # Handle `use module::path;` (simple path)
+    if use_tree.type in ("use_tree", "use_tree_segment"):
+        segments = []
+        current = use_tree
+        while current:
+            path_node = current.child_by_field_name("path")
+            if path_node is not None:
+                for child in path_node.children:
+                    if child.type == "path_segment":
+                        name_node = child.child_by_field_name("name")
+                        if name_node is not None:
+                            segments.append(_text(source, name_node))
+            # Get the next segment if there's a tree child
+            next_tree = current.child_by_field_name("tree")
+            if next_tree is not None:
+                current = next_tree
+            else:
+                break
+
+        if segments:
+            module_name = "::".join(segments)
+            edges.append(
+                ImportEdge(
+                    str(path),
+                    module_name,
+                    _is_rust_internal(module_name, repo_root),
+                    names=[segments[-1]] if segments else [],
+                    line_range=_line_range(node),
+                )
+            )
+
+    # Handle `use crate::module::Struct { field1, field2 };` (with braces)
+    name_node = use_tree.child_by_field_name("name")
+    if name_node is not None:
+        module_segments = []
+        # Collect the path leading to this use_tree
+        parent = node
+        while parent and parent.type != "source_file":
+            if parent.type == "use_declaration":
+                break
+            parent = parent.parent if hasattr(parent, "parent") else None
+
+        # Extract names from brace use groups: `use std::io::{Read, Write}`
+        for child in use_tree.children:
+            if child.type == "use_tree":
+                nested = _rust_use_declaration(path, source, node, repo_root)
+                edges.extend(nested)
+                break
+
+        # Simple segment extraction
+        if use_tree.type == "use_tree_segment":
+            seg_name = use_tree.child_by_field_name("name")
+            if seg_name is not None:
+                edges.append(
+                    ImportEdge(
+                        str(path),
+                        _text(source, seg_name),
+                        _is_rust_internal(_text(source, seg_name), repo_root),
+                        names=[_text(source, seg_name)],
+                        line_range=_line_range(node),
+                    )
+                )
+
+    return edges
+
+
+def _rust_function_symbol(source: str, node: Node, parent: str | None) -> SymbolRecord:
+    """Extract a Rust function symbol."""
+    name_node = node.child_by_field_name("name")
+    name = _text(source, name_node) if name_node is not None else ""
+
+    # Extract parameters
+    signature_node = node.child_by_field_name("signature")
+    params: list[str] = []
+    if signature_node is not None:
+        parameters = signature_node.child_by_field_name("parameters")
+        if parameters is not None:
+            params = [
+                _text(source, child)
+                for child in parameters.children
+                if child.type == "function_parameter"
+            ]
+
+    # Extract return type
+    return_type: str | None = None
+    if signature_node is not None:
+        return_type_node = signature_node.child_by_field_name("return_type")
+        if return_type_node is not None:
+            return_type = _text(source, return_type_node)
+
+    # Build signature
+    param_str = ", ".join(params)
+    sig = f"fn {name}({param_str})"
+    if return_type:
+        sig += f" {return_type}"
+
+    return SymbolRecord(
+        name=name,
+        kind="function",
+        signature=sig,
+        line_range=_line_range(node),
+        parent=parent,
+        return_type=return_type,
+        parameters=params,
+    )
+
+
+def _rust_struct_symbol(
+    source: str, node: Node, parent: str | None
+) -> list[SymbolCapture]:
+    """Extract Rust struct symbols (struct name + fields)."""
+    name_node = node.child_by_field_name("name")
+    name = _text(source, name_node) if name_node is not None else ""
+    fields = node.child_by_field_name("fields")
+
+    captures: list[SymbolCapture] = []
+
+    field_sigs: list[str] = []
+    if fields is not None:
+        for child in fields.children:
+            if child.type == "field_declaration":
+                field_name_node = child.child_by_field_name("name")
+                field_type_node = child.child_by_field_name("type")
+                if field_name_node is not None and field_type_node is not None:
+                    field_sigs.append(
+                        f"{_text(source, field_name_node)}: {_text(source, field_type_node)}"
+                    )
+
+    # Build struct signature
+    field_str = ";\n    ".join(field_sigs) if field_sigs else ""
+    struct_sig = (
+        f"struct {name} {{\n    {field_str}\n}}" if field_str else f"struct {name}"
+    )
+
+    captures.append(
+        SymbolCapture(
+            SymbolRecord(
+                name=name,
+                kind="struct",
+                signature=struct_sig,
+                line_range=_line_range(node),
+                parent=parent,
+            ),
+            node,
+        )
+    )
+
+    # Add fields as child symbols
+    if fields is not None:
+        for child in fields.children:
+            if child.type == "field_declaration":
+                field_name_node = child.child_by_field_name("name")
+                field_type_node = child.child_by_field_name("type")
+                if field_name_node is not None and field_type_node is not None:
+                    field_name = _text(source, field_name_node)
+                    field_type = _text(source, field_type_node)
+                    captures.append(
+                        SymbolCapture(
+                            SymbolRecord(
+                                name=field_name,
+                                kind="field",
+                                signature=f"{field_name}: {field_type}",
+                                line_range=_line_range(child),
+                                parent=name,
+                            ),
+                            child,
+                        )
+                    )
+
+    return captures
+
+
+def _rust_enum_symbol(
+    source: str, node: Node, parent: str | None
+) -> list[SymbolCapture]:
+    """Extract Rust enum symbols (enum name + variants)."""
+    name_node = node.child_by_field_name("name")
+    name = _text(source, name_node) if name_node is not None else ""
+    body = node.child_by_field_name("body")
+
+    captures: list[SymbolCapture] = []
+
+    variant_names: list[str] = []
+    if body is not None:
+        for child in body.children:
+            if child.type == "enum_variant":
+                v_name_node = child.child_by_field_name("name")
+                if v_name_node is not None:
+                    variant_names.append(_text(source, v_name_node))
+
+    # Build enum signature
+    variant_str = ", ".join(variant_names)
+    enum_sig = f"enum {name} {{ {variant_str} }}" if variant_str else f"enum {name}"
+
+    captures.append(
+        SymbolCapture(
+            SymbolRecord(
+                name=name,
+                kind="enum",
+                signature=enum_sig,
+                line_range=_line_range(node),
+                parent=parent,
+            ),
+            node,
+        )
+    )
+
+    # Add variants as child symbols
+    if body is not None:
+        for child in body.children:
+            if child.type == "enum_variant":
+                v_name_node = child.child_by_field_name("name")
+                if v_name_node is not None:
+                    v_name = _text(source, v_name_node)
+                    captures.append(
+                        SymbolCapture(
+                            SymbolRecord(
+                                name=v_name,
+                                kind="enum_variant",
+                                signature=f"{v_name}",
+                                line_range=_line_range(child),
+                                parent=name,
+                            ),
+                            child,
+                        )
+                    )
+
+    return captures
+
+
+def _rust_impl_block(source: str, node: Node, repo_root: Path) -> list[SymbolCapture]:
+    """Extract symbols from Rust `impl` blocks."""
+    captures: list[SymbolCapture] = []
+    name_node = node.child_by_field_name("name")
+    impl_name = _text(source, name_node) if name_node is not None else ""
+
+    body = node.child_by_field_name("body")
+    if body is None:
+        return captures
+
+    for child in body.children:
+        if child.type == "function_item":
+            symbol = _rust_function_symbol(source, child, parent=impl_name or None)
+            captures.append(SymbolCapture(symbol, child))
+
+    return captures
 
 
 def _is_python_internal(module_name: str, repo_root: Path) -> bool:
@@ -559,7 +1012,7 @@ def _is_typescript_internal(module_name: str) -> bool:
 def _text(source: str, node: Node | None) -> str:
     if node is None:
         return ""
-    return _source_bytes(source)[node.start_byte:node.end_byte].decode("utf-8")
+    return _source_bytes(source)[node.start_byte : node.end_byte].decode("utf-8")
 
 
 @lru_cache(maxsize=128)
@@ -596,7 +1049,9 @@ def _typescript_return_type(source: str, node: Node | None) -> str | None:
     return _text(source, node).removeprefix(":").strip()
 
 
-def _annotate_call_graph(source: str, captures: list[SymbolCapture], language: str) -> tuple[list[SymbolRecord], list[CallSiteRecord]]:
+def _annotate_call_graph(
+    source: str, captures: list[SymbolCapture], language: str
+) -> tuple[list[SymbolRecord], list[CallSiteRecord]]:
     symbol_by_name = {capture.record.name: capture.record for capture in captures}
     incoming: dict[str, Counter[str]] = {name: Counter() for name in symbol_by_name}
     call_sites: list[CallSiteRecord] = []
@@ -604,22 +1059,40 @@ def _annotate_call_graph(source: str, captures: list[SymbolCapture], language: s
     for capture in captures:
         if capture.record.kind not in {"function", "method"}:
             continue
-        symbol_call_sites = _collect_call_sites(source, capture.node, language, capture.record.name)
+        symbol_call_sites = _collect_call_sites(
+            source, capture.node, language, capture.record.name
+        )
         call_sites.extend(symbol_call_sites)
         call_counts = Counter(site.callee_name for site in symbol_call_sites)
-        visible_counts = Counter({name: count for name, count in call_counts.items() if name != capture.record.name})
+        visible_counts = Counter(
+            {
+                name: count
+                for name, count in call_counts.items()
+                if name != capture.record.name
+            }
+        )
         capture.record.callees = [name for name, _ in visible_counts.most_common()]
-        internal_counts = Counter({name: count for name, count in visible_counts.items() if name in symbol_by_name})
+        internal_counts = Counter(
+            {
+                name: count
+                for name, count in visible_counts.items()
+                if name in symbol_by_name
+            }
+        )
         for callee_name, count in internal_counts.items():
             incoming[callee_name][capture.record.name] += count
 
     for capture in captures:
-        capture.record.callers = [name for name, _ in incoming[capture.record.name].most_common()]
+        capture.record.callers = [
+            name for name, _ in incoming[capture.record.name].most_common()
+        ]
 
     return [capture.record for capture in captures], call_sites
 
 
-def _collect_call_sites(source: str, node: Node, language: str, caller_name: str) -> list[CallSiteRecord]:
+def _collect_call_sites(
+    source: str, node: Node, language: str, caller_name: str
+) -> list[CallSiteRecord]:
     output: list[CallSiteRecord] = []
     stack = list(node.named_children)
     while stack:
@@ -628,12 +1101,24 @@ def _collect_call_sites(source: str, node: Node, language: str, caller_name: str
             function_node = current.child_by_field_name("function")
             function_name = _call_target_name(source, function_node, language)
             if function_name:
-                output.append(CallSiteRecord(caller_name=caller_name, callee_name=function_name, line_range=_line_range(current)))
+                output.append(
+                    CallSiteRecord(
+                        caller_name=caller_name,
+                        callee_name=function_name,
+                        line_range=_line_range(current),
+                    )
+                )
         elif language == "typescript" and current.type == "call_expression":
             function_node = current.child_by_field_name("function")
             function_name = _call_target_name(source, function_node, language)
             if function_name:
-                output.append(CallSiteRecord(caller_name=caller_name, callee_name=function_name, line_range=_line_range(current)))
+                output.append(
+                    CallSiteRecord(
+                        caller_name=caller_name,
+                        callee_name=function_name,
+                        line_range=_line_range(current),
+                    )
+                )
         stack.extend(current.named_children)
     return output
 

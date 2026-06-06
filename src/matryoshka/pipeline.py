@@ -10,7 +10,10 @@ from typing import Callable, Iterable
 from pathspec import GitIgnoreSpec
 
 from matryoshka.ast_extractor import FileExtraction, SymbolRecord, extract_file
-from matryoshka.community_detection import build_louvain_communities, build_theme_domains
+from matryoshka.community_detection import (
+    build_louvain_communities,
+    build_theme_domains,
+)
 from matryoshka.graph_builder import RepositoryGraphBuilder
 from matryoshka.graph_models import RepositoryGraph
 from matryoshka.labeling import LabelingEngine
@@ -19,7 +22,7 @@ from matryoshka.models import AnalyzedFile, FilePacket, LabelResult, NodePacket
 
 @dataclass(slots=True)
 class PipelineConfig:
-    include_suffixes: tuple[str, ...] = (".py", ".ts", ".tsx")
+    include_suffixes: tuple[str, ...] = (".py", ".ts", ".tsx", ".rs")
     excluded_suffixes: tuple[str, ...] = ()
     excluded_paths: tuple[str, ...] = ()
     honor_gitignore: bool = True
@@ -55,7 +58,9 @@ class RepositoryWalker:
 
     def collect_source_files(self, repo_root: str | Path) -> list[Path]:
         root = Path(repo_root)
-        gitignore_spec = _load_gitignore_spec(root) if self._config.honor_gitignore else None
+        gitignore_spec = (
+            _load_gitignore_spec(root) if self._config.honor_gitignore else None
+        )
         files: list[Path] = []
         for path in root.rglob("*"):
             if path.is_dir():
@@ -86,7 +91,9 @@ def _load_gitignore_spec(repo_root: Path) -> GitIgnoreSpec | None:
     return GitIgnoreSpec.from_lines(lines)
 
 
-def _is_excluded_path(path: Path, repo_root: Path, excluded_paths: tuple[str, ...]) -> bool:
+def _is_excluded_path(
+    path: Path, repo_root: Path, excluded_paths: tuple[str, ...]
+) -> bool:
     if not excluded_paths:
         return False
     relative_path = path.relative_to(repo_root).as_posix()
@@ -118,8 +125,13 @@ class FilePacketBuilder:
         source_text = path.read_text(encoding="utf-8")
         relative_path = path.relative_to(root).as_posix()
         ranked_symbols = _rank_symbols(extraction.symbols)
-        top_symbols = [symbol.signature for symbol in ranked_symbols[: self._config.max_symbols_per_file]]
-        docstrings = [symbol.docstring for symbol in ranked_symbols if symbol.docstring][: self._config.max_docstrings_per_file]
+        top_symbols = [
+            symbol.signature
+            for symbol in ranked_symbols[: self._config.max_symbols_per_file]
+        ]
+        docstrings = [
+            symbol.docstring for symbol in ranked_symbols if symbol.docstring
+        ][: self._config.max_docstrings_per_file]
         call_hints = _dedupe(
             hint
             for symbol in ranked_symbols
@@ -130,16 +142,42 @@ class FilePacketBuilder:
             ranked_symbols[: self._config.max_snippets_per_file],
             self._config.snippet_line_limit,
         )
-        imports_external = sorted({edge.imported_module for edge in extraction.import_edges if not edge.is_internal})
-        imports_internal = sorted({edge.imported_module for edge in extraction.import_edges if edge.is_internal})
-        imported_symbols = _dedupe(name for edge in extraction.import_edges for name in edge.names)
-        import_signature = Counter(_external_signature_key(edge.imported_module) for edge in extraction.import_edges if not edge.is_internal)
-        internal_signature = Counter(edge.imported_module for edge in extraction.import_edges if edge.is_internal)
+        imports_external = sorted(
+            {
+                edge.imported_module
+                for edge in extraction.import_edges
+                if not edge.is_internal
+            }
+        )
+        imports_internal = sorted(
+            {
+                edge.imported_module
+                for edge in extraction.import_edges
+                if edge.is_internal
+            }
+        )
+        imported_symbols = _dedupe(
+            name for edge in extraction.import_edges for name in edge.names
+        )
+        import_signature = Counter(
+            _external_signature_key(edge.imported_module)
+            for edge in extraction.import_edges
+            if not edge.is_internal
+        )
+        internal_signature = Counter(
+            edge.imported_module for edge in extraction.import_edges if edge.is_internal
+        )
 
         packet = FilePacket(
             path=relative_path,
             language=extraction.language,
-            summary_input=_build_summary_input(relative_path, extraction, top_symbols, imports_external, imports_internal),
+            summary_input=_build_summary_input(
+                relative_path,
+                extraction,
+                top_symbols,
+                imports_external,
+                imports_internal,
+            ),
             imports_external=imports_external,
             imports_internal=imports_internal,
             imported_symbols=imported_symbols,
@@ -177,27 +215,44 @@ class MatryoshkaPipeline:
     ) -> None:
         self._config = config or PipelineConfig()
         self._walker = walker or RepositoryWalker(self._config)
-        self._file_packet_builder = file_packet_builder or FilePacketBuilder(self._config)
+        self._file_packet_builder = file_packet_builder or FilePacketBuilder(
+            self._config
+        )
         self._labeling_engine = labeling_engine
         self._graph_builder = RepositoryGraphBuilder()
 
-    def analyze(self, repo_root: str | Path, progress: Callable[[str], None] | None = None) -> RepositoryGraph:
+    def analyze(
+        self, repo_root: str | Path, progress: Callable[[str], None] | None = None
+    ) -> RepositoryGraph:
         root = Path(repo_root)
         files = self._walker.collect_source_files(root)
         _emit_progress(progress, f"collected {len(files)} source files")
-        analyzed_files = {analysis.packet.path: analysis for analysis in (self._file_packet_builder.build(root, path) for path in files)}
-        file_packets = {path: analyzed.packet for path, analyzed in analyzed_files.items()}
+        analyzed_files = {
+            analysis.packet.path: analysis
+            for analysis in (
+                self._file_packet_builder.build(root, path) for path in files
+            )
+        }
+        file_packets = {
+            path: analyzed.packet for path, analyzed in analyzed_files.items()
+        }
         _emit_progress(progress, f"built {len(file_packets)} file packets")
 
         file_labels: dict[str, LabelResult] = {}
         if self._labeling_engine is not None and file_packets:
-            file_labels = self._labeling_engine.label_files(list(file_packets.values()), progress=progress)
+            file_labels = self._labeling_engine.label_files(
+                list(file_packets.values()), progress=progress
+            )
             _emit_progress(progress, f"labeled {len(file_labels)} files")
 
-        folder_packets, node_labels = self._build_folder_packets(root, file_packets, file_labels, progress=progress)
+        folder_packets, node_labels = self._build_folder_packets(
+            root, file_packets, file_labels, progress=progress
+        )
         _emit_progress(progress, f"built {len(folder_packets)} folder nodes")
 
-        repo_packet = self._build_repo_packet(root, file_packets, file_labels, folder_packets, node_labels)
+        repo_packet = self._build_repo_packet(
+            root, file_packets, file_labels, folder_packets, node_labels
+        )
         repo_label: LabelResult | None = None
         if self._labeling_engine is not None:
             repo_label = self._labeling_engine.label_node(repo_packet)
@@ -212,7 +267,9 @@ class MatryoshkaPipeline:
             repo_packet,
             repo_label,
         )
-        community_nodes, community_members = build_louvain_communities(graph.nodes, graph.imports, graph.calls)
+        community_nodes, community_members = build_louvain_communities(
+            graph.nodes, graph.imports, graph.calls
+        )
         if community_nodes:
             graph.nodes.extend(community_nodes)
             graph.community_members.extend(community_members)
@@ -220,7 +277,10 @@ class MatryoshkaPipeline:
         if theme_nodes:
             graph.nodes.extend(theme_nodes)
             graph.theme_members.extend(theme_members)
-        _emit_progress(progress, f"built graph with {len(graph.nodes)} nodes and {len(graph.symbols)} symbols")
+        _emit_progress(
+            progress,
+            f"built graph with {len(graph.nodes)} nodes and {len(graph.symbols)} symbols",
+        )
         return graph
 
     def _build_folder_packets(
@@ -252,7 +312,9 @@ class MatryoshkaPipeline:
                 folder_packets[packet.node_id] = packet
                 level_packets.append(packet)
             if self._labeling_engine is not None and level_packets:
-                folder_labels.update(self._labeling_engine.label_nodes(level_packets, progress=progress))
+                folder_labels.update(
+                    self._labeling_engine.label_nodes(level_packets, progress=progress)
+                )
 
         return folder_packets, folder_labels
 
@@ -264,21 +326,55 @@ class MatryoshkaPipeline:
         folder_packets: dict[str, NodePacket],
         node_labels: dict[str, LabelResult],
     ) -> NodePacket:
-        top_level_dirs = sorted(node_id for node_id in folder_packets if "/" not in node_id)
+        top_level_dirs = sorted(
+            node_id for node_id in folder_packets if "/" not in node_id
+        )
         root_files = sorted(path for path in file_packets if "/" not in path)
         child_ids = [*root_files, *top_level_dirs]
         child_summaries = [
-            *[_child_summary_for_file(path, file_packets, file_labels) for path in root_files],
-            *[_child_summary_for_folder(node_id, folder_packets, node_labels) for node_id in top_level_dirs],
+            *[
+                _child_summary_for_file(path, file_packets, file_labels)
+                for path in root_files
+            ],
+            *[
+                _child_summary_for_folder(node_id, folder_packets, node_labels)
+                for node_id in top_level_dirs
+            ],
         ][: self._config.max_node_child_summaries]
 
         file_iterable = list(file_packets.values())
-        top_tags = _top_counter_keys(Counter(tag for label in [*file_labels.values(), *node_labels.values()] for tag in label.tags), self._config.max_node_tags)
-        top_external = _top_counter_keys(Counter(name for packet in file_iterable for name in packet.imports_external), self._config.max_node_packages)
-        top_internal = _top_counter_keys(Counter(name for packet in file_iterable for name in packet.imports_internal), self._config.max_node_packages)
-        representative_symbols = _top_counter_keys(Counter(symbol for packet in file_iterable for symbol in packet.top_symbols), self._config.max_node_symbols)
-        representative_files = _representative_files(file_iterable, self._config.max_node_files)
-        representative_snippets = _representative_snippets(file_iterable, self._config.max_node_snippets)
+        top_tags = _top_counter_keys(
+            Counter(
+                tag
+                for label in [*file_labels.values(), *node_labels.values()]
+                for tag in label.tags
+            ),
+            self._config.max_node_tags,
+        )
+        top_external = _top_counter_keys(
+            Counter(
+                name for packet in file_iterable for name in packet.imports_external
+            ),
+            self._config.max_node_packages,
+        )
+        top_internal = _top_counter_keys(
+            Counter(
+                name for packet in file_iterable for name in packet.imports_internal
+            ),
+            self._config.max_node_packages,
+        )
+        representative_symbols = _top_counter_keys(
+            Counter(
+                symbol for packet in file_iterable for symbol in packet.top_symbols
+            ),
+            self._config.max_node_symbols,
+        )
+        representative_files = _representative_files(
+            file_iterable, self._config.max_node_files
+        )
+        representative_snippets = _representative_snippets(
+            file_iterable, self._config.max_node_snippets
+        )
 
         return NodePacket(
             node_id="repo",
@@ -292,7 +388,11 @@ class MatryoshkaPipeline:
             representative_symbols=representative_symbols,
             representative_files=representative_files,
             representative_snippets=representative_snippets,
-            metadata={"repo_name": repo_root.name, "file_count": len(file_iterable), "folder_count": len(folder_packets)},
+            metadata={
+                "repo_name": repo_root.name,
+                "file_count": len(file_iterable),
+                "folder_count": len(folder_packets),
+            },
         )
 
 
@@ -306,27 +406,65 @@ def _build_folder_packet(
     folder_labels: dict[str, LabelResult],
     config: PipelineConfig,
 ) -> NodePacket:
-    child_files = sorted(path for path in file_packets if _parent_directory(path) == directory)
-    child_folders = sorted(node_id for node_id in folder_packets if _parent_directory(node_id) == directory)
-    descendant_files = [packet for path, packet in file_packets.items() if _is_descendant_or_self(directory, _parent_directory(path))]
+    child_files = sorted(
+        path for path in file_packets if _parent_directory(path) == directory
+    )
+    child_folders = sorted(
+        node_id for node_id in folder_packets if _parent_directory(node_id) == directory
+    )
+    descendant_files = [
+        packet
+        for path, packet in file_packets.items()
+        if _is_descendant_or_self(directory, _parent_directory(path))
+    ]
     child_ids = [*child_files, *child_folders]
     child_summaries = [
-        *[_child_summary_for_file(path, file_packets, file_labels) for path in child_files],
-        *[_child_summary_for_folder(node_id, folder_packets, folder_labels) for node_id in child_folders],
+        *[
+            _child_summary_for_file(path, file_packets, file_labels)
+            for path in child_files
+        ],
+        *[
+            _child_summary_for_folder(node_id, folder_packets, folder_labels)
+            for node_id in child_folders
+        ],
     ][: config.max_node_child_summaries]
     top_tags = _top_counter_keys(
         Counter(
             tag
-            for label in [*[file_labels[path] for path in child_files if path in file_labels], *[folder_labels[node_id] for node_id in child_folders if node_id in folder_labels]]
+            for label in [
+                *[file_labels[path] for path in child_files if path in file_labels],
+                *[
+                    folder_labels[node_id]
+                    for node_id in child_folders
+                    if node_id in folder_labels
+                ],
+            ]
             for tag in label.tags
         ),
         config.max_node_tags,
     )
-    top_external = _top_counter_keys(Counter(name for packet in descendant_files for name in packet.imports_external), config.max_node_packages)
-    top_internal = _top_counter_keys(Counter(name for packet in descendant_files for name in packet.imports_internal), config.max_node_packages)
-    representative_symbols = _top_counter_keys(Counter(symbol for packet in descendant_files for symbol in packet.top_symbols), config.max_node_symbols)
-    representative_files = _representative_files(descendant_files, config.max_node_files)
-    representative_snippets = _representative_snippets(descendant_files, config.max_node_snippets)
+    top_external = _top_counter_keys(
+        Counter(
+            name for packet in descendant_files for name in packet.imports_external
+        ),
+        config.max_node_packages,
+    )
+    top_internal = _top_counter_keys(
+        Counter(
+            name for packet in descendant_files for name in packet.imports_internal
+        ),
+        config.max_node_packages,
+    )
+    representative_symbols = _top_counter_keys(
+        Counter(symbol for packet in descendant_files for symbol in packet.top_symbols),
+        config.max_node_symbols,
+    )
+    representative_files = _representative_files(
+        descendant_files, config.max_node_files
+    )
+    representative_snippets = _representative_snippets(
+        descendant_files, config.max_node_snippets
+    )
 
     return NodePacket(
         node_id=directory,
@@ -391,7 +529,9 @@ def _rank_symbols(symbols: Iterable[SymbolRecord]) -> list[SymbolRecord]:
     )
 
 
-def _select_snippets(source_text: str, symbols: list[SymbolRecord], line_limit: int) -> list[str]:
+def _select_snippets(
+    source_text: str, symbols: list[SymbolRecord], line_limit: int
+) -> list[str]:
     lines = source_text.splitlines()
     snippets: list[str] = []
     for symbol in symbols:
@@ -453,13 +593,19 @@ def _sort_folder_node_ids(nodes: dict[str, NodePacket]) -> list[str]:
     return sorted(nodes, key=lambda node_id: (_directory_depth(node_id), node_id))
 
 
-def _child_summary_for_file(path: str, file_packets: dict[str, FilePacket], file_labels: dict[str, LabelResult]) -> str:
+def _child_summary_for_file(
+    path: str, file_packets: dict[str, FilePacket], file_labels: dict[str, LabelResult]
+) -> str:
     if path in file_labels and file_labels[path].summary:
         return file_labels[path].summary
     return file_packets[path].summary_input
 
 
-def _child_summary_for_folder(node_id: str, folder_packets: dict[str, NodePacket], folder_labels: dict[str, LabelResult]) -> str:
+def _child_summary_for_folder(
+    node_id: str,
+    folder_packets: dict[str, NodePacket],
+    folder_labels: dict[str, LabelResult],
+) -> str:
     if node_id in folder_labels and folder_labels[node_id].summary:
         return folder_labels[node_id].summary
     return f"folder {folder_packets[node_id].path}"
@@ -470,7 +616,15 @@ def _top_counter_keys(counter: Counter[str], limit: int) -> list[str]:
 
 
 def _representative_files(file_packets: list[FilePacket], limit: int) -> list[str]:
-    scored = sorted(file_packets, key=lambda packet: (len(packet.top_symbols), len(packet.imports_external) + len(packet.imports_internal), packet.path), reverse=True)
+    scored = sorted(
+        file_packets,
+        key=lambda packet: (
+            len(packet.top_symbols),
+            len(packet.imports_external) + len(packet.imports_internal),
+            packet.path,
+        ),
+        reverse=True,
+    )
     return [packet.path for packet in scored[:limit]]
 
 
@@ -485,7 +639,15 @@ def _representative_snippets(file_packets: list[FilePacket], limit: int) -> list
 
 
 def _sorted_packets_for_snippets(file_packets: list[FilePacket]) -> list[FilePacket]:
-    return sorted(file_packets, key=lambda packet: (len(packet.code_snippets), len(packet.top_symbols), packet.path), reverse=True)
+    return sorted(
+        file_packets,
+        key=lambda packet: (
+            len(packet.code_snippets),
+            len(packet.top_symbols),
+            packet.path,
+        ),
+        reverse=True,
+    )
 
 
 def _emit_progress(progress: Callable[[str], None] | None, message: str) -> None:
