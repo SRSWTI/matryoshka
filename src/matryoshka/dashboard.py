@@ -1,4 +1,4 @@
-"""Local web dashboard for Cradle analysis artifacts.
+"""Local web dashboard for Matryoshka analysis artifacts.
 
 Serves a single-page application at http://127.0.0.1:<port>/ backed by
 Python's built-in HTTP server (no extra dependencies beyond numpy which is
@@ -36,6 +36,7 @@ logger = logging.getLogger(__name__)
 # Helpers
 # ---------------------------------------------------------------------------
 
+
 def _pca_2d(matrix: np.ndarray) -> np.ndarray:
     """Project an N×D matrix to N×2 via PCA (no external dependency)."""
     if matrix.shape[0] <= 2:
@@ -49,7 +50,8 @@ def _pca_2d(matrix: np.ndarray) -> np.ndarray:
 # Dashboard data layer
 # ---------------------------------------------------------------------------
 
-class CradleDashboard:
+
+class MatryoshkaDashboard:
     def __init__(
         self,
         db_path: str | Path,
@@ -94,9 +96,7 @@ class CradleDashboard:
             ).fetchall()
 
             tags_map: dict[str, list[str]] = {}
-            for row in conn.execute(
-                "SELECT node_id, tag FROM node_tags ORDER BY rank"
-            ):
+            for row in conn.execute("SELECT node_id, tag FROM node_tags ORDER BY rank"):
                 tags_map.setdefault(row["node_id"], []).append(row["tag"])
 
             cats_map: dict[str, list[str]] = {}
@@ -234,7 +234,11 @@ class CradleDashboard:
             if row["src"] and row["tgt"]
         ]
 
-        result: dict[str, Any] = {"nodes": nodes, "edges": edges, "call_edges": call_file_edges}
+        result: dict[str, Any] = {
+            "nodes": nodes,
+            "edges": edges,
+            "call_edges": call_file_edges,
+        }
         self._cache["graph"] = result
         return result
 
@@ -290,7 +294,9 @@ class CradleDashboard:
 
         members_map: dict[str, list[str]] = {}
         for row in member_rows:
-            members_map.setdefault(row["theme_node_id"], []).append(row["member_node_id"])
+            members_map.setdefault(row["theme_node_id"], []).append(
+                row["member_node_id"]
+            )
 
         themes = [
             {
@@ -325,7 +331,9 @@ class CradleDashboard:
 
         members_map: dict[str, list[str]] = {}
         for row in member_rows:
-            members_map.setdefault(row["community_node_id"], []).append(row["member_node_id"])
+            members_map.setdefault(row["community_node_id"], []).append(
+                row["member_node_id"]
+            )
 
         communities = [
             {
@@ -356,7 +364,7 @@ class CradleDashboard:
             result: dict[str, Any] = {
                 "error": (
                     "No semantic index found. "
-                    f"Run: cradle semantic-index {self.db_path}"
+                    f"Run: matryoshka semantic-index {self.db_path}"
                 ),
                 "points": [],
             }
@@ -562,7 +570,9 @@ class CradleDashboard:
 
         server = HTTPServer(("127.0.0.1", self.port), _Handler)
         url = f"http://127.0.0.1:{self.port}"
-        print(f"\n  Cradle Dashboard  →  {url}\n  DB: {self.db_path}\n  Press Ctrl-C to stop.\n")
+        print(
+            f"\n  Matryoshka Dashboard  →  {url}\n  DB: {self.db_path}\n  Press Ctrl-C to stop.\n"
+        )
 
         if open_browser:
             threading.Timer(0.6, webbrowser.open, args=[url]).start()
@@ -579,13 +589,16 @@ class CradleDashboard:
 # Convenience entry point
 # ---------------------------------------------------------------------------
 
+
 def run_dashboard(
     db_path: str | Path,
     index_dir: str | Path | None = None,
     port: int = 8765,
     open_browser: bool = True,
 ) -> None:
-    CradleDashboard(db_path, index_dir=index_dir, port=port).serve(open_browser=open_browser)
+    MatryoshkaDashboard(db_path, index_dir=index_dir, port=port).serve(
+        open_browser=open_browser
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -597,7 +610,7 @@ _DASHBOARD_HTML = r"""<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Cradle · Dashboard</title>
+<title>Matryoshka · Dashboard</title>
 <script src="https://unpkg.com/cytoscape@3.30.2/dist/cytoscape.min.js"></script>
 <script src="https://cdn.plot.ly/plotly-2.35.2.min.js" charset="utf-8"></script>
 <style>
@@ -758,7 +771,7 @@ select:focus { border-color: var(--accent); }
 
 <div id="app">
   <header id="hdr">
-    <span id="app-title">⬡ Cradle</span>
+    <span id="app-title">⬡ Matryoshka</span>
     <span id="db-name"></span>
     <div id="stats-bar">
       <div class="stat"><span class="stat-val" id="sv-files">—</span><span class="stat-lbl">files</span></div>
@@ -1488,7 +1501,7 @@ function showOOSDetail(nodeId, name) {
     <div class="det-sec"><p class="det-summary">
       This module was imported as an internal dependency but its target file was
       not found in the analysed root. It may live in a parent package or sibling
-      project that Cradle did not analyse.
+      project that Matryoshka did not analyse.
     </p></div>`;
 }
 

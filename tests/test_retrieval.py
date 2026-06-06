@@ -3,10 +3,10 @@ from __future__ import annotations
 import json
 import sqlite3
 
-from cradle.labeling import LabelingConfig, LabelingEngine
-from cradle.pipeline import CradlePipeline, PipelineConfig
-from cradle.retrieval import axe_retrieval
-from cradle.storage import CradleDatabase
+from matryoshka.labeling import LabelingConfig, LabelingEngine
+from matryoshka.pipeline import MatryoshkaPipeline, PipelineConfig
+from matryoshka.retrieval import axe_retrieval
+from matryoshka.storage import MatryoshkaDatabase
 
 
 class FakeClient:
@@ -122,11 +122,11 @@ def verify_token(token: str) -> bool:
     )
 
     engine = LabelingEngine(FakeClient(), LabelingConfig())
-    pipeline = CradlePipeline(config=PipelineConfig(), labeling_engine=engine)
+    pipeline = MatryoshkaPipeline(config=PipelineConfig(), labeling_engine=engine)
     graph = pipeline.analyze(tmp_path)
 
     db_path = tmp_path / "index.db"
-    database = CradleDatabase(db_path)
+    database = MatryoshkaDatabase(db_path)
     database.replace_graph(graph)
 
     conn = sqlite3.connect(db_path)
@@ -183,11 +183,11 @@ def stream_bedrock_lazy() -> str:
     )
 
     engine = LabelingEngine(FakeClient(), LabelingConfig())
-    pipeline = CradlePipeline(config=PipelineConfig(), labeling_engine=engine)
+    pipeline = MatryoshkaPipeline(config=PipelineConfig(), labeling_engine=engine)
     graph = pipeline.analyze(tmp_path)
 
     db_path = tmp_path / "index.db"
-    CradleDatabase(db_path).replace_graph(graph)
+    MatryoshkaDatabase(db_path).replace_graph(graph)
 
     exact_result = axe_retrieval(db_path, "stream_bedrock", limit=3)
 
@@ -227,11 +227,11 @@ def load_openai_credentials() -> str | None:
     )
 
     engine = LabelingEngine(FakeClient(), LabelingConfig())
-    pipeline = CradlePipeline(config=PipelineConfig(), labeling_engine=engine)
+    pipeline = MatryoshkaPipeline(config=PipelineConfig(), labeling_engine=engine)
     graph = pipeline.analyze(tmp_path)
 
     db_path = tmp_path / "index.db"
-    CradleDatabase(db_path).replace_graph(graph)
+    MatryoshkaDatabase(db_path).replace_graph(graph)
 
     result = axe_retrieval(db_path, "how are api keys loaded from environment", limit=3)
 

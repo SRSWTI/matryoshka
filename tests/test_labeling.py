@@ -4,10 +4,10 @@ import json
 import sqlite3
 from pathlib import Path
 
-from cradle.cache import LabelCache
-from cradle.labeling import LabelingConfig, LabelingEngine
-from cradle.models import FilePacket, NodePacket
-from cradle.prompts import LABEL_RESPONSE_SCHEMA, build_file_label_messages, build_node_label_messages
+from matryoshka.cache import LabelCache
+from matryoshka.labeling import LabelingConfig, LabelingEngine
+from matryoshka.models import FilePacket, NodePacket
+from matryoshka.prompts import LABEL_RESPONSE_SCHEMA, build_file_label_messages, build_node_label_messages
 
 
 class FakeClient:

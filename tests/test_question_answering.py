@@ -6,11 +6,11 @@ import re
 
 import numpy as np
 
-from cradle.labeling import LabelingConfig, LabelingEngine
-from cradle.pipeline import CradlePipeline, PipelineConfig
-from cradle.question_answering import axe_question
-from cradle.semantic_index import SemanticIndexBuilder
-from cradle.storage import CradleDatabase
+from matryoshka.labeling import LabelingConfig, LabelingEngine
+from matryoshka.pipeline import MatryoshkaPipeline, PipelineConfig
+from matryoshka.question_answering import axe_question
+from matryoshka.semantic_index import SemanticIndexBuilder
+from matryoshka.storage import MatryoshkaDatabase
 
 
 class FakeClient:
@@ -112,9 +112,9 @@ def stream_bedrock() -> str:
     )
 
     engine = LabelingEngine(FakeClient(), LabelingConfig())
-    graph = CradlePipeline(config=PipelineConfig(), labeling_engine=engine).analyze(tmp_path)
+    graph = MatryoshkaPipeline(config=PipelineConfig(), labeling_engine=engine).analyze(tmp_path)
     db_path = tmp_path / "index.db"
-    CradleDatabase(db_path).replace_graph(graph)
+    MatryoshkaDatabase(db_path).replace_graph(graph)
     SemanticIndexBuilder(db_path, embedder=FakeEmbedder()).build()
 
     result = axe_question(db_path, "where does the system decide what to show the user", embedder=FakeEmbedder())
@@ -150,9 +150,9 @@ def stream_bedrock_lazy() -> str:
     )
 
     engine = LabelingEngine(FakeClient(), LabelingConfig())
-    graph = CradlePipeline(config=PipelineConfig(), labeling_engine=engine).analyze(tmp_path)
+    graph = MatryoshkaPipeline(config=PipelineConfig(), labeling_engine=engine).analyze(tmp_path)
     db_path = tmp_path / "index.db"
-    CradleDatabase(db_path).replace_graph(graph)
+    MatryoshkaDatabase(db_path).replace_graph(graph)
     SemanticIndexBuilder(db_path, embedder=FakeEmbedder()).build()
 
     result = axe_question(db_path, "who calls stream_bedrock", embedder=FakeEmbedder())

@@ -2,10 +2,10 @@ from __future__ import annotations
 
 import json
 
-from cradle.exact_search import axe_call_search, axe_file_search, axe_import_search, axe_module_search, axe_reference_search, axe_symbol_search
-from cradle.labeling import LabelingConfig, LabelingEngine
-from cradle.pipeline import CradlePipeline, PipelineConfig
-from cradle.storage import CradleDatabase
+from matryoshka.exact_search import axe_call_search, axe_file_search, axe_import_search, axe_module_search, axe_reference_search, axe_symbol_search
+from matryoshka.labeling import LabelingConfig, LabelingEngine
+from matryoshka.pipeline import MatryoshkaPipeline, PipelineConfig
+from matryoshka.storage import MatryoshkaDatabase
 
 
 class FakeClient:
@@ -110,11 +110,11 @@ def stream_bedrock_lazy() -> str:
     )
 
     engine = LabelingEngine(FakeClient(), LabelingConfig())
-    pipeline = CradlePipeline(config=PipelineConfig(), labeling_engine=engine)
+    pipeline = MatryoshkaPipeline(config=PipelineConfig(), labeling_engine=engine)
     graph = pipeline.analyze(tmp_path)
 
     db_path = tmp_path / "index.db"
-    CradleDatabase(db_path).replace_graph(graph)
+    MatryoshkaDatabase(db_path).replace_graph(graph)
 
     file_result = axe_file_search(db_path, "middleware.py", limit=3)
     assert file_result.node_hits

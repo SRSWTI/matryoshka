@@ -60,7 +60,7 @@ class ImportRecord:
     strength_weight: float
     # True when the import looks internal (same package / relative) but the
     # target file does not exist within the analyzed root.  The dependency is
-    # real but lives outside the Cradle analysis scope.
+    # real but lives outside the Matryoshka analysis scope.
     is_out_of_scope: bool = False
     names: list[str] = field(default_factory=list)
     start_line: int | None = None

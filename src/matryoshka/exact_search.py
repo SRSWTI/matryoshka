@@ -6,9 +6,9 @@ import sqlite3
 from collections import defaultdict
 from pathlib import Path
 
-from cradle.graph_models import CallRecord, CodeNode, CodeSymbol, ExactCallHit, ExactImportHit, ExactReferenceHit, ExactSearchResult, ImportRecord, RetrievalNodeHit, RetrievalSymbolHit, SymbolReferenceRecord
-from cradle.result_loader import SQLiteResultLoader
-from cradle.retrieval import QueryPlan, build_query_plan
+from matryoshka.graph_models import CallRecord, CodeNode, CodeSymbol, ExactCallHit, ExactImportHit, ExactReferenceHit, ExactSearchResult, ImportRecord, RetrievalNodeHit, RetrievalSymbolHit, SymbolReferenceRecord
+from matryoshka.result_loader import SQLiteResultLoader
+from matryoshka.retrieval import QueryPlan, build_query_plan
 
 _WORD_SPLIT = re.compile(r"[^a-z0-9_]+")
 

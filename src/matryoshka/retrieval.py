@@ -8,8 +8,8 @@ from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 
-from cradle.graph_models import RetrievalResult
-from cradle.result_loader import SQLiteResultLoader
+from matryoshka.graph_models import RetrievalResult
+from matryoshka.result_loader import SQLiteResultLoader
 
 logger = logging.getLogger(__name__)
 

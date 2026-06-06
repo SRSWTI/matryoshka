@@ -3,10 +3,10 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
 
-from cradle.cache import LabelCache
-from cradle.llm_client import OpenAICompatibleClient
-from cradle.models import ConsistencyReport, FilePacket, LabelResult, NodePacket
-from cradle.prompts import DEFAULT_TAXONOMY, build_confirmation_messages, build_file_label_messages, build_node_label_messages
+from matryoshka.cache import LabelCache
+from matryoshka.llm_client import OpenAICompatibleClient
+from matryoshka.models import ConsistencyReport, FilePacket, LabelResult, NodePacket
+from matryoshka.prompts import DEFAULT_TAXONOMY, build_confirmation_messages, build_file_label_messages, build_node_label_messages
 
 
 @dataclass(slots=True)

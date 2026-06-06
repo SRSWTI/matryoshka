@@ -4,7 +4,7 @@ import json
 import sqlite3
 from pathlib import Path
 
-from cradle.graph_models import CallRecord, CodeNode, CodeSymbol, ImportRecord, NodeContextRecord, RetrievalNodeHit, RetrievalSymbolHit, SymbolReferenceRecord
+from matryoshka.graph_models import CallRecord, CodeNode, CodeSymbol, ImportRecord, NodeContextRecord, RetrievalNodeHit, RetrievalSymbolHit, SymbolReferenceRecord
 
 
 class SQLiteResultLoader:

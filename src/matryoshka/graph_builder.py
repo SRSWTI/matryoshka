@@ -5,8 +5,16 @@ import posixpath
 from collections import defaultdict
 from pathlib import Path
 
-from cradle.graph_models import CallRecord, CodeNode, CodeSymbol, ImportRecord, NodeContextRecord, RepositoryGraph, SymbolReferenceRecord
-from cradle.models import AnalyzedFile, LabelResult, NodePacket
+from matryoshka.graph_models import (
+    CallRecord,
+    CodeNode,
+    CodeSymbol,
+    ImportRecord,
+    NodeContextRecord,
+    RepositoryGraph,
+    SymbolReferenceRecord,
+)
+from matryoshka.models import AnalyzedFile, LabelResult, NodePacket
 
 logger = logging.getLogger(__name__)
 
@@ -22,10 +30,20 @@ class RepositoryGraphBuilder:
         repo_packet: NodePacket,
         repo_label: LabelResult | None,
     ) -> RepositoryGraph:
-        nodes = self._build_nodes(repo_root, analyzed_files, file_labels, folder_packets, node_labels, repo_packet, repo_label)
+        nodes = self._build_nodes(
+            repo_root,
+            analyzed_files,
+            file_labels,
+            folder_packets,
+            node_labels,
+            repo_packet,
+            repo_label,
+        )
         symbols = self._build_symbols(analyzed_files)
         imports = self._build_imports(repo_root, analyzed_files, folder_packets)
-        node_context = self._build_node_context(imports, file_labels, node_labels, repo_label)
+        node_context = self._build_node_context(
+            imports, file_labels, node_labels, repo_label
+        )
         calls = self._build_calls(analyzed_files, symbols, imports)
         references = self._build_references(imports, calls, symbols)
         logger.info(
@@ -72,9 +90,15 @@ class RepositoryGraphBuilder:
                     kind="file",
                     parent_id=_parent_node_id(relative_path),
                     language=analyzed.packet.language,
-                    summary=label.summary if label is not None else analyzed.packet.summary_input,
-                    description=label.description if label is not None else analyzed.packet.summary_input,
-                    primary_category=label.primary_category if label is not None else None,
+                    summary=label.summary
+                    if label is not None
+                    else analyzed.packet.summary_input,
+                    description=label.description
+                    if label is not None
+                    else analyzed.packet.summary_input,
+                    primary_category=label.primary_category
+                    if label is not None
+                    else None,
                     categories=list(label.categories) if label is not None else [],
                     tags=list(label.tags) if label is not None else [],
                     confidence=label.confidence if label is not None else 0.0,
@@ -99,11 +123,17 @@ class RepositoryGraphBuilder:
                     name=Path(packet.path).name,
                     kind="folder",
                     parent_id=_parent_node_id(node_id),
-                    summary=label.summary if label is not None else f"Folder {packet.path}",
+                    summary=label.summary
+                    if label is not None
+                    else f"Folder {packet.path}",
                     description=label.description if label is not None else "",
-                    primary_category=label.primary_category if label is not None else None,
+                    primary_category=label.primary_category
+                    if label is not None
+                    else None,
                     categories=list(label.categories) if label is not None else [],
-                    tags=list(label.tags) if label is not None else list(packet.top_tags),
+                    tags=list(label.tags)
+                    if label is not None
+                    else list(packet.top_tags),
                     confidence=label.confidence if label is not None else 0.0,
                     file_count=int(metadata.get("file_count", 0)),
                     folder_count=int(metadata.get("direct_folder_count", 0)),
@@ -117,11 +147,19 @@ class RepositoryGraphBuilder:
                 name=repo_root.name,
                 kind="repo",
                 parent_id=None,
-                summary=repo_label.summary if repo_label is not None else f"Repository {repo_root.name}",
+                summary=repo_label.summary
+                if repo_label is not None
+                else f"Repository {repo_root.name}",
                 description=repo_label.description if repo_label is not None else "",
-                primary_category=repo_label.primary_category if repo_label is not None else None,
-                categories=list(repo_label.categories) if repo_label is not None else [],
-                tags=list(repo_label.tags) if repo_label is not None else list(repo_packet.top_tags),
+                primary_category=repo_label.primary_category
+                if repo_label is not None
+                else None,
+                categories=list(repo_label.categories)
+                if repo_label is not None
+                else [],
+                tags=list(repo_label.tags)
+                if repo_label is not None
+                else list(repo_packet.top_tags),
                 confidence=repo_label.confidence if repo_label is not None else 0.0,
                 file_count=int(repo_packet.metadata.get("file_count", 0)),
                 folder_count=int(repo_packet.metadata.get("folder_count", 0)),
@@ -129,13 +167,19 @@ class RepositoryGraphBuilder:
         )
         return nodes
 
-    def _build_symbols(self, analyzed_files: dict[str, AnalyzedFile]) -> list[CodeSymbol]:
+    def _build_symbols(
+        self, analyzed_files: dict[str, AnalyzedFile]
+    ) -> list[CodeSymbol]:
         symbols: list[CodeSymbol] = []
         for relative_path in sorted(analyzed_files):
             extraction = analyzed_files[relative_path].extraction
             for symbol in extraction.symbols:
-                qualified_name = f"{symbol.parent}.{symbol.name}" if symbol.parent else symbol.name
-                symbol_id = build_symbol_id(relative_path, qualified_name, symbol.line_range.start_line)
+                qualified_name = (
+                    f"{symbol.parent}.{symbol.name}" if symbol.parent else symbol.name
+                )
+                symbol_id = build_symbol_id(
+                    relative_path, qualified_name, symbol.line_range.start_line
+                )
                 symbols.append(
                     CodeSymbol(
                         symbol_id=symbol_id,
@@ -186,9 +230,11 @@ class RepositoryGraphBuilder:
                 # An import classified as internal but whose target cannot be
                 # resolved to any file or folder within the analyzed root is
                 # "out of scope": the dependency is real but lives outside the
-                # portion of the repository that Cradle analysed.
+                # portion of the repository that Matryoshka analysed.
                 is_out_of_scope = edge.is_internal and target_node_id is None
-                strength_label, strength_weight = classify_import_strength(relative_path, target_node_id, edge.is_internal)
+                strength_label, strength_weight = classify_import_strength(
+                    relative_path, target_node_id, edge.is_internal
+                )
                 imports.append(
                     ImportRecord(
                         importer_node_id=relative_path,
@@ -199,10 +245,18 @@ class RepositoryGraphBuilder:
                         strength_label=strength_label,
                         strength_weight=strength_weight,
                         names=list(edge.names),
-                        start_line=edge.line_range.start_line if edge.line_range is not None else None,
-                        start_column=edge.line_range.start_column if edge.line_range is not None else None,
-                        end_line=edge.line_range.end_line if edge.line_range is not None else None,
-                        end_column=edge.line_range.end_column if edge.line_range is not None else None,
+                        start_line=edge.line_range.start_line
+                        if edge.line_range is not None
+                        else None,
+                        start_column=edge.line_range.start_column
+                        if edge.line_range is not None
+                        else None,
+                        end_line=edge.line_range.end_line
+                        if edge.line_range is not None
+                        else None,
+                        end_column=edge.line_range.end_column
+                        if edge.line_range is not None
+                        else None,
                     )
                 )
         return imports
@@ -249,7 +303,9 @@ class RepositoryGraphBuilder:
         symbols: list[CodeSymbol],
         imports: list[ImportRecord],
     ) -> list[CallRecord]:
-        symbols_by_node_name: dict[tuple[str, str], list[CodeSymbol]] = defaultdict(list)
+        symbols_by_node_name: dict[tuple[str, str], list[CodeSymbol]] = defaultdict(
+            list
+        )
         symbols_by_name: dict[str, list[CodeSymbol]] = defaultdict(list)
         for symbol in symbols:
             symbols_by_node_name[(symbol.node_id, symbol.name)].append(symbol)
@@ -260,18 +316,33 @@ class RepositoryGraphBuilder:
         for relative_path in sorted(analyzed_files):
             extraction = analyzed_files[relative_path].extraction
             for call_site in extraction.call_sites:
-                caller_candidates = symbols_by_node_name.get((relative_path, call_site.caller_name), [])
+                caller_candidates = symbols_by_node_name.get(
+                    (relative_path, call_site.caller_name), []
+                )
                 if not caller_candidates:
                     continue
-                caller_symbol = sorted(caller_candidates, key=lambda item: (item.start_line or 0, item.symbol_id))[0]
-                target_symbol = resolve_call_target(relative_path, call_site.callee_name, symbols_by_node_name, imported_targets, symbols_by_name)
+                caller_symbol = sorted(
+                    caller_candidates,
+                    key=lambda item: (item.start_line or 0, item.symbol_id),
+                )[0]
+                target_symbol = resolve_call_target(
+                    relative_path,
+                    call_site.callee_name,
+                    symbols_by_node_name,
+                    imported_targets,
+                    symbols_by_name,
+                )
                 calls.append(
                     CallRecord(
                         caller_symbol_id=caller_symbol.symbol_id,
                         caller_node_id=relative_path,
                         callee_name=call_site.callee_name,
-                        target_symbol_id=target_symbol.symbol_id if target_symbol is not None else None,
-                        target_node_id=target_symbol.node_id if target_symbol is not None else None,
+                        target_symbol_id=target_symbol.symbol_id
+                        if target_symbol is not None
+                        else None,
+                        target_node_id=target_symbol.node_id
+                        if target_symbol is not None
+                        else None,
                         start_line=call_site.line_range.start_line,
                         start_column=call_site.line_range.start_column,
                         end_line=call_site.line_range.end_line,
@@ -287,7 +358,9 @@ class RepositoryGraphBuilder:
         symbols: list[CodeSymbol],
     ) -> list[SymbolReferenceRecord]:
         references: list[SymbolReferenceRecord] = []
-        symbols_by_node_name: dict[tuple[str, str], list[CodeSymbol]] = defaultdict(list)
+        symbols_by_node_name: dict[tuple[str, str], list[CodeSymbol]] = defaultdict(
+            list
+        )
         symbols_by_id = {symbol.symbol_id: symbol for symbol in symbols}
         for symbol in symbols:
             symbols_by_node_name[(symbol.node_id, symbol.name)].append(symbol)
@@ -315,12 +388,16 @@ class RepositoryGraphBuilder:
             for imported_name in names:
                 clean_name = normalize_imported_name(imported_name)
                 target_symbol = None
-                candidates = symbols_by_node_name.get((record.target_node_id, clean_name), [])
+                candidates = symbols_by_node_name.get(
+                    (record.target_node_id, clean_name), []
+                )
                 if len(candidates) == 1:
                     target_symbol = candidates[0]
                 references.append(
                     SymbolReferenceRecord(
-                        target_symbol_id=target_symbol.symbol_id if target_symbol is not None else None,
+                        target_symbol_id=target_symbol.symbol_id
+                        if target_symbol is not None
+                        else None,
                         target_node_id=record.target_node_id,
                         target_name=clean_name,
                         source_node_id=record.importer_node_id,
@@ -333,7 +410,11 @@ class RepositoryGraphBuilder:
                     )
                 )
 
-        unresolved_targets = sum(1 for reference in references if reference.target_symbol_id is None and reference.target_node_id is None)
+        unresolved_targets = sum(
+            1
+            for reference in references
+            if reference.target_symbol_id is None and reference.target_node_id is None
+        )
         if unresolved_targets:
             logger.debug("recorded %s unresolved references", unresolved_targets)
         else:
@@ -346,7 +427,9 @@ def build_symbol_id(path: str, qualified_name: str, start_line: int | None) -> s
     return f"{path}::{qualified_name}::L{line_suffix}"
 
 
-def classify_import_strength(importer_path: str, target_node_id: str | None, is_internal: bool) -> tuple[str, float]:
+def classify_import_strength(
+    importer_path: str, target_node_id: str | None, is_internal: bool
+) -> tuple[str, float]:
     if not is_internal or target_node_id is None:
         return "weak", 0.2
 
@@ -391,18 +474,22 @@ def resolve_internal_import(
     if language == "python":
         parts = imported_module.split(".")
         module_path = Path(*parts).as_posix()
-        candidates.extend([
-            f"{module_path}.py",
-            Path(module_path, "__init__.py").as_posix(),
-            module_path,
-        ])
+        candidates.extend(
+            [
+                f"{module_path}.py",
+                Path(module_path, "__init__.py").as_posix(),
+                module_path,
+            ]
+        )
     else:
         if imported_module.startswith("@/"):
             base = imported_module[2:]
         elif imported_module.startswith("/"):
             base = imported_module.lstrip("/")
         else:
-            base = posixpath.normpath(posixpath.join(posixpath.dirname(importer_path), imported_module))
+            base = posixpath.normpath(
+                posixpath.join(posixpath.dirname(importer_path), imported_module)
+            )
         base = base.rstrip("/")
         candidates.extend(
             [
@@ -439,7 +526,9 @@ def _imported_symbol_targets(
     imports: list[ImportRecord],
     symbols_by_node_name: dict[tuple[str, str], list[CodeSymbol]],
 ) -> dict[str, dict[str, list[CodeSymbol]]]:
-    imported_targets: dict[str, dict[str, list[CodeSymbol]]] = defaultdict(lambda: defaultdict(list))
+    imported_targets: dict[str, dict[str, list[CodeSymbol]]] = defaultdict(
+        lambda: defaultdict(list)
+    )
     for record in imports:
         if not record.is_internal or record.target_node_id is None:
             continue
@@ -448,11 +537,15 @@ def _imported_symbol_targets(
             for (node_id, symbol_name), candidates in symbols_by_node_name.items():
                 if node_id != record.target_node_id:
                     continue
-                imported_targets[record.importer_node_id][symbol_name].extend(candidates)
+                imported_targets[record.importer_node_id][symbol_name].extend(
+                    candidates
+                )
             continue
         for imported_name in names:
             clean_name = normalize_imported_name(imported_name)
-            imported_targets[record.importer_node_id][clean_name].extend(symbols_by_node_name.get((record.target_node_id, clean_name), []))
+            imported_targets[record.importer_node_id][clean_name].extend(
+                symbols_by_node_name.get((record.target_node_id, clean_name), [])
+            )
     return imported_targets
 
 

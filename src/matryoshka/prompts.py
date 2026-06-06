@@ -3,8 +3,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from cradle.models import FilePacket, NodePacket
-
+from matryoshka.models import FilePacket, NodePacket
 
 DEFAULT_TAXONOMY = (
     "authentication",
@@ -36,7 +35,14 @@ DEFAULT_TAXONOMY = (
 LABEL_RESPONSE_SCHEMA: dict[str, Any] = {
     "type": "object",
     "additionalProperties": False,
-    "required": ["summary", "description", "tags", "categories", "confidence", "evidence"],
+    "required": [
+        "summary",
+        "description",
+        "tags",
+        "categories",
+        "confidence",
+        "evidence",
+    ],
     "properties": {
         "summary": {"type": "string"},
         "description": {"type": "string"},
@@ -48,10 +54,12 @@ LABEL_RESPONSE_SCHEMA: dict[str, Any] = {
 }
 
 
-def build_file_label_messages(packet: FilePacket, taxonomy: tuple[str, ...] = DEFAULT_TAXONOMY) -> list[dict[str, str]]:
+def build_file_label_messages(
+    packet: FilePacket, taxonomy: tuple[str, ...] = DEFAULT_TAXONOMY
+) -> list[dict[str, str]]:
     system_prompt = "\n".join(
         [
-            "You are Cradle's file labeling engine.",
+            "You are Matryoshka's file labeling engine.",
             "Your job is to classify a single source file using only the structured evidence provided.",
             "Prefer precise software capability tags over broad topic words.",
             "For developer tooling code, prefer categories like developer-tooling, code-analysis, llm-integration, cli-tooling, pipeline-orchestration, caching, and types-and-models over incidental implementation details.",
@@ -75,10 +83,12 @@ def build_file_label_messages(packet: FilePacket, taxonomy: tuple[str, ...] = DE
     ]
 
 
-def build_node_label_messages(packet: NodePacket, taxonomy: tuple[str, ...] = DEFAULT_TAXONOMY) -> list[dict[str, str]]:
+def build_node_label_messages(
+    packet: NodePacket, taxonomy: tuple[str, ...] = DEFAULT_TAXONOMY
+) -> list[dict[str, str]]:
     system_prompt = "\n".join(
         [
-            "You are Cradle's hierarchy labeling engine.",
+            "You are Matryoshka's hierarchy labeling engine.",
             "Your job is to summarize a folder or repository node from aggregated evidence.",
             "Respect the hierarchy: summarize the dominant capabilities without flattening distinct subdomains.",
             "For repository infrastructure and developer tooling, prefer the tooling-oriented categories over generic shared-utils when the packet shows parsing, labeling, orchestration, CLI, or LLM integration.",
@@ -108,7 +118,7 @@ def build_confirmation_messages(
 ) -> list[dict[str, str]]:
     system_prompt = "\n".join(
         [
-            "You are Cradle's top-down consistency labeling engine.",
+            "You are Matryoshka's top-down consistency labeling engine.",
             "Check a child node against the repository's macro description without forcing false agreement.",
             "Preserve local specificity even when the repository-level summary is broader.",
             "Always populate every required field in the response schema.",

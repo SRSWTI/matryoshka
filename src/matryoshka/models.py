@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
-from cradle.ast_extractor import FileExtraction
+from matryoshka.ast_extractor import FileExtraction
 
 
 def _trim_text(value: str, max_chars: int) -> str:

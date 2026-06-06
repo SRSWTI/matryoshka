@@ -3,9 +3,9 @@ requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "cradle"
+name = "matryoshka"
 version = "0.1.0"
-description = "Cradle extraction foundation"
+description = "Matryoshka code analysis and retrieval"
 requires-python = ">=3.12"
 dependencies = [
   "mlx-embeddings>=0.1.0; platform_system == 'Darwin'",
@@ -26,7 +26,7 @@ dev = [
 ]
 
 [project.scripts]
-cradle = "cradle.cli:main"
+matryoshka = "matryoshka.cli:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}

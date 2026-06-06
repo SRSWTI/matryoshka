@@ -9,12 +9,12 @@ from typing import Callable, Iterable
 
 from pathspec import GitIgnoreSpec
 
-from cradle.ast_extractor import FileExtraction, SymbolRecord, extract_file
-from cradle.community_detection import build_louvain_communities, build_theme_domains
-from cradle.graph_builder import RepositoryGraphBuilder
-from cradle.graph_models import RepositoryGraph
-from cradle.labeling import LabelingEngine
-from cradle.models import AnalyzedFile, FilePacket, LabelResult, NodePacket
+from matryoshka.ast_extractor import FileExtraction, SymbolRecord, extract_file
+from matryoshka.community_detection import build_louvain_communities, build_theme_domains
+from matryoshka.graph_builder import RepositoryGraphBuilder
+from matryoshka.graph_models import RepositoryGraph
+from matryoshka.labeling import LabelingEngine
+from matryoshka.models import AnalyzedFile, FilePacket, LabelResult, NodePacket
 
 
 @dataclass(slots=True)
@@ -166,7 +166,7 @@ class FilePacketBuilder:
         )
 
 
-class CradlePipeline:
+class MatryoshkaPipeline:
     def __init__(
         self,
         *,

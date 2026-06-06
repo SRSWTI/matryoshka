@@ -5,7 +5,7 @@ import json
 import sqlite3
 from pathlib import Path
 
-from cradle.models import LabelResult
+from matryoshka.models import LabelResult
 
 
 class LabelCache:

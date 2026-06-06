@@ -4,10 +4,10 @@ import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
 
-from cradle.exact_search import axe_call_search, axe_import_search, axe_reference_search, axe_symbol_search
-from cradle.graph_models import CodeExcerpt, QuestionResult
-from cradle.hierarchical_search import AxeHierarchySearcher, HierarchySearchConfig
-from cradle.retrieval import build_query_plan
+from matryoshka.exact_search import axe_call_search, axe_import_search, axe_reference_search, axe_symbol_search
+from matryoshka.graph_models import CodeExcerpt, QuestionResult
+from matryoshka.hierarchical_search import AxeHierarchySearcher, HierarchySearchConfig
+from matryoshka.retrieval import build_query_plan
 
 
 @dataclass(slots=True)

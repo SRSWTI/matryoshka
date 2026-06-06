@@ -30,7 +30,12 @@ def build_db_visualization(db_path: str | Path, *, sample_limit: int = 10) -> st
         if repo_row is None:
             raise ValueError(f"No repository graph found in {path}")
 
-        table_counts = {table_name: conn.execute(f'SELECT COUNT(*) FROM "{table_name}"').fetchone()[0] for table_name in TABLE_NAMES}
+        table_counts = {
+            table_name: conn.execute(f'SELECT COUNT(*) FROM "{table_name}"').fetchone()[
+                0
+            ]
+            for table_name in TABLE_NAMES
+        }
         node_kind_counts = conn.execute(
             "SELECT kind, COUNT(*) AS count FROM nodes GROUP BY kind ORDER BY count DESC, kind"
         ).fetchall()
@@ -41,27 +46,27 @@ def build_db_visualization(db_path: str | Path, *, sample_limit: int = 10) -> st
             "SELECT strength_label, COUNT(*) AS count FROM imports GROUP BY strength_label ORDER BY count DESC, strength_label"
         ).fetchall()
         top_files = conn.execute(
-            '''
+            """
             SELECT path, COALESCE(primary_category, 'none') AS category, symbol_count, import_count, summary
             FROM nodes
             WHERE kind = 'file'
             ORDER BY symbol_count DESC, import_count DESC, path ASC
             LIMIT ?
-            ''',
+            """,
             (sample_limit,),
         ).fetchall()
         top_folders = conn.execute(
-            '''
+            """
             SELECT path, COALESCE(primary_category, 'none') AS category, file_count, folder_count, summary
             FROM nodes
             WHERE kind = 'folder'
             ORDER BY file_count DESC, folder_count DESC, path ASC
             LIMIT ?
-            ''',
+            """,
             (sample_limit,),
         ).fetchall()
         top_symbols = conn.execute(
-            '''
+            """
             SELECT
                 symbols.qualified_name,
                 symbols.path,
@@ -72,68 +77,78 @@ def build_db_visualization(db_path: str | Path, *, sample_limit: int = 10) -> st
             GROUP BY symbols.symbol_id
             ORDER BY reference_count DESC, symbols.qualified_name ASC
             LIMIT ?
-            ''',
+            """,
             (sample_limit,),
         ).fetchall()
         top_import_edges = conn.execute(
-            '''
+            """
             SELECT importer_node_id AS source_path, target_node_id AS target_path, strength_label, COUNT(*) AS weight
             FROM imports
             WHERE target_node_id IS NOT NULL
             GROUP BY importer_node_id, target_node_id, strength_label
             ORDER BY weight DESC, importer_node_id ASC, target_node_id ASC
             LIMIT ?
-            ''',
+            """,
             (sample_limit,),
         ).fetchall()
         # Out-of-scope: internal imports whose target lies outside the analyzed root.
-        # These are real dependencies Cradle could not resolve to a file in the graph.
+        # These are real dependencies Matryoshka could not resolve to a file in the graph.
         # Guard against older DBs that predate the is_out_of_scope column.
-        import_columns = {row[1] for row in conn.execute("PRAGMA table_info(imports)").fetchall()}
+        import_columns = {
+            row[1] for row in conn.execute("PRAGMA table_info(imports)").fetchall()
+        }
         _has_scope_col = "is_out_of_scope" in import_columns
         if _has_scope_col:
             out_of_scope_counts = conn.execute(
-                '''
+                """
                 SELECT imported_module, COUNT(*) AS count
                 FROM imports
                 WHERE is_out_of_scope = 1
                 GROUP BY imported_module
                 ORDER BY count DESC, imported_module ASC
                 LIMIT ?
-                ''',
+                """,
                 (sample_limit,),
             ).fetchall()
             import_scope_summary = conn.execute(
-                '''
+                """
                 SELECT
                     SUM(CASE WHEN is_internal = 1 AND target_node_id IS NOT NULL THEN 1 ELSE 0 END) AS resolved_internal,
                     SUM(CASE WHEN is_out_of_scope = 1 THEN 1 ELSE 0 END) AS out_of_scope,
                     SUM(CASE WHEN is_internal = 0 THEN 1 ELSE 0 END) AS external
                 FROM imports
-                '''
+                """
             ).fetchone()
         else:
             out_of_scope_counts = []
             import_scope_summary = None
         top_call_edges = conn.execute(
-            '''
+            """
             SELECT caller_node_id AS source_path, target_node_id AS target_path, COUNT(*) AS weight
             FROM call_sites
             WHERE target_node_id IS NOT NULL
             GROUP BY caller_node_id, target_node_id
             ORDER BY weight DESC, caller_node_id ASC, target_node_id ASC
             LIMIT ?
-            ''',
+            """,
             (sample_limit,),
         ).fetchall()
-        table_schemas = {table_name: _load_table_schema(conn, table_name) for table_name in TABLE_NAMES}
-        table_samples = {table_name: _load_table_samples(conn, table_name, sample_limit=min(sample_limit, 3)) for table_name in TABLE_NAMES}
+        table_schemas = {
+            table_name: _load_table_schema(conn, table_name)
+            for table_name in TABLE_NAMES
+        }
+        table_samples = {
+            table_name: _load_table_samples(
+                conn, table_name, sample_limit=min(sample_limit, 3)
+            )
+            for table_name in TABLE_NAMES
+        }
     finally:
         conn.close()
 
     repo_tags = json.loads(repo_row["tags_json"])
     report_lines = [
-        "# Cradle DB Visualization",
+        "# Matryoshka DB Visualization",
         "",
         "## Repository",
         "",
@@ -147,7 +162,10 @@ def build_db_visualization(db_path: str | Path, *, sample_limit: int = 10) -> st
         "",
         "| Table | Rows |",
         "| --- | ---: |",
-        *[f"| {table_name} | {table_counts[table_name]} |" for table_name in TABLE_NAMES],
+        *[
+            f"| {table_name} | {table_counts[table_name]} |"
+            for table_name in TABLE_NAMES
+        ],
         "",
         "## Node Kinds",
         "",
@@ -165,13 +183,16 @@ def build_db_visualization(db_path: str | Path, *, sample_limit: int = 10) -> st
         "",
         "| Strength | Rows |",
         "| --- | ---: |",
-        *[f"| {row['strength_label']} | {row['count']} |" for row in import_strength_counts],
+        *[
+            f"| {row['strength_label']} | {row['count']} |"
+            for row in import_strength_counts
+        ],
         "",
         "## Import Scope",
         "",
         "Resolved internal imports point to a file inside the analyzed root.  "
         "Out-of-scope imports are real internal dependencies whose target lies **outside** "
-        "the portion of the repository that Cradle analysed.  "
+        "the portion of the repository that Matryoshka analysed.  "
         "External imports are third-party or stdlib packages.",
         "",
         *(
@@ -195,7 +216,10 @@ def build_db_visualization(db_path: str | Path, *, sample_limit: int = 10) -> st
                 "",
                 "| Module | Importers |",
                 "| --- | ---: |",
-                *[f"| `{row['imported_module']}` | {row['count']} |" for row in out_of_scope_counts],
+                *[
+                    f"| `{row['imported_module']}` | {row['count']} |"
+                    for row in out_of_scope_counts
+                ],
                 "",
             ]
             if out_of_scope_counts
@@ -262,12 +286,19 @@ def build_db_visualization(db_path: str | Path, *, sample_limit: int = 10) -> st
         "",
         "## Stored Graph Sample",
         "",
-        _render_graph_mermaid(repo_row["name"], top_files, top_import_edges, top_call_edges),
+        _render_graph_mermaid(
+            repo_row["name"], top_files, top_import_edges, top_call_edges
+        ),
     ]
     return "\n".join(report_lines)
 
 
-def _render_graph_mermaid(repo_name: str, top_files: list[sqlite3.Row], top_import_edges: list[sqlite3.Row], top_call_edges: list[sqlite3.Row]) -> str:
+def _render_graph_mermaid(
+    repo_name: str,
+    top_files: list[sqlite3.Row],
+    top_import_edges: list[sqlite3.Row],
+    top_call_edges: list[sqlite3.Row],
+) -> str:
     selected_paths = []
     for row in top_files:
         selected_paths.append(row["path"])
@@ -295,7 +326,9 @@ def _render_graph_mermaid(repo_name: str, top_files: list[sqlite3.Row], top_impo
         target_id = node_ids.get(row["target_path"])
         if source_id is None or target_id is None:
             continue
-        lines.append(f'  {source_id} -. "import {row["strength_label"]} x{row["weight"]}" .-> {target_id}')
+        lines.append(
+            f'  {source_id} -. "import {row["strength_label"]} x{row["weight"]}" .-> {target_id}'
+        )
 
     for row in top_call_edges:
         source_id = node_ids.get(row["source_path"])
@@ -320,12 +353,21 @@ def _load_table_schema(conn: sqlite3.Connection, table_name: str) -> list[sqlite
     return conn.execute(f'PRAGMA table_info("{table_name}")').fetchall()
 
 
-def _load_table_samples(conn: sqlite3.Connection, table_name: str, *, sample_limit: int) -> list[sqlite3.Row]:
-    return conn.execute(f'SELECT * FROM "{table_name}" LIMIT ?', (sample_limit,)).fetchall()
+def _load_table_samples(
+    conn: sqlite3.Connection, table_name: str, *, sample_limit: int
+) -> list[sqlite3.Row]:
+    return conn.execute(
+        f'SELECT * FROM "{table_name}" LIMIT ?', (sample_limit,)
+    ).fetchall()
 
 
 def _render_table_schema(table_name: str, schema_rows: list[sqlite3.Row]) -> str:
-    lines = [f"### `{table_name}`", "", "| Column | Type | Not Null | Default | PK |", "| --- | --- | --- | --- | ---: |"]
+    lines = [
+        f"### `{table_name}`",
+        "",
+        "| Column | Type | Not Null | Default | PK |",
+        "| --- | --- | --- | --- | ---: |",
+    ]
     for row in schema_rows:
         default_value = "" if row["dflt_value"] is None else str(row["dflt_value"])
         lines.append(

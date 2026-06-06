@@ -8,7 +8,7 @@ import re
 
 import numpy as np
 
-from cradle import cli
+from matryoshka import cli
 
 
 class FakeClient:
@@ -93,7 +93,7 @@ def verify_token(token: str) -> bool:
         sys,
         "argv",
         [
-            "cradle",
+            "matryoshka",
             "analyze",
             str(tmp_path),
             "--model",
@@ -168,7 +168,7 @@ export function skipMe(): boolean {
         sys,
         "argv",
         [
-            "cradle",
+            "matryoshka",
             "analyze",
             str(tmp_path),
             "--model",
@@ -219,13 +219,13 @@ def run() -> None:
     )
 
     cache_path = tmp_path / "labels.db"
-    expected_db_path = tmp_path / ".cradle" / f"{tmp_path.name}.db"
+    expected_db_path = tmp_path / ".matryoshka" / f"{tmp_path.name}.db"
     monkeypatch.setattr(cli, "OpenAICompatibleClient", FakeClient)
     monkeypatch.setattr(
         sys,
         "argv",
         [
-            "cradle",
+            "matryoshka",
             "analyze",
             str(tmp_path),
             "--model",
@@ -275,7 +275,7 @@ def verify_token(token: str) -> bool:
         sys,
         "argv",
         [
-            "cradle",
+            "matryoshka",
             "analyze",
             str(tmp_path),
             "--model",
@@ -303,7 +303,7 @@ def verify_token(token: str) -> bool:
         sys,
         "argv",
         [
-            "cradle",
+            "matryoshka",
             "visualize-db",
             str(output_path),
             "--output",
@@ -319,7 +319,7 @@ def verify_token(token: str) -> bool:
 
     assert exit_code == 0
     assert f"visualization: {report_path}" in captured.out
-    assert "# Cradle DB Visualization" in report
+    assert "# Matryoshka DB Visualization" in report
     assert "## Table Counts" in report
     assert "## SQL Schema" in report
     assert "## Sample Stored Rows" in report
@@ -353,7 +353,7 @@ def verify_token(token: str) -> bool:
         sys,
         "argv",
         [
-            "cradle",
+            "matryoshka",
             "analyze",
             str(tmp_path),
             "--model",
@@ -381,7 +381,7 @@ def verify_token(token: str) -> bool:
         sys,
         "argv",
         [
-            "cradle",
+            "matryoshka",
             "semantic-index",
             str(output_path),
             "--model",
@@ -400,7 +400,7 @@ def verify_token(token: str) -> bool:
         sys,
         "argv",
         [
-            "cradle",
+            "matryoshka",
             "semantic-search",
             str(output_path),
             "where is verify_token implemented",
@@ -468,7 +468,7 @@ def stream_bedrock_lazy() -> str:
         sys,
         "argv",
         [
-            "cradle",
+            "matryoshka",
             "analyze",
             str(tmp_path),
             "--model",
@@ -492,25 +492,25 @@ def stream_bedrock_lazy() -> str:
     assert cli.main() == 0
     capsys.readouterr()
 
-    monkeypatch.setattr(sys, "argv", ["cradle", "file-search", str(output_path), "middleware.py"])
+    monkeypatch.setattr(sys, "argv", ["matryoshka", "file-search", str(output_path), "middleware.py"])
     assert cli.main() == 0
     captured = capsys.readouterr()
     assert "search_type: file" in captured.out
     assert "src/auth/middleware.py" in captured.out
 
-    monkeypatch.setattr(sys, "argv", ["cradle", "symbol-search", str(output_path), "verify_sig"])
+    monkeypatch.setattr(sys, "argv", ["matryoshka", "symbol-search", str(output_path), "verify_sig"])
     assert cli.main() == 0
     captured = capsys.readouterr()
     assert "search_type: symbol" in captured.out
     assert "verify_sig" in captured.out
 
-    monkeypatch.setattr(sys, "argv", ["cradle", "import-search", str(output_path), "src.shared.crypto"])
+    monkeypatch.setattr(sys, "argv", ["matryoshka", "import-search", str(output_path), "src.shared.crypto"])
     assert cli.main() == 0
     captured = capsys.readouterr()
     assert "search_type: import" in captured.out
     assert "src/auth/middleware.py" in captured.out
 
-    monkeypatch.setattr(sys, "argv", ["cradle", "call-search", str(output_path), "who calls stream_bedrock"])
+    monkeypatch.setattr(sys, "argv", ["matryoshka", "call-search", str(output_path), "who calls stream_bedrock"])
     assert cli.main() == 0
     captured = capsys.readouterr()
     assert "search_type: call" in captured.out
@@ -538,7 +538,7 @@ def decide_visible_output(user_role: str) -> str:
         sys,
         "argv",
         [
-            "cradle",
+            "matryoshka",
             "analyze",
             str(tmp_path),
             "--model",
@@ -566,7 +566,7 @@ def decide_visible_output(user_role: str) -> str:
         sys,
         "argv",
         [
-            "cradle",
+            "matryoshka",
             "semantic-index",
             str(output_path),
             "--model",
@@ -582,7 +582,7 @@ def decide_visible_output(user_role: str) -> str:
         sys,
         "argv",
         [
-            "cradle",
+            "matryoshka",
             "question",
             str(output_path),
             "where does the system decide what to show the user",
@@ -631,7 +631,7 @@ def verify_token(token: str) -> bool:
         sys,
         "argv",
         [
-            "cradle",
+            "matryoshka",
             "analyze",
             str(tmp_path),
             "--model",
@@ -659,7 +659,7 @@ def verify_token(token: str) -> bool:
         sys,
         "argv",
         [
-            "cradle",
+            "matryoshka",
             "visualize-focus",
             str(output_path),
             "verify_sig",

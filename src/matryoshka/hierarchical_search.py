@@ -5,11 +5,11 @@ from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 
-from cradle.embeddings import DEFAULT_QUERY_TASK, TextEmbedder, build_text_embedder, format_query_text
-from cradle.graph_models import HierarchicalSearchResult, TraversalCandidate, TraversalStep
-from cradle.result_loader import SQLiteResultLoader
-from cradle.retrieval import build_query_plan
-from cradle.semantic_index import SemanticIndexStore
+from matryoshka.embeddings import DEFAULT_QUERY_TASK, TextEmbedder, build_text_embedder, format_query_text
+from matryoshka.graph_models import HierarchicalSearchResult, TraversalCandidate, TraversalStep
+from matryoshka.result_loader import SQLiteResultLoader
+from matryoshka.retrieval import build_query_plan
+from matryoshka.semantic_index import SemanticIndexStore
 
 
 @dataclass(slots=True)

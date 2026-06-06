@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import json
 
-from cradle.labeling import LabelingConfig, LabelingEngine
-from cradle.pipeline import CradlePipeline, PipelineConfig, RepositoryWalker
+from matryoshka.labeling import LabelingConfig, LabelingEngine
+from matryoshka.pipeline import MatryoshkaPipeline, PipelineConfig, RepositoryWalker
 
 
 class FakeClient:
@@ -129,7 +129,7 @@ def verify_token(token: str) -> bool:
     )
 
     engine = LabelingEngine(FakeClient(), LabelingConfig())
-    pipeline = CradlePipeline(config=PipelineConfig(), labeling_engine=engine)
+    pipeline = MatryoshkaPipeline(config=PipelineConfig(), labeling_engine=engine)
 
     graph = pipeline.analyze(tmp_path)
 
@@ -226,7 +226,7 @@ def test_pipeline_persists_duplicate_tags_and_categories_without_conflict(tmp_pa
             }
 
     engine = LabelingEngine(DuplicateLabelClient(), LabelingConfig())
-    pipeline = CradlePipeline(config=PipelineConfig(), labeling_engine=engine)
+    pipeline = MatryoshkaPipeline(config=PipelineConfig(), labeling_engine=engine)
 
     graph = pipeline.analyze(tmp_path)
 
@@ -257,7 +257,7 @@ def build_session(token: str) -> str:
     )
 
     engine = LabelingEngine(FakeClient(), LabelingConfig())
-    pipeline = CradlePipeline(config=PipelineConfig(), labeling_engine=engine)
+    pipeline = MatryoshkaPipeline(config=PipelineConfig(), labeling_engine=engine)
 
     graph = pipeline.analyze(tmp_path)
 
@@ -295,7 +295,7 @@ def test_pipeline_marks_unresolvable_internal_imports_as_out_of_scope(tmp_path):
     )
 
     engine = LabelingEngine(FakeClient(), LabelingConfig())
-    pipeline = CradlePipeline(config=PipelineConfig(), labeling_engine=engine)
+    pipeline = MatryoshkaPipeline(config=PipelineConfig(), labeling_engine=engine)
 
     graph = pipeline.analyze(tmp_path)
 

@@ -7,11 +7,11 @@ import sqlite3
 
 import numpy as np
 
-from cradle.hierarchical_search import axe_hierarchy_search
-from cradle.labeling import LabelingConfig, LabelingEngine
-from cradle.pipeline import CradlePipeline, PipelineConfig
-from cradle.semantic_index import SemanticIndexBuilder, SemanticIndexStore
-from cradle.storage import CradleDatabase
+from matryoshka.hierarchical_search import axe_hierarchy_search
+from matryoshka.labeling import LabelingConfig, LabelingEngine
+from matryoshka.pipeline import MatryoshkaPipeline, PipelineConfig
+from matryoshka.semantic_index import SemanticIndexBuilder, SemanticIndexStore
+from matryoshka.storage import MatryoshkaDatabase
 
 
 class FakeClient:
@@ -218,9 +218,9 @@ def get_env_api_key(provider: str) -> str | None:
     )
 
     engine = LabelingEngine(FakeClient(), LabelingConfig())
-    graph = CradlePipeline(config=PipelineConfig(), labeling_engine=engine).analyze(tmp_path)
+    graph = MatryoshkaPipeline(config=PipelineConfig(), labeling_engine=engine).analyze(tmp_path)
     db_path = tmp_path / "index.db"
-    CradleDatabase(db_path).replace_graph(graph)
+    MatryoshkaDatabase(db_path).replace_graph(graph)
     SemanticIndexBuilder(db_path, embedder=FakeEmbedder()).build()
 
     result = axe_hierarchy_search(db_path, "where does the system decide what to show the user", embedder=FakeEmbedder(), limit=3)
@@ -255,9 +255,9 @@ def get_env_api_key(provider: str) -> str | None:
     )
 
     engine = LabelingEngine(FakeClient(), LabelingConfig())
-    graph = CradlePipeline(config=PipelineConfig(), labeling_engine=engine).analyze(tmp_path)
+    graph = MatryoshkaPipeline(config=PipelineConfig(), labeling_engine=engine).analyze(tmp_path)
     db_path = tmp_path / "index.db"
-    CradleDatabase(db_path).replace_graph(graph)
+    MatryoshkaDatabase(db_path).replace_graph(graph)
     SemanticIndexBuilder(db_path, embedder=FakeEmbedder()).build()
 
     result = axe_hierarchy_search(db_path, "how are api keys loaded from environment", embedder=FakeEmbedder(), limit=3)
@@ -290,9 +290,9 @@ def decide_visible_output(user_role: str) -> str:
     )
 
     engine = LabelingEngine(FakeClient(), LabelingConfig())
-    graph = CradlePipeline(config=PipelineConfig(), labeling_engine=engine).analyze(tmp_path)
+    graph = MatryoshkaPipeline(config=PipelineConfig(), labeling_engine=engine).analyze(tmp_path)
     db_path = tmp_path / "index.db"
-    CradleDatabase(db_path).replace_graph(graph)
+    MatryoshkaDatabase(db_path).replace_graph(graph)
     SemanticIndexBuilder(db_path, embedder=FakeEmbedder()).build()
 
     result = axe_hierarchy_search(db_path, "where does the system decide what to show the user", embedder=FakeEmbedder(), limit=3)
@@ -323,9 +323,9 @@ def render_image() -> str:
     )
 
     engine = LabelingEngine(FakeClient(), LabelingConfig())
-    graph = CradlePipeline(config=PipelineConfig(), labeling_engine=engine).analyze(tmp_path)
+    graph = MatryoshkaPipeline(config=PipelineConfig(), labeling_engine=engine).analyze(tmp_path)
     db_path = tmp_path / "index.db"
-    CradleDatabase(db_path).replace_graph(graph)
+    MatryoshkaDatabase(db_path).replace_graph(graph)
     SemanticIndexBuilder(db_path, embedder=FakeEmbedder()).build()
 
     result = axe_hierarchy_search(db_path, "bedrock streaming provider implementation", embedder=FakeEmbedder(), limit=3)
@@ -356,9 +356,9 @@ def stream_bedrock() -> str:
     )
 
     engine = LabelingEngine(FakeClient(), LabelingConfig())
-    graph = CradlePipeline(config=PipelineConfig(), labeling_engine=engine).analyze(tmp_path)
+    graph = MatryoshkaPipeline(config=PipelineConfig(), labeling_engine=engine).analyze(tmp_path)
     db_path = tmp_path / "index.db"
-    CradleDatabase(db_path).replace_graph(graph)
+    MatryoshkaDatabase(db_path).replace_graph(graph)
     SemanticIndexBuilder(db_path, embedder=FakeEmbedder()).build()
 
     result = axe_hierarchy_search(db_path, "bedrock streaming provider implementation", embedder=FakeEmbedder(), limit=3)
@@ -371,7 +371,7 @@ def test_pipeline_persists_louvain_communities(tmp_path):
     fixture = _write_phase5_fixture(tmp_path)
 
     engine = LabelingEngine(FakeClient(), LabelingConfig())
-    graph = CradlePipeline(config=PipelineConfig(), labeling_engine=engine).analyze(tmp_path)
+    graph = MatryoshkaPipeline(config=PipelineConfig(), labeling_engine=engine).analyze(tmp_path)
 
     community_nodes = [node for node in graph.nodes if node.kind == "community"]
     assert community_nodes
@@ -379,7 +379,7 @@ def test_pipeline_persists_louvain_communities(tmp_path):
     assert fixture["target_paths"].issuperset({record.member_node_id for record in graph.community_members})
 
     db_path = tmp_path / "index.db"
-    CradleDatabase(db_path).replace_graph(graph)
+    MatryoshkaDatabase(db_path).replace_graph(graph)
 
     with sqlite3.connect(db_path) as conn:
         community_count = conn.execute("SELECT COUNT(*) FROM nodes WHERE kind = 'community'").fetchone()[0]
@@ -393,12 +393,12 @@ def test_semantic_index_builds_centroids_and_hierarchy_uses_community_branch(tmp
     fixture = _write_phase5_fixture(tmp_path)
 
     engine = LabelingEngine(FakeClient(), LabelingConfig())
-    graph = CradlePipeline(config=PipelineConfig(), labeling_engine=engine).analyze(tmp_path)
+    graph = MatryoshkaPipeline(config=PipelineConfig(), labeling_engine=engine).analyze(tmp_path)
     community_ids = [node.node_id for node in graph.nodes if node.kind == "community"]
     assert community_ids
 
     db_path = tmp_path / "index.db"
-    CradleDatabase(db_path).replace_graph(graph)
+    MatryoshkaDatabase(db_path).replace_graph(graph)
     SemanticIndexBuilder(db_path, embedder=FakeEmbedder()).build()
     store = SemanticIndexStore(db_path)
     assert any(record.summary.startswith("Semantic routing summary") for record in store.centroid_records)
@@ -468,9 +468,9 @@ def create_session(token: str) -> str:
     )
 
     engine = LabelingEngine(ThemeClient(), LabelingConfig())
-    graph = CradlePipeline(config=PipelineConfig(), labeling_engine=engine).analyze(tmp_path)
+    graph = MatryoshkaPipeline(config=PipelineConfig(), labeling_engine=engine).analyze(tmp_path)
     db_path = tmp_path / "index.db"
-    CradleDatabase(db_path).replace_graph(graph)
+    MatryoshkaDatabase(db_path).replace_graph(graph)
     SemanticIndexBuilder(db_path, embedder=FakeEmbedder()).build()
 
     result = axe_hierarchy_search(db_path, "auth login session", embedder=FakeEmbedder(), limit=3)

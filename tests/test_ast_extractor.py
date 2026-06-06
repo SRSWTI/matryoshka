@@ -1,4 +1,4 @@
-from cradle.ast_extractor import extract_file
+from matryoshka.ast_extractor import extract_file
 
 
 def test_extract_python_symbols_and_imports(tmp_path):

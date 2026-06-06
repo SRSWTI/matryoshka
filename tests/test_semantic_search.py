@@ -6,12 +6,12 @@ import re
 
 import numpy as np
 
-from cradle.embeddings import DEFAULT_QUERY_TASK
-from cradle.labeling import LabelingConfig, LabelingEngine
-from cradle.pipeline import CradlePipeline, PipelineConfig
-from cradle.semantic_index import SemanticIndexBuilder
-from cradle.semantic_search import axe_semantic_search
-from cradle.storage import CradleDatabase
+from matryoshka.embeddings import DEFAULT_QUERY_TASK
+from matryoshka.labeling import LabelingConfig, LabelingEngine
+from matryoshka.pipeline import MatryoshkaPipeline, PipelineConfig
+from matryoshka.semantic_index import SemanticIndexBuilder
+from matryoshka.semantic_search import axe_semantic_search
+from matryoshka.storage import MatryoshkaDatabase
 
 
 class FakeClient:
@@ -105,9 +105,9 @@ def load_openai_credentials() -> str | None:
     )
 
     engine = LabelingEngine(FakeClient(), LabelingConfig())
-    graph = CradlePipeline(config=PipelineConfig(), labeling_engine=engine).analyze(tmp_path)
+    graph = MatryoshkaPipeline(config=PipelineConfig(), labeling_engine=engine).analyze(tmp_path)
     db_path = tmp_path / "index.db"
-    CradleDatabase(db_path).replace_graph(graph)
+    MatryoshkaDatabase(db_path).replace_graph(graph)
     SemanticIndexBuilder(db_path, embedder=FakeEmbedder()).build()
 
     result = axe_semantic_search(db_path, "how are api keys loaded from environment", embedder=FakeEmbedder(), task=DEFAULT_QUERY_TASK, limit=3)
@@ -141,9 +141,9 @@ def stream_bedrock_lazy() -> str:
     )
 
     engine = LabelingEngine(FakeClient(), LabelingConfig())
-    graph = CradlePipeline(config=PipelineConfig(), labeling_engine=engine).analyze(tmp_path)
+    graph = MatryoshkaPipeline(config=PipelineConfig(), labeling_engine=engine).analyze(tmp_path)
     db_path = tmp_path / "index.db"
-    CradleDatabase(db_path).replace_graph(graph)
+    MatryoshkaDatabase(db_path).replace_graph(graph)
     SemanticIndexBuilder(db_path, embedder=FakeEmbedder()).build()
 
     exact = axe_semantic_search(db_path, "stream_bedrock", embedder=FakeEmbedder(), task=DEFAULT_QUERY_TASK, limit=3)
@@ -185,9 +185,9 @@ stream_bedrock_lazy = load_bedrock_provider_module
     )
 
     engine = LabelingEngine(FakeClient(), LabelingConfig())
-    graph = CradlePipeline(config=PipelineConfig(), labeling_engine=engine).analyze(tmp_path)
+    graph = MatryoshkaPipeline(config=PipelineConfig(), labeling_engine=engine).analyze(tmp_path)
     db_path = tmp_path / "index.db"
-    CradleDatabase(db_path).replace_graph(graph)
+    MatryoshkaDatabase(db_path).replace_graph(graph)
     SemanticIndexBuilder(db_path, embedder=FakeEmbedder()).build()
 
     result = axe_semantic_search(
@@ -222,9 +222,9 @@ def stream_mistral() -> str:
     )
 
     engine = LabelingEngine(FakeClient(), LabelingConfig())
-    graph = CradlePipeline(config=PipelineConfig(), labeling_engine=engine).analyze(tmp_path)
+    graph = MatryoshkaPipeline(config=PipelineConfig(), labeling_engine=engine).analyze(tmp_path)
     db_path = tmp_path / "index.db"
-    CradleDatabase(db_path).replace_graph(graph)
+    MatryoshkaDatabase(db_path).replace_graph(graph)
     SemanticIndexBuilder(db_path, embedder=FakeEmbedder()).build()
 
     result = axe_semantic_search(

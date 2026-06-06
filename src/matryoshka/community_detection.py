@@ -6,7 +6,7 @@ from collections import Counter, defaultdict
 
 import networkx as nx
 
-from cradle.graph_models import CallRecord, CodeNode, CommunityMemberRecord, ImportRecord, ThemeMemberRecord
+from matryoshka.graph_models import CallRecord, CodeNode, CommunityMemberRecord, ImportRecord, ThemeMemberRecord
 
 
 def build_louvain_communities(

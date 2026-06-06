@@ -8,12 +8,12 @@ from datetime import UTC, datetime
 from hashlib import sha256
 from pathlib import Path
 
-from cradle.graph_models import AnalysisSummary, RepositoryGraph
+from matryoshka.graph_models import AnalysisSummary, RepositoryGraph
 
 logger = logging.getLogger(__name__)
 
 
-class CradleDatabase:
+class MatryoshkaDatabase:
     def __init__(self, db_path: str | Path) -> None:
         self._path = Path(db_path)
 
