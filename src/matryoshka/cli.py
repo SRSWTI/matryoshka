@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import sys
 from pathlib import Path
 
 from matryoshka.cache import LabelCache
@@ -16,6 +17,7 @@ from matryoshka.exact_search import (
     axe_reference_search,
     axe_symbol_search,
 )
+from matryoshka.file_reader import FileReader
 from matryoshka.focus_visualization import build_focus_visualization
 from matryoshka.hierarchical_search import axe_hierarchy_search
 from matryoshka.labeling import LabelingConfig, LabelingEngine
@@ -173,6 +175,20 @@ def main() -> int:
     )
     serve_parser.add_argument("--log-level", default="INFO")
 
+    read_parser = subparsers.add_parser(
+        "read", help="Read rich file summary from the analysis DB"
+    )
+    read_parser.add_argument("db_path")
+    read_parser.add_argument("file_path")
+    read_parser.add_argument("--log-level", default="INFO")
+
+    read_more_parser = subparsers.add_parser(
+        "read-more", help="Read rich file detail with collapsed source blocks"
+    )
+    read_more_parser.add_argument("db_path")
+    read_more_parser.add_argument("file_path")
+    read_more_parser.add_argument("--log-level", default="INFO")
+
     args = parser.parse_args()
     if args.command == "analyze":
         return _run_analyze(args)
@@ -204,6 +220,10 @@ def main() -> int:
         return _run_question(args)
     if args.command == "serve":
         return _run_serve(args)
+    if args.command == "read":
+        return _run_read(args)
+    if args.command == "read-more":
+        return _run_read_more(args)
     return 1
 
 
@@ -592,6 +612,167 @@ def _configure_logging(level: str) -> None:
         level=getattr(logging, level.upper(), logging.INFO),
         format="%(levelname)s %(name)s: %(message)s",
     )
+
+
+# ------------------------------------------------------------------
+# read / read-more
+# ------------------------------------------------------------------
+
+
+def _run_read(args: argparse.Namespace) -> int:
+    _configure_logging(args.log_level)
+    try:
+        reader = FileReader(args.db_path)
+        result = reader.read(args.file_path)
+        print(_format_read_result(result, include_source=False))
+        return 0
+    except FileNotFoundError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+
+def _run_read_more(args: argparse.Namespace) -> int:
+    _configure_logging(args.log_level)
+    try:
+        reader = FileReader(args.db_path)
+        result = reader.read_more(args.file_path)
+        print(_format_read_result(result, include_source=True))
+        return 0
+    except FileNotFoundError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+
+def _format_read_result(result, *, include_source: bool = False) -> str:
+    """Format a FileReadResult for terminal output."""
+    from matryoshka.file_reader import FileReadResult
+
+    node = result.node
+    lines: list[str] = []
+
+    # ---- header ----
+    lines.append(f"file: {node.path}")
+    lines.append(f"kind: {node.kind}")
+    lines.append(f"language: {node.language or 'unknown'}")
+    lines.append(f"symbols: {node.symbol_count}")
+    lines.append(f"imports: {node.import_count}")
+    if node.primary_category:
+        lines.append(f"category: {node.primary_category}")
+    if node.categories:
+        lines.append(f"categories: {', '.join(node.categories)}")
+    if node.tags:
+        lines.append(f"tags: {', '.join(node.tags)}")
+    if node.summary:
+        lines.append(f"summary: {node.summary}")
+    if node.description:
+        lines.append(f"description: {node.description}")
+
+    # ---- repo context ----
+    if result.repo_summary:
+        lines.append("")
+        lines.append(f"repo_summary: {result.repo_summary}")
+    if result.repo_categories:
+        lines.append(f"repo_tags: {', '.join(result.repo_categories)}")
+
+    # ---- imports ----
+    if result.imports:
+        lines.append("")
+        lines.append("imports:")
+        for imp in result.imports:
+            internal = "internal" if imp.is_internal else "external"
+            strength = imp.strength_label
+            names = ", ".join(imp.names) if imp.names else imp.imported_module
+            line_info = f"L{imp.start_line}" if imp.start_line else ""
+            lines.append(
+                f"  - {imp.imported_module} [{internal}] ({strength}) {names} {line_info}"
+            )
+
+    # ---- symbols ----
+    if result.symbols:
+        lines.append("")
+        lines.append("symbols:")
+        for sym in result.symbols:
+            loc = f"L{sym.start_line or 0}-{sym.end_line or 0}"
+            sig = _compact_signature(sym.signature or "")
+            parent = f" (parent: {sym.parent_name})" if sym.parent_name else ""
+            lines.append(f"  - {sym.qualified_name} [{sym.kind}] {loc}{parent}")
+            lines.append(f"    signature: {sig}")
+            if sym.docstring:
+                first_line = sym.docstring.strip().split("\n")[0][:120]
+                lines.append(f"    doc: {first_line}")
+            if sym.parameters:
+                lines.append(f"    params: {', '.join(sym.parameters)}")
+            if sym.return_type:
+                lines.append(f"    returns: {sym.return_type}")
+            if sym.base_classes:
+                lines.append(f"    extends: {', '.join(sym.base_classes)}")
+            if sym.decorators:
+                lines.append(f"    decorators: {', '.join(sym.decorators)}")
+
+    # ---- exports ----
+    if result.exports:
+        lines.append("")
+        lines.append("exports (referenced by other files):")
+        for sym in result.exports:
+            loc = f"L{sym.start_line or 0}"
+            lines.append(f"  - {sym.qualified_name} [{sym.kind}] {loc}")
+
+    # ---- calls ----
+    if result.called_by:
+        lines.append("")
+        lines.append("called_by (other files calling this file):")
+        for call in result.called_by[:10]:
+            lines.append(
+                f"  - {call.caller_node_id}:{call.start_line or 0} -> {call.callee_name}"
+            )
+    if result.callees:
+        lines.append("")
+        lines.append("callees (this file calling others):")
+        for call in result.callees[:10]:
+            target = call.target_node_id or call.callee_name
+            lines.append(
+                f"  - {call.callee_name} -> {target} (caller L{call.start_line or 0})"
+            )
+
+    # ---- references ----
+    if result.references:
+        lines.append("")
+        lines.append("references (from this file):")
+        for ref in result.references[:10]:
+            lines.append(
+                f"  - {ref.target_name} [{ref.reference_kind}] -> {ref.target_node_id or 'unresolved'} (L{ref.start_line or 0})"
+            )
+    if result.reverse_references:
+        lines.append("")
+        lines.append("reverse_references (into this file):")
+        for ref in result.reverse_references[:10]:
+            lines.append(
+                f"  - {ref.source_node_id} -> {ref.target_name} [{ref.reference_kind}] (L{ref.start_line or 0})"
+            )
+
+    # ---- related context ----
+    if result.contexts:
+        lines.append("")
+        lines.append("related_context:")
+        for ctx in result.contexts:
+            lines.append(
+                f"  - {ctx.source_node_id} ({ctx.strength_label}): {ctx.inherited_summary}"
+            )
+
+    # ---- source blocks (read_more only) ----
+    if include_source and result.symbol_blocks:
+        lines.append("")
+        lines.append("===== COLLAPSED SOURCE BLOCKS =====")
+        for block in result.symbol_blocks:
+            lines.append(block)
+
+    if include_source and result.import_lines:
+        lines.append("")
+        lines.append("===== IMPORT LINES (from source) =====")
+        for line in result.import_lines:
+            lines.append(line)
+
+    return "\n".join(lines)
 
 
 if __name__ == "__main__":

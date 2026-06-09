@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "jesco-matryoshka"
-version = "0.1.5"
+version = "0.1.6"
 description = "Matryoshka code analysis and retrieval"
 requires-python = ">=3.12"
 dependencies = [
