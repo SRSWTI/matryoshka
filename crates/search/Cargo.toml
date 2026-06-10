@@ -1,0 +1,12 @@
+[package]
+name = "matryoshka-search"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+matryoshka-core-ir.workspace = true
+matryoshka-embed-client.workspace = true
+matryoshka-store-sqlite.workspace = true
+serde_json.workspace = true

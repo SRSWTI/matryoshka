@@ -10,10 +10,6 @@ from typing import Callable, Iterable
 from pathspec import GitIgnoreSpec
 
 from matryoshka.ast_extractor import FileExtraction, SymbolRecord, extract_file
-from matryoshka.community_detection import (
-    build_louvain_communities,
-    build_theme_domains,
-)
 from matryoshka.graph_builder import RepositoryGraphBuilder
 from matryoshka.graph_models import RepositoryGraph
 from matryoshka.labeling import LabelingEngine
@@ -267,16 +263,6 @@ class MatryoshkaPipeline:
             repo_packet,
             repo_label,
         )
-        community_nodes, community_members = build_louvain_communities(
-            graph.nodes, graph.imports, graph.calls
-        )
-        if community_nodes:
-            graph.nodes.extend(community_nodes)
-            graph.community_members.extend(community_members)
-        theme_nodes, theme_members = build_theme_domains(graph.nodes)
-        if theme_nodes:
-            graph.nodes.extend(theme_nodes)
-            graph.theme_members.extend(theme_members)
         _emit_progress(
             progress,
             f"built graph with {len(graph.nodes)} nodes and {len(graph.symbols)} symbols",

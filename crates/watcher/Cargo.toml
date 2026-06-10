@@ -1,0 +1,15 @@
+[package]
+name = "matryoshka-watcher"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+matryoshka-core-ir.workspace = true
+matryoshka-parser.workspace = true
+matryoshka-store-sqlite.workspace = true
+walkdir.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

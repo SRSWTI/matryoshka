@@ -1,0 +1,11 @@
+[package]
+name = "matryoshka-parser"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+matryoshka-core-ir.workspace = true
+sha2.workspace = true
+walkdir.workspace = true

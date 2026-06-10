@@ -1,0 +1,22 @@
+[package]
+name = "matryoshka-indexer"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+matryoshka-core-ir.workspace = true
+matryoshka-embed-client.workspace = true
+matryoshka-enricher.workspace = true
+matryoshka-parser.workspace = true
+matryoshka-resolver.workspace = true
+matryoshka-store-sqlite.workspace = true
+rayon.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+matryoshka-read-api.workspace = true
+matryoshka-search.workspace = true
+tempfile.workspace = true

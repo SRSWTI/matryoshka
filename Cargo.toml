@@ -1,0 +1,46 @@
+[workspace]
+resolver = "3"
+members = [
+  "crates/core-ir",
+  "crates/parser",
+  "crates/resolver",
+  "crates/store-sqlite",
+  "crates/enricher",
+  "crates/embed-client",
+  "crates/indexer",
+  "crates/search",
+  "crates/read-api",
+  "crates/watcher",
+  "crates/cli",
+]
+
+[workspace.package]
+edition = "2024"
+license = "MIT"
+version = "0.1.0"
+
+[workspace.dependencies]
+anyhow = "1"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4", features = ["derive"] }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+rayon = "1"
+rusqlite = { version = "0.32", features = ["bundled"] }
+schemars = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tempfile = "3"
+thiserror = "2"
+walkdir = "2"
+
+matryoshka-core-ir = { path = "crates/core-ir" }
+matryoshka-parser = { path = "crates/parser" }
+matryoshka-resolver = { path = "crates/resolver" }
+matryoshka-store-sqlite = { path = "crates/store-sqlite" }
+matryoshka-enricher = { path = "crates/enricher" }
+matryoshka-embed-client = { path = "crates/embed-client" }
+matryoshka-indexer = { path = "crates/indexer" }
+matryoshka-search = { path = "crates/search" }
+matryoshka-read-api = { path = "crates/read-api" }
+matryoshka-watcher = { path = "crates/watcher" }

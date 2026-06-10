@@ -17,6 +17,7 @@ htmlcov/
 build/
 dist/
 *.egg-info/
+target/
 
 # Local analysis output
 .cradle/

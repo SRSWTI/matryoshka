@@ -1,0 +1,15 @@
+[package]
+name = "matryoshka-enricher"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+matryoshka-core-ir.workspace = true
+reqwest.workspace = true
+schemars.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true

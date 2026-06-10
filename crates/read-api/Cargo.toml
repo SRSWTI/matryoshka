@@ -1,0 +1,10 @@
+[package]
+name = "matryoshka-read-api"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+matryoshka-core-ir.workspace = true
+matryoshka-store-sqlite.workspace = true

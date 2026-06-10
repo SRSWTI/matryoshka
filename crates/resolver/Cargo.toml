@@ -1,0 +1,11 @@
+[package]
+name = "matryoshka-resolver"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+chrono.workspace = true
+matryoshka-core-ir.workspace = true
+matryoshka-parser.workspace = true
+serde_json.workspace = true
