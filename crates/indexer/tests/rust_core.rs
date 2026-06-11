@@ -85,7 +85,7 @@ fn indexes_searches_and_reads_file_cards() {
             .contains("src/auth/middleware.py")
     );
     assert!(!card.symbols.is_empty());
-    assert!(!card.imports.is_empty());
+    assert!(card.imports.external.is_some() || !card.imports.internal.is_empty());
 }
 
 #[test]

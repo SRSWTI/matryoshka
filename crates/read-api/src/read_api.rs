@@ -1,12 +1,15 @@
 use anyhow::{Result, anyhow};
 use matryoshka_core_ir::{
-    DependencyInterpretation, EdgeFact, FileCard, FileFact, FolderCard, ImportFact, ReadCard,
-    ReadDependencies, ReadDependency, ReadFileOverview, ReadFolderOverview, ReadImport, ReadSymbol,
-    SymbolBehavior, SymbolFact,
+    DependencyInterpretation, EdgeFact, EdgeKind, FileCard, FileFact, FolderCard, ImportFact,
+    ReadCard, ReadDependency, ReadFileOverview, ReadFolderOverview, ReadImports,
+    ReadInternalImport, ReadSymbol, SymbolBehavior, SymbolFact,
 };
 use matryoshka_store_sqlite::MatryoshkaStore;
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+
+const MAX_READ_DEPENDENCIES: usize = 20;
 
 pub struct ReadApi {
     store: MatryoshkaStore,
@@ -59,8 +62,10 @@ impl ReadApi {
                 &file.imports,
                 file_card.as_ref().filter(|_| !card_is_heuristic),
             ),
-            dependencies: read_dependencies(&incoming_edges, &outgoing_edges),
-            agent_hints: read_hints(file_card.as_ref(), card_is_heuristic),
+            total_dependents: collapsed_dependency_count(&incoming_edges, DependencySide::Incoming),
+            dependents: read_dependencies(&incoming_edges, DependencySide::Incoming),
+            total_depends_on: collapsed_dependency_count(&outgoing_edges, DependencySide::Outgoing),
+            depends_on: read_dependencies(&outgoing_edges, DependencySide::Outgoing),
         })
     }
 }
@@ -155,8 +160,7 @@ fn read_symbols(
                 qualified_name: symbol.qualified_name.clone(),
                 kind: symbol.kind.clone(),
                 signature: symbol.signature.clone(),
-                start_line: symbol.start_line,
-                end_line: symbol.end_line,
+                lines: format!("{}-{}", symbol.start_line, symbol.end_line),
                 doc: symbol_doc(source_lines, symbol.start_line),
                 behavior: symbol_behavior,
             }
@@ -196,21 +200,76 @@ fn meaningful_symbol_behavior(
     Some(trimmed.to_string())
 }
 
-fn read_imports(imports: &[ImportFact], card: Option<&FileCard>) -> Vec<ReadImport> {
+fn read_imports(imports: &[ImportFact], card: Option<&FileCard>) -> ReadImports {
     let interpreted = card
         .map(|card| card.imports_interpreted.as_slice())
         .unwrap_or_default();
-    imports
-        .iter()
-        .map(|import| ReadImport {
-            module: import.module.clone(),
-            names: import.names.clone(),
-            line: import.line,
-            is_internal: import.is_internal,
-            resolved_file_id: import.resolved_file_id.clone(),
-            purpose: import_purpose(import, interpreted),
-        })
-        .collect()
+
+    let mut external = Vec::new();
+    let mut internal: BTreeMap<(String, Option<String>), InternalImportGroup> = BTreeMap::new();
+    for import in imports {
+        if import.is_internal {
+            internal
+                .entry((import.module.clone(), import.resolved_file_id.clone()))
+                .or_insert_with(|| {
+                    InternalImportGroup::new(import.module.clone(), import.resolved_file_id.clone())
+                })
+                .add(import, interpreted);
+        } else {
+            external.push(import.module.clone());
+        }
+    }
+
+    external.sort();
+    external.dedup();
+
+    ReadImports {
+        external: non_empty(external.join(", ")),
+        internal: internal
+            .into_values()
+            .map(InternalImportGroup::into_read_import)
+            .collect(),
+    }
+}
+
+#[derive(Debug, Clone)]
+struct InternalImportGroup {
+    module: String,
+    path: Option<String>,
+    names: Vec<String>,
+    why: Option<String>,
+}
+
+impl InternalImportGroup {
+    fn new(module: String, path: Option<String>) -> Self {
+        Self {
+            module,
+            path,
+            names: Vec::new(),
+            why: None,
+        }
+    }
+
+    fn add(&mut self, import: &ImportFact, interpreted: &[DependencyInterpretation]) {
+        for name in &import.names {
+            if !self.names.contains(name) {
+                self.names.push(name.clone());
+            }
+        }
+        if self.why.is_none() {
+            self.why =
+                import_purpose(import, interpreted).or_else(|| fallback_import_purpose(import));
+        }
+    }
+
+    fn into_read_import(self) -> ReadInternalImport {
+        ReadInternalImport {
+            module: self.module,
+            path: self.path,
+            names: joined_names(&self.names),
+            why: self.why,
+        }
+    }
 }
 
 fn import_purpose(import: &ImportFact, interpreted: &[DependencyInterpretation]) -> Option<String> {
@@ -226,33 +285,130 @@ fn import_purpose(import: &ImportFact, interpreted: &[DependencyInterpretation])
         .filter(|why| !why.trim().is_empty())
 }
 
-fn read_dependencies(incoming: &[EdgeFact], outgoing: &[EdgeFact]) -> ReadDependencies {
-    ReadDependencies {
-        incoming: incoming
-            .iter()
-            .map(|edge| read_dependency(edge, edge.source_id.clone()))
-            .collect(),
-        outgoing: outgoing
-            .iter()
-            .map(|edge| read_dependency(edge, edge.target_id.clone()))
-            .collect(),
+fn joined_names(names: &[String]) -> Option<String> {
+    if names.is_empty() {
+        None
+    } else {
+        Some(names.join(", "))
     }
 }
 
-fn read_dependency(edge: &EdgeFact, entity_id: String) -> ReadDependency {
-    ReadDependency {
-        entity_id,
-        kind: edge.kind.clone(),
-        detail: edge.detail.clone(),
+fn fallback_import_purpose(import: &ImportFact) -> Option<String> {
+    if !import.is_internal {
+        return None;
+    }
+    let target = import
+        .resolved_file_id
+        .as_deref()
+        .unwrap_or(import.module.as_str());
+    let subject = joined_names(&import.names).unwrap_or_else(|| import.module.clone());
+    Some(format!("Provides {subject} from {target}."))
+}
+
+#[derive(Debug, Clone, Copy)]
+enum DependencySide {
+    Incoming,
+    Outgoing,
+}
+
+fn collapsed_dependency_count(edges: &[EdgeFact], side: DependencySide) -> usize {
+    collapsed_dependencies(edges, side).len()
+}
+
+fn read_dependencies(edges: &[EdgeFact], side: DependencySide) -> Vec<ReadDependency> {
+    collapsed_dependencies(edges, side)
+        .into_values()
+        .take(MAX_READ_DEPENDENCIES)
+        .map(|group| group.into_read_dependency(side))
+        .collect()
+}
+
+fn collapsed_dependencies(
+    edges: &[EdgeFact],
+    side: DependencySide,
+) -> BTreeMap<String, DependencyGroup> {
+    let mut groups: BTreeMap<String, DependencyGroup> = BTreeMap::new();
+    for edge in edges {
+        if edge.kind == EdgeKind::Contains {
+            continue;
+        }
+        let path = match side {
+            DependencySide::Incoming => edge.source_id.clone(),
+            DependencySide::Outgoing => edge.target_id.clone(),
+        };
+        if path.trim().is_empty() {
+            continue;
+        }
+        groups
+            .entry(path.clone())
+            .or_insert_with(|| DependencyGroup::new(path))
+            .add(edge);
+    }
+    groups
+}
+
+#[derive(Debug, Clone)]
+struct DependencyGroup {
+    path: String,
+    relationships: Vec<String>,
+    details: Vec<String>,
+}
+
+impl DependencyGroup {
+    fn new(path: String) -> Self {
+        Self {
+            path,
+            relationships: Vec::new(),
+            details: Vec::new(),
+        }
+    }
+
+    fn add(&mut self, edge: &EdgeFact) {
+        let relationship = edge_relationship(edge);
+        if !self.relationships.contains(&relationship) {
+            self.relationships.push(relationship);
+        }
+        let detail = edge.detail.trim();
+        if !detail.is_empty() && !self.details.iter().any(|existing| existing == detail) {
+            self.details.push(detail.to_string());
+        }
+    }
+
+    fn into_read_dependency(self, side: DependencySide) -> ReadDependency {
+        ReadDependency {
+            path: self.path,
+            relationships: self.relationships.join(", "),
+            why: dependency_why(side, &self.relationships, &self.details),
+        }
     }
 }
 
-fn read_hints(card: Option<&FileCard>, card_is_heuristic: bool) -> Vec<String> {
-    if card_is_heuristic {
-        return Vec::new();
+fn edge_relationship(edge: &EdgeFact) -> String {
+    match edge.kind {
+        EdgeKind::Contains => "contains",
+        EdgeKind::Imports => "imports",
+        EdgeKind::Calls => "calls",
+        EdgeKind::References => "references",
+        EdgeKind::DependsOn => "depends_on",
     }
-    card.map(|card| card.agent_read_hints.clone())
-        .unwrap_or_default()
+    .to_string()
+}
+
+fn dependency_why(
+    side: DependencySide,
+    relationships: &[String],
+    details: &[String],
+) -> Option<String> {
+    if let Some(detail) = details.first().filter(|detail| !detail.trim().is_empty()) {
+        return Some(detail.clone());
+    }
+
+    let joined = relationships.join(", ");
+    let text = match side {
+        DependencySide::Incoming => format!("Uses this file via {joined}."),
+        DependencySide::Outgoing => format!("This file uses it via {joined}."),
+    };
+    non_empty(text)
 }
 
 fn module_docs(lines: &[String], language: &str) -> Vec<String> {

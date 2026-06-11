@@ -327,11 +327,17 @@ pub struct ReadCard {
     pub description: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub folder: Option<ReadFolderOverview>,
-    pub symbols: Vec<ReadSymbol>,
-    pub imports: Vec<ReadImport>,
-    pub dependencies: ReadDependencies,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub agent_hints: Vec<String>,
+    pub symbols: Vec<ReadSymbol>,
+    pub imports: ReadImports,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dependents: Vec<ReadDependency>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub depends_on: Vec<ReadDependency>,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub total_dependents: usize,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub total_depends_on: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -358,8 +364,7 @@ pub struct ReadSymbol {
     pub qualified_name: String,
     pub kind: SymbolKind,
     pub signature: String,
-    pub start_line: usize,
-    pub end_line: usize,
+    pub lines: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub doc: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -367,30 +372,34 @@ pub struct ReadSymbol {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ReadImport {
-    pub module: String,
-    pub names: Vec<String>,
-    pub line: usize,
-    pub is_internal: bool,
+pub struct ReadImports {
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub resolved_file_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub purpose: Option<String>,
+    pub external: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub internal: Vec<ReadInternalImport>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ReadDependencies {
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub incoming: Vec<ReadDependency>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub outgoing: Vec<ReadDependency>,
+pub struct ReadInternalImport {
+    pub module: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub names: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub why: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ReadDependency {
-    pub entity_id: String,
-    pub kind: EdgeKind,
-    pub detail: String,
+    pub path: String,
+    pub relationships: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub why: Option<String>,
+}
+
+fn is_zero(value: &usize) -> bool {
+    *value == 0
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
