@@ -40,7 +40,8 @@ impl GraphResolver {
 
         for file in &mut files {
             for import in &mut file.imports {
-                let target = resolve_import(&import.module, &file.file_id, &file_ids, &module_aliases);
+                let target =
+                    resolve_import(&import.module, &file.file_id, &file_ids, &module_aliases);
                 import.resolved_file_id = target.clone();
                 import.is_internal = target.is_some() || import.is_internal;
                 if let Some(target_id) = target {
@@ -378,10 +379,8 @@ mod tests {
 
     #[test]
     fn resolves_relative_python_imports() {
-        let file_ids = BTreeSet::from([
-            "pkg/graph.py".to_string(),
-            "pkg/sub/module.py".to_string(),
-        ]);
+        let file_ids =
+            BTreeSet::from(["pkg/graph.py".to_string(), "pkg/sub/module.py".to_string()]);
         let aliases = BTreeSet::new();
         let resolved = resolve_import("..graph", "pkg/sub/module.py", &file_ids, &aliases);
         assert_eq!(resolved.as_deref(), Some("pkg/graph.py"));

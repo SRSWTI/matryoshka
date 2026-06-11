@@ -189,6 +189,20 @@ impl MatryoshkaStore {
         Ok(())
     }
 
+    pub fn replace_semantic_records(&self, records: &[SemanticRecord]) -> Result<()> {
+        let mut conn = self.connect()?;
+        let tx = conn.transaction()?;
+        tx.execute("DELETE FROM semantic_records", [])?;
+        for record in records {
+            tx.execute(
+                "INSERT OR REPLACE INTO semantic_records(record_id, entity_id, entity_type, path, source_hash, payload_json) VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
+                params![record.record_id, record.entity_id, format!("{:?}", record.entity_type), record.path, record.source_hash, to_json(record)?],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     pub fn load_file(&self, file_id: &str) -> Result<Option<FileFact>> {
         self.load_one("SELECT payload_json FROM files WHERE file_id = ?1", file_id)
     }
@@ -204,6 +218,13 @@ impl MatryoshkaStore {
         self.load_one(
             "SELECT payload_json FROM folder_cards WHERE folder_id = ?1",
             folder_id,
+        )
+    }
+
+    pub fn load_repo_card(&self, repo_root: &str) -> Result<Option<RepoCard>> {
+        self.load_one(
+            "SELECT payload_json FROM repo_cards WHERE repo_root = ?1",
+            repo_root,
         )
     }
 
@@ -249,11 +270,21 @@ impl MatryoshkaStore {
         self.load_all("SELECT payload_json FROM semantic_records ORDER BY record_id")
     }
 
+    pub fn load_all_file_cards(&self) -> Result<Vec<FileCard>> {
+        self.load_all("SELECT payload_json FROM file_cards ORDER BY file_id")
+    }
+
+    pub fn load_all_folder_cards(&self) -> Result<Vec<FolderCard>> {
+        self.load_all("SELECT payload_json FROM folder_cards ORDER BY folder_id")
+    }
+
     pub fn load_repo_root(&self) -> Result<Option<String>> {
         let conn = self.connect()?;
-        conn.query_row("SELECT value FROM meta WHERE key = 'repo_root'", [], |row| {
-            row.get::<_, String>(0)
-        })
+        conn.query_row(
+            "SELECT value FROM meta WHERE key = 'repo_root'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
         .optional()
         .context("failed to load repo_root from sqlite")
     }
@@ -343,7 +374,12 @@ impl MatryoshkaStore {
                 "INSERT OR REPLACE INTO files(file_id, path, source_hash, payload_json) VALUES(?1, ?2, ?3, ?4)",
             )?;
             for file in files {
-                stmt.execute(params![file.file_id, file.path, file.source_hash, to_json(file)?])?;
+                stmt.execute(params![
+                    file.file_id,
+                    file.path,
+                    file.source_hash,
+                    to_json(file)?
+                ])?;
             }
         }
         tx.commit()?;

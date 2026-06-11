@@ -165,6 +165,21 @@ pub enum EdgeKind {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum FileOwnershipKind {
+    Facade,
+    Implementation,
+    Mixed,
+    Unknown,
+}
+
+impl Default for FileOwnershipKind {
+    fn default() -> Self {
+        Self::Unknown
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct FileCard {
     pub file_id: String,
     pub summary: String,
@@ -176,6 +191,12 @@ pub struct FileCard {
     pub edit_intents: Vec<String>,
     #[serde(default)]
     pub retrieval_tags: Vec<String>,
+    #[serde(default)]
+    pub ownership_kind: FileOwnershipKind,
+    #[serde(default)]
+    pub owns_behaviors: Vec<String>,
+    #[serde(default)]
+    pub delegates_to: Vec<String>,
     pub side_effects: Vec<String>,
     pub key_entities: Vec<String>,
     pub external_systems: Vec<String>,

@@ -166,8 +166,13 @@ impl CodeEnricher for MlxChatEnricher {
                     }
                     card.side_effects =
                         sanitize_side_effects(core.side_effects, file, context, &card.side_effects);
-                    card.key_entities =
-                        sanitize_key_entities(core.key_entities, file, symbols, context, &card.key_entities);
+                    card.key_entities = sanitize_key_entities(
+                        core.key_entities,
+                        file,
+                        symbols,
+                        context,
+                        &card.key_entities,
+                    );
                     card.external_systems = sanitize_external_systems(
                         core.external_systems,
                         context,
@@ -206,10 +211,8 @@ impl CodeEnricher for MlxChatEnricher {
                 Ok(dependencies) => {
                     card.imports_interpreted =
                         sanitize_import_interpretations(dependencies.imports_interpreted, context);
-                    card.used_by_interpreted = sanitize_used_by_interpretations(
-                        dependencies.used_by_interpreted,
-                        context,
-                    );
+                    card.used_by_interpreted =
+                        sanitize_used_by_interpretations(dependencies.used_by_interpreted, context);
                     card.blast_radius = sanitize_blast_radius(dependencies.blast_radius, file);
                 }
                 Err(error) => {
@@ -284,7 +287,8 @@ impl CodeEnricher for MlxChatEnricher {
             }
         }
 
-        card.risk_notes = remove_heuristic_placeholder_notes(card.risk_notes, &heuristic_risk_notes);
+        card.risk_notes =
+            remove_heuristic_placeholder_notes(card.risk_notes, &heuristic_risk_notes);
         card.provenance = Provenance {
             source_hash: file.source_hash.clone(),
             input_hash: Some(hash_json(&json!(prompt_hashes))?),
@@ -323,25 +327,19 @@ impl CodeEnricher for MlxChatEnricher {
         );
         match core {
             Ok(core) => {
-                card.summary = core.summary;
-                card.responsibility = core.responsibility;
                 let anchors = folder_anchor_strings(folder, child_files, context, &card);
                 let behavior_intents =
                     sanitize_grounded_strings(core.behavior_intents, &anchors, 12);
                 if !behavior_intents.is_empty() {
-                    card.behavior_intents = behavior_intents;
-                }
-                let contains_kinds =
-                    sanitize_grounded_strings(core.contains_kinds_of_files, &anchors, 8);
-                if !contains_kinds.is_empty() {
-                    card.contains_kinds_of_files = contains_kinds;
+                    card.behavior_intents =
+                        merge_preferred_strings(behavior_intents, card.behavior_intents, 12);
                 }
                 let common_behaviors =
                     sanitize_grounded_strings(core.common_behaviors, &anchors, 12);
                 if !common_behaviors.is_empty() {
-                    card.common_behaviors = common_behaviors;
+                    card.common_behaviors =
+                        merge_preferred_strings(common_behaviors, card.common_behaviors, 12);
                 }
-                card.subareas = core.subareas;
             }
             Err(error) => {
                 card.agent_guidance.push(format!(
@@ -391,10 +389,10 @@ impl CodeEnricher for MlxChatEnricher {
                 if !key_entrypoints.is_empty() {
                     card.key_entrypoints = key_entrypoints;
                 }
-                let edit_intents =
-                    sanitize_grounded_strings(navigation.edit_intents, &anchors, 12);
+                let edit_intents = sanitize_grounded_strings(navigation.edit_intents, &anchors, 12);
                 if !edit_intents.is_empty() {
-                    card.edit_intents = edit_intents;
+                    card.edit_intents =
+                        merge_preferred_strings(edit_intents, card.edit_intents, 12);
                 }
                 let retrieval_tags = sanitize_grounded_tags(
                     sanitize_retrieval_tags(navigation.retrieval_tags, 24),
@@ -404,7 +402,10 @@ impl CodeEnricher for MlxChatEnricher {
                         path: folder.path.clone(),
                         name: folder.name.clone(),
                         language: "folder".into(),
-                        parent_folder_id: folder.parent_folder_id.clone().unwrap_or_else(|| "repo".into()),
+                        parent_folder_id: folder
+                            .parent_folder_id
+                            .clone()
+                            .unwrap_or_else(|| "repo".into()),
                         source_hash: String::new(),
                         line_count: 0,
                         imports: Vec::new(),
@@ -419,12 +420,14 @@ impl CodeEnricher for MlxChatEnricher {
                 let agent_guidance =
                     sanitize_grounded_strings(navigation.agent_guidance, &anchors, 6);
                 if !agent_guidance.is_empty() {
-                    card.agent_guidance = agent_guidance;
+                    card.agent_guidance =
+                        merge_preferred_strings(agent_guidance, card.agent_guidance, 6);
                 }
                 let search_phrases =
                     sanitize_search_phrases(navigation.search_phrases, &anchors, 12);
                 if !search_phrases.is_empty() {
-                    card.search_phrases = search_phrases;
+                    card.search_phrases =
+                        merge_preferred_strings(search_phrases, card.search_phrases, 12);
                 }
             }
             Err(error) => {
@@ -449,79 +452,9 @@ impl CodeEnricher for MlxChatEnricher {
     }
 
     fn enrich_repo(&self, repo_root: &str, folders: &[FolderCard]) -> Result<RepoCard> {
-        Ok(RepoCard {
-            repo_root: repo_root.into(),
-            summary: format!(
-                "Repository at {repo_root} has {} enriched folder cards available for code-agent navigation.",
-                folders.len()
-            ),
-            behavior_intents: sanitize_string_items(
-                folders
-                    .iter()
-                    .flat_map(|folder| folder.behavior_intents.clone())
-                    .collect(),
-                24,
-            ),
-            edit_intents: sanitize_string_items(
-                folders
-                    .iter()
-                    .flat_map(|folder| folder.edit_intents.clone())
-                    .collect(),
-                24,
-            ),
-            retrieval_tags: sanitize_retrieval_tags(
-                folders
-                    .iter()
-                    .flat_map(|folder| folder.retrieval_tags.clone())
-                    .chain(std::iter::once("artifact:repo-card".into()))
-                    .collect(),
-                40,
-            ),
-            top_level_subsystems: folders
-                .iter()
-                .filter(|folder| !folder.folder_id.contains('/'))
-                .map(|folder| SubareaSummary {
-                    id: folder.folder_id.clone(),
-                    name: folder.folder_id.clone(),
-                    responsibility: folder.responsibility.clone(),
-                })
-                .collect(),
-            cross_subsystem_flows: folders
-                .iter()
-                .flat_map(|folder| folder.outgoing_dependencies_meaning.clone())
-                .take(24)
-                .collect(),
-            entrypoints: folders
-                .iter()
-                .flat_map(|folder| folder.key_entrypoints.clone())
-                .take(24)
-                .collect(),
-            high_risk_areas: folders
-                .iter()
-                .flat_map(|folder| folder.incoming_dependencies_meaning.clone())
-                .take(12)
-                .collect(),
-            agent_navigation_hints: folders
-                .iter()
-                .flat_map(|folder| folder.agent_guidance.clone())
-                .take(12)
-                .collect(),
-            search_phrases: vec![
-                "repository architecture".into(),
-                "top level subsystem map".into(),
-            ],
-            provenance: Provenance {
-                source_hash: folders
-                    .iter()
-                    .map(|folder| folder.provenance.source_hash.as_str())
-                    .collect::<Vec<_>>()
-                    .join(":"),
-                input_hash: None,
-                model: Some(self.model.clone()),
-                schema_version: matryoshka_core_ir::CARD_SCHEMA_VERSION,
-                generated_at: Utc::now(),
-            },
-        })
+        let mut card = HeuristicEnricher.enrich_repo(repo_root, folders)?;
+        card.provenance.model = Some(self.model.clone());
+        Ok(card)
     }
 }
 
@@ -720,9 +653,11 @@ fn sanitize_used_by_interpretations(
             })
         })
         .map(|mut item| {
-            if let Some((_, _, detail, relationship)) = dependents.iter().find(|(file_id, path, _, _)| {
-                item.target_id == *file_id || item.target_path == *path
-            }) {
+            if let Some((_, _, detail, relationship)) =
+                dependents.iter().find(|(file_id, path, _, _)| {
+                    item.target_id == *file_id || item.target_path == *path
+                })
+            {
                 item.why = (*detail).to_string();
                 item.dependency_kind = if relationship.is_empty() {
                     "dependent".into()
@@ -807,7 +742,11 @@ fn folder_anchor_strings(
     anchors.extend(card.retrieval_tags.clone());
     anchors.extend(card.common_behaviors.clone());
     anchors.extend(child_files.iter().map(|file| file.file_id.clone()));
-    anchors.extend(child_files.iter().flat_map(|file| file.primary_behaviors.clone()));
+    anchors.extend(
+        child_files
+            .iter()
+            .flat_map(|file| file.primary_behaviors.clone()),
+    );
     anchors.extend(
         context
             .incoming_dependencies
@@ -839,13 +778,16 @@ fn sanitize_grounded_tags(
     folder_id: &str,
 ) -> Vec<String> {
     let anchor_tokens = collect_anchor_tokens(anchors);
-    let exact_path_tag = format!("path:{}", collapse_dashes(&file_like.path.replace('/', "-")));
+    let exact_path_tag = format!(
+        "path:{}",
+        collapse_dashes(&file_like.path.replace('/', "-"))
+    );
     let exact_folder_tag = format!("folder:{}", collapse_dashes(&folder_id.replace('/', "-")));
     tags.into_iter()
         .filter(|tag| {
             let prefix = tag.split(':').next().unwrap_or_default();
             match prefix {
-                "artifact" | "entity" | "language" | "role" | "core" => true,
+                "artifact" | "entity" | "language" | "role" | "core" | "ownership" => true,
                 "path" => tag == &exact_path_tag,
                 "folder" => tag == &exact_folder_tag,
                 "behavior" | "edit" | "dependency" => {
@@ -870,7 +812,9 @@ fn sanitize_side_effects(
         .iter()
         .map(|import| import.module.to_lowercase())
         .collect::<Vec<_>>();
-    let has_database = external.iter().any(|item| item.contains("sql") || item.contains("sqlite"));
+    let has_database = external
+        .iter()
+        .any(|item| item.contains("sql") || item.contains("sqlite"));
     let has_filesystem = external
         .iter()
         .any(|item| item.contains("path") || item.contains("fs"));
@@ -884,7 +828,10 @@ fn sanitize_side_effects(
             if lowered.contains("uncertain") || lowered.contains("potential") {
                 return false;
             }
-            (has_database && (lowered.contains("database") || lowered.contains("sqlite") || lowered.contains("sql")))
+            (has_database
+                && (lowered.contains("database")
+                    || lowered.contains("sqlite")
+                    || lowered.contains("sql")))
                 || (has_filesystem
                     && (lowered.contains("filesystem")
                         || lowered.contains("file")
@@ -918,7 +865,11 @@ fn sanitize_key_entities(
     let allowed = std::iter::once(file.name.to_lowercase())
         .chain(std::iter::once(file.path.to_lowercase()))
         .chain(symbols.iter().map(|symbol| symbol.name.to_lowercase()))
-        .chain(symbols.iter().map(|symbol| symbol.qualified_name.to_lowercase()))
+        .chain(
+            symbols
+                .iter()
+                .map(|symbol| symbol.qualified_name.to_lowercase()),
+        )
         .chain(
             context
                 .internal_imports
@@ -931,9 +882,9 @@ fn sanitize_key_entities(
         .into_iter()
         .filter(|item| {
             let lowered = item.to_lowercase();
-            allowed
-                .iter()
-                .any(|allowed_item| lowered.contains(allowed_item) || allowed_item.contains(&lowered))
+            allowed.iter().any(|allowed_item| {
+                lowered.contains(allowed_item) || allowed_item.contains(&lowered)
+            })
         })
         .take(10)
         .collect::<Vec<_>>();
@@ -958,9 +909,9 @@ fn sanitize_external_systems(
         .into_iter()
         .filter(|item| {
             let lowered = item.to_lowercase();
-            allowed
-                .iter()
-                .any(|allowed_item| lowered.contains(allowed_item) || allowed_item.contains(&lowered))
+            allowed.iter().any(|allowed_item| {
+                lowered.contains(allowed_item) || allowed_item.contains(&lowered)
+            })
         })
         .take(8)
         .collect::<Vec<_>>();
@@ -1043,9 +994,7 @@ fn sanitize_key_entrypoints(
 }
 
 fn collect_anchor_tokens(items: &[String]) -> std::collections::BTreeSet<String> {
-    items.iter()
-        .flat_map(|item| phrase_tokens(item))
-        .collect()
+    items.iter().flat_map(|item| phrase_tokens(item)).collect()
 }
 
 fn phrase_tokens(item: &str) -> std::collections::BTreeSet<String> {
@@ -1055,10 +1004,7 @@ fn phrase_tokens(item: &str) -> std::collections::BTreeSet<String> {
         .collect()
 }
 
-fn is_grounded_phrase(
-    item: &str,
-    anchor_tokens: &std::collections::BTreeSet<String>,
-) -> bool {
+fn is_grounded_phrase(item: &str, anchor_tokens: &std::collections::BTreeSet<String>) -> bool {
     let tokens = phrase_tokens(item);
     !tokens.is_empty() && tokens.iter().any(|token| anchor_tokens.contains(token))
 }
@@ -1079,11 +1025,23 @@ fn merge_preferred_strings(
         .collect()
 }
 
-fn merge_retrieval_tags(preferred: Vec<String>, fallback: Vec<String>, limit: usize) -> Vec<String> {
+fn merge_retrieval_tags(
+    preferred: Vec<String>,
+    fallback: Vec<String>,
+    limit: usize,
+) -> Vec<String> {
     let structural_fallback = fallback.into_iter().filter(|tag| {
         matches!(
             tag.split(':').next().unwrap_or_default(),
-            "artifact" | "entity" | "language" | "path" | "folder" | "role" | "dependency" | "core"
+            "artifact"
+                | "entity"
+                | "language"
+                | "path"
+                | "folder"
+                | "role"
+                | "dependency"
+                | "core"
+                | "ownership"
         )
     });
     merge_preferred_strings(preferred, structural_fallback.collect(), limit)
@@ -1154,8 +1112,7 @@ fn remove_heuristic_placeholder_notes(
         .into_iter()
         .filter(|note| {
             let lowered = note.to_lowercase();
-            !lowered.contains("heuristic card:")
-                && !heuristic_set.contains(&lowered)
+            !lowered.contains("heuristic card:") && !heuristic_set.contains(&lowered)
         })
         .collect()
 }

@@ -2,7 +2,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use matryoshka_embed_client::{DeterministicEmbedder, EndpointEmbedder};
 use matryoshka_enricher::{HeuristicEnricher, MlxChatEnricher};
-use matryoshka_indexer::{FullIndexer, IndexSummary, UpdateSummary};
+use matryoshka_indexer::{FullIndexer, IndexSummary, SemanticRebuildSummary, UpdateSummary};
 use matryoshka_read_api::ReadApi;
 use matryoshka_search::SearchEngine;
 use matryoshka_store_sqlite::MatryoshkaStore;
@@ -36,9 +36,9 @@ enum Command {
         base_url: String,
         #[arg(long, default_value = DEFAULT_API_KEY)]
         api_key: String,
-        #[arg(long, default_value = DEFAULT_EMBED_MODEL)]
+        #[arg(long = "embedding-model", visible_alias = "embed-model", default_value = DEFAULT_EMBED_MODEL)]
         embed_model: String,
-        #[arg(long, default_value = DEFAULT_CHAT_MODEL)]
+        #[arg(long = "model", visible_alias = "chat-model", default_value = DEFAULT_CHAT_MODEL)]
         chat_model: String,
     },
     Update {
@@ -51,9 +51,9 @@ enum Command {
         base_url: String,
         #[arg(long, default_value = DEFAULT_API_KEY)]
         api_key: String,
-        #[arg(long, default_value = DEFAULT_EMBED_MODEL)]
+        #[arg(long = "embedding-model", visible_alias = "embed-model", default_value = DEFAULT_EMBED_MODEL)]
         embed_model: String,
-        #[arg(long, default_value = DEFAULT_CHAT_MODEL)]
+        #[arg(long = "model", visible_alias = "chat-model", default_value = DEFAULT_CHAT_MODEL)]
         chat_model: String,
     },
     Watch {
@@ -66,14 +66,27 @@ enum Command {
         base_url: String,
         #[arg(long, default_value = DEFAULT_API_KEY)]
         api_key: String,
-        #[arg(long, default_value = DEFAULT_EMBED_MODEL)]
+        #[arg(long = "embedding-model", visible_alias = "embed-model", default_value = DEFAULT_EMBED_MODEL)]
         embed_model: String,
-        #[arg(long, default_value = DEFAULT_CHAT_MODEL)]
+        #[arg(long = "model", visible_alias = "chat-model", default_value = DEFAULT_CHAT_MODEL)]
         chat_model: String,
         #[arg(long, default_value_t = 2_000)]
         interval_ms: u64,
         #[arg(long, default_value_t = 3_000)]
         debounce_ms: u64,
+    },
+    RebuildSemantic {
+        repo_root: PathBuf,
+        #[arg(long)]
+        db: PathBuf,
+        #[arg(long, default_value_t = false)]
+        offline: bool,
+        #[arg(long, default_value = DEFAULT_BASE_URL)]
+        base_url: String,
+        #[arg(long, default_value = DEFAULT_API_KEY)]
+        api_key: String,
+        #[arg(long = "embedding-model", visible_alias = "embed-model", default_value = DEFAULT_EMBED_MODEL)]
+        embed_model: String,
     },
     Search {
         #[arg(long)]
@@ -87,7 +100,7 @@ enum Command {
         base_url: String,
         #[arg(long, default_value = DEFAULT_API_KEY)]
         api_key: String,
-        #[arg(long, default_value = DEFAULT_EMBED_MODEL)]
+        #[arg(long = "embedding-model", visible_alias = "embed-model", default_value = DEFAULT_EMBED_MODEL)]
         embed_model: String,
     },
     Read {
@@ -192,8 +205,8 @@ fn main() -> Result<()> {
                         );
                         print_update_summary(indexer.update_repo(&repo_root)?);
                     } else {
-                        let enricher =
-                            MlxChatEnricher::new(&base_url, &api_key).with_model(chat_model.clone());
+                        let enricher = MlxChatEnricher::new(&base_url, &api_key)
+                            .with_model(chat_model.clone());
                         let embedder =
                             EndpointEmbedder::new(&base_url, &api_key, embed_model.clone());
                         let indexer = FullIndexer::new(store, enricher, embedder);
@@ -220,6 +233,28 @@ fn main() -> Result<()> {
                     .search(&query, limit)?
             };
             println!("{}", serde_json::to_string_pretty(&hits)?);
+        }
+        Command::RebuildSemantic {
+            repo_root,
+            db,
+            offline,
+            base_url,
+            api_key,
+            embed_model,
+        } => {
+            let store = MatryoshkaStore::open(&db)?;
+            let summary = if offline {
+                FullIndexer::new(store, HeuristicEnricher, DeterministicEmbedder::default())
+                    .rebuild_semantic_index(repo_root)?
+            } else {
+                FullIndexer::new(
+                    store,
+                    HeuristicEnricher,
+                    EndpointEmbedder::new(base_url, api_key, embed_model),
+                )
+                .rebuild_semantic_index(repo_root)?
+            };
+            print_semantic_rebuild_summary(summary);
         }
         Command::Read {
             db,
@@ -258,5 +293,13 @@ fn print_update_summary(summary: UpdateSummary) {
     println!("removed_files: {}", summary.removed_files);
     println!("changed_folders: {}", summary.changed_folders);
     println!("repo_card_updated: {}", summary.repo_card_updated);
+    println!("embedding_model: {}", summary.embedding_model);
+}
+
+fn print_semantic_rebuild_summary(summary: SemanticRebuildSummary) {
+    println!("semantic_records: {}", summary.semantic_record_count);
+    println!("file_card_records: {}", summary.file_card_record_count);
+    println!("folder_card_records: {}", summary.folder_card_record_count);
+    println!("repo_card_records: {}", summary.repo_card_record_count);
     println!("embedding_model: {}", summary.embedding_model);
 }

@@ -1,7 +1,7 @@
-use anyhow::Result;
+use anyhow::{Result, bail};
 use matryoshka_core_ir::{
     FileCard, FileEnrichmentContext, FileFact, FolderCard, FolderEnrichmentContext, ImportContext,
-    RelatedFileContext, RepositorySnapshot, SemanticEntityType, SemanticRecord,
+    RelatedFileContext, RepoCard, RepositorySnapshot, SemanticEntityType, SemanticRecord,
 };
 use matryoshka_embed_client::Embedder;
 use matryoshka_enricher::CodeEnricher;
@@ -135,6 +135,48 @@ where
             embedding_model: self.embedder.model().into(),
         })
     }
+
+    pub fn rebuild_semantic_index(
+        &self,
+        repo_root: impl AsRef<Path>,
+    ) -> Result<SemanticRebuildSummary> {
+        let repo_root = repo_root.as_ref();
+        let snapshot = load_snapshot(&self.store, repo_root)?;
+        if snapshot.files.is_empty() {
+            bail!("no indexed files found in store; run index first");
+        }
+
+        let file_cards = self.store.load_all_file_cards()?;
+        let folder_cards = self.store.load_all_folder_cards()?;
+        let repo_card = self.store.load_repo_card(&snapshot.repo_root)?;
+
+        let mut raw_records = raw_semantic_records(&snapshot);
+        embed_selected_records(&self.embedder, &mut raw_records, |record| {
+            matches!(
+                record.entity_type,
+                SemanticEntityType::Snippet | SemanticEntityType::Symbol
+            )
+        })?;
+
+        let mut card_records =
+            card_semantic_records(&file_cards, &folder_cards, repo_card.as_ref());
+        embed_records(&self.embedder, &mut card_records)?;
+
+        let file_card_record_count = file_cards.len();
+        let folder_card_record_count = folder_cards.len();
+        let repo_card_record_count = usize::from(repo_card.is_some());
+
+        raw_records.extend(card_records);
+        self.store.replace_semantic_records(&raw_records)?;
+
+        Ok(SemanticRebuildSummary {
+            semantic_record_count: raw_records.len(),
+            file_card_record_count,
+            folder_card_record_count,
+            repo_card_record_count,
+            embedding_model: self.embedder.model().into(),
+        })
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -157,6 +199,15 @@ pub struct UpdateSummary {
     pub removed_files: usize,
     pub changed_folders: usize,
     pub repo_card_updated: bool,
+    pub embedding_model: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct SemanticRebuildSummary {
+    pub semantic_record_count: usize,
+    pub file_card_record_count: usize,
+    pub folder_card_record_count: usize,
+    pub repo_card_record_count: usize,
     pub embedding_model: String,
 }
 
@@ -190,21 +241,127 @@ fn enrichment_concurrency() -> usize {
         .unwrap_or(6)
 }
 
+fn embedding_batch_size() -> usize {
+    std::env::var("MATRYOSHKA_EMBED_BATCH")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(64)
+}
+
 pub fn embed_records(embedder: &impl Embedder, records: &mut [SemanticRecord]) -> Result<()> {
-    let inputs = records
+    embed_selected_records(embedder, records, |_| true)
+}
+
+fn embed_selected_records<F>(
+    embedder: &impl Embedder,
+    records: &mut [SemanticRecord],
+    include: F,
+) -> Result<()>
+where
+    F: Fn(&SemanticRecord) -> bool,
+{
+    let batch_size = embedding_batch_size();
+    let selected_indices = records
         .iter()
-        .map(|record| {
-            format!(
-                "title: {}\npath: {}\n{}",
-                record.title, record.path, record.content
-            )
-        })
+        .enumerate()
+        .filter_map(|(index, record)| include(record).then_some(index))
         .collect::<Vec<_>>();
-    let embeddings = embedder.embed(&inputs)?;
-    for (record, embedding) in records.iter_mut().zip(embeddings) {
-        record.embedding = Some(embedding);
+    for batch in selected_indices.chunks(batch_size) {
+        let inputs = batch
+            .iter()
+            .map(|index| semantic_embedding_input(&records[*index]))
+            .collect::<Vec<_>>();
+        let embeddings = embedder.embed(&inputs)?;
+        for (index, embedding) in batch.iter().zip(embeddings) {
+            records[*index].embedding = Some(embedding);
+        }
     }
     Ok(())
+}
+
+fn semantic_embedding_input(record: &SemanticRecord) -> String {
+    format!(
+        "title: {}\npath: {}\n{}",
+        record.title, record.path, record.content
+    )
+}
+
+fn raw_semantic_records(snapshot: &RepositorySnapshot) -> Vec<SemanticRecord> {
+    let source_hash_by_file_id = snapshot
+        .files
+        .iter()
+        .map(|file| (file.file_id.as_str(), file.source_hash.clone()))
+        .collect::<BTreeMap<_, _>>();
+    let mut semantic_records = Vec::new();
+    for file in &snapshot.files {
+        semantic_records.push(SemanticRecord {
+            record_id: format!("semantic:file:{}", file.file_id),
+            entity_id: file.file_id.clone(),
+            entity_type: SemanticEntityType::File,
+            title: format!("File {}", file.path),
+            content: raw_file_record_content(file),
+            path: file.path.clone(),
+            source_hash: file.source_hash.clone(),
+            embedding: None,
+            metadata: BTreeMap::from([("kind".into(), json!("file_fact"))]),
+        });
+        for snippet in &file.snippets {
+            semantic_records.push(SemanticRecord {
+                record_id: format!("semantic:snippet:{}", snippet.snippet_id),
+                entity_id: snippet.snippet_id.clone(),
+                entity_type: SemanticEntityType::Snippet,
+                title: format!("Snippet {} in {}", snippet.title, file.path),
+                content: snippet.text.clone(),
+                path: file.path.clone(),
+                source_hash: file.source_hash.clone(),
+                embedding: None,
+                metadata: BTreeMap::from([
+                    ("file_id".into(), json!(file.file_id)),
+                    ("start_line".into(), json!(snippet.start_line)),
+                ]),
+            });
+        }
+    }
+    for symbol in &snapshot.symbols {
+        semantic_records.push(SemanticRecord {
+            record_id: format!("semantic:symbol:{}", symbol.symbol_id),
+            entity_id: symbol.symbol_id.clone(),
+            entity_type: SemanticEntityType::Symbol,
+            title: format!("Symbol {} in {}", symbol.qualified_name, symbol.path),
+            content: format!(
+                "symbol: {}\nkind: {:?}\nsignature: {}\nfile: {}",
+                symbol.qualified_name, symbol.kind, symbol.signature, symbol.path
+            ),
+            path: symbol.path.clone(),
+            source_hash: source_hash_by_file_id
+                .get(symbol.file_id.as_str())
+                .cloned()
+                .unwrap_or_default(),
+            embedding: None,
+            metadata: BTreeMap::from([("kind".into(), json!("symbol_fact"))]),
+        });
+    }
+    semantic_records
+}
+
+fn raw_file_record_content(file: &matryoshka_core_ir::FileFact) -> String {
+    let imports = file
+        .imports
+        .iter()
+        .map(|import| import.module.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let snippets = file
+        .snippets
+        .iter()
+        .map(|snippet| snippet.title.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "path: {}\nlanguage: {}\nimports: {}\nimportant snippets: {}\nlines: {}",
+        file.path, file.language, imports, snippets, file.line_count
+    )
 }
 
 fn load_snapshot(store: &MatryoshkaStore, repo_root: &Path) -> Result<RepositorySnapshot> {
@@ -326,7 +483,10 @@ fn compute_delta(old: &RepositorySnapshot, new: &RepositorySnapshot) -> Snapshot
             repo_card_stale = true;
         }
         for target_id in old_targets.symmetric_difference(&new_targets) {
-            if let Some(file) = new_files.get(target_id).or_else(|| old_files.get(target_id)) {
+            if let Some(file) = new_files
+                .get(target_id)
+                .or_else(|| old_files.get(target_id))
+            {
                 affected_file_ids.insert(file.file_id.clone());
                 affected_folder_ids.insert(file.parent_folder_id.clone());
                 raw_semantic_paths.insert(file.path.clone());
@@ -419,7 +579,11 @@ fn mark_invalidation_queue(
         let parent_folder_id = new_files
             .get(file_id)
             .map(|file| file.parent_folder_id.as_str())
-            .or_else(|| old_files.get(file_id).map(|file| file.parent_folder_id.as_str()));
+            .or_else(|| {
+                old_files
+                    .get(file_id)
+                    .map(|file| file.parent_folder_id.as_str())
+            });
         store.mark_stale("file", file_id, "file content changed")?;
         if let Some(folder_id) = parent_folder_id {
             store.mark_stale("folder", folder_id, "child file changed")?;
@@ -467,7 +631,11 @@ fn apply_structural_delta(
     )?;
     store.delete_folders(&delta.removed_folder_ids.iter().cloned().collect::<Vec<_>>())?;
     store.delete_edges_for_entities(
-        &delta.structural_entity_ids.iter().cloned().collect::<Vec<_>>(),
+        &delta
+            .structural_entity_ids
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>(),
     )?;
     store.delete_semantic_records_for_paths(
         &delta
@@ -605,7 +773,7 @@ where
                 .delete_folder_cards(&removed_folder_ids.into_iter().collect::<Vec<_>>())?;
         }
 
-        if repo_card_stale {
+        let repo_card = if repo_card_stale {
             let all_folder_cards = snapshot
                 .folders
                 .iter()
@@ -614,7 +782,12 @@ where
                         .iter()
                         .find(|card| card.folder_id == folder.folder_id)
                         .cloned()
-                        .or_else(|| self.store.load_folder_card(&folder.folder_id).ok().flatten())
+                        .or_else(|| {
+                            self.store
+                                .load_folder_card(&folder.folder_id)
+                                .ok()
+                                .flatten()
+                        })
                         .unwrap_or_else(|| FolderCard {
                             folder_id: folder.folder_id.clone(),
                             summary: String::new(),
@@ -638,9 +811,17 @@ where
                 .enricher
                 .enrich_repo(&snapshot.repo_root, &all_folder_cards)?;
             self.store.upsert_repo_card(&repo_card)?;
-        }
+            Some(repo_card)
+        } else {
+            None
+        };
 
-        let mut card_records = card_semantic_records(&file_cards, &folder_cards);
+        let mut raw_records = selected_embedded_raw_records(snapshot, affected_file_ids);
+        embed_records(&self.embedder, &mut raw_records)?;
+        self.store.upsert_semantic_records(&raw_records)?;
+
+        let mut card_records =
+            card_semantic_records(&file_cards, &folder_cards, repo_card.as_ref());
         embed_records(&self.embedder, &mut card_records)?;
         self.store.upsert_semantic_records(&card_records)?;
         Ok(self.store.load_all_semantic_records()?.len())
@@ -650,6 +831,7 @@ where
 fn card_semantic_records(
     file_cards: &[FileCard],
     folder_cards: &[FolderCard],
+    repo_card: Option<&RepoCard>,
 ) -> Vec<SemanticRecord> {
     let mut records = Vec::new();
     for card in file_cards {
@@ -659,9 +841,12 @@ fn card_semantic_records(
             entity_type: SemanticEntityType::File,
             title: format!("FileCard {}", card.file_id),
             content: format!(
-                "summary: {}\nrole: {}\nbehaviors: {}\nbehavior intents: {}\nedit intents: {}\nretrieval tags: {}\nimports: {}\nused_by: {}\nblast_radius: {}\nread hints: {}\nsearch phrases: {}",
+                "summary: {}\nrole: {}\nownership: {:?}\nowns behaviors: {}\ndelegates to: {}\nbehaviors: {}\nbehavior intents: {}\nedit intents: {}\nretrieval tags: {}\nimports: {}\nused_by: {}\nblast_radius: {}\nread hints: {}\nsearch phrases: {}",
                 card.summary,
                 card.role,
+                card.ownership_kind,
+                card.owns_behaviors.join("; "),
+                card.delegates_to.join("; "),
                 card.primary_behaviors.join("; "),
                 card.behavior_intents.join("; "),
                 card.edit_intents.join("; "),
@@ -688,6 +873,9 @@ fn card_semantic_records(
                 ("behavior_intents".into(), json!(card.behavior_intents)),
                 ("edit_intents".into(), json!(card.edit_intents)),
                 ("retrieval_tags".into(), json!(card.retrieval_tags)),
+                ("ownership_kind".into(), json!(card.ownership_kind)),
+                ("owns_behaviors".into(), json!(card.owns_behaviors)),
+                ("delegates_to".into(), json!(card.delegates_to)),
             ]),
         });
     }
@@ -722,7 +910,70 @@ fn card_semantic_records(
             ]),
         });
     }
+    if let Some(card) = repo_card {
+        records.push(repo_card_semantic_record(card));
+    }
     records
+}
+
+fn repo_card_semantic_record(card: &RepoCard) -> SemanticRecord {
+    SemanticRecord {
+        record_id: format!("semantic:repo_card:{}", card.repo_root),
+        entity_id: card.repo_root.clone(),
+        entity_type: SemanticEntityType::Repo,
+        title: format!("RepoCard {}", card.repo_root),
+        content: format!(
+            "summary: {}\nbehavior intents: {}\nedit intents: {}\nretrieval tags: {}\nsubsystems: {}\nflows: {}\nentrypoints: {}\nhigh risk areas: {}\nnavigation hints: {}\nsearch phrases: {}",
+            card.summary,
+            card.behavior_intents.join("; "),
+            card.edit_intents.join("; "),
+            card.retrieval_tags.join("; "),
+            card.top_level_subsystems
+                .iter()
+                .map(|item| format!("{} -> {}", item.name, item.responsibility))
+                .collect::<Vec<_>>()
+                .join("; "),
+            card.cross_subsystem_flows.join("; "),
+            card.entrypoints.join("; "),
+            card.high_risk_areas.join("; "),
+            card.agent_navigation_hints.join("; "),
+            card.search_phrases.join("; ")
+        ),
+        path: card.repo_root.clone(),
+        source_hash: card.provenance.source_hash.clone(),
+        embedding: None,
+        metadata: BTreeMap::from([
+            ("kind".into(), json!("repo_card")),
+            ("behavior_intents".into(), json!(card.behavior_intents)),
+            ("edit_intents".into(), json!(card.edit_intents)),
+            ("retrieval_tags".into(), json!(card.retrieval_tags)),
+        ]),
+    }
+}
+
+fn selected_embedded_raw_records(
+    snapshot: &RepositorySnapshot,
+    affected_file_ids: &BTreeSet<String>,
+) -> Vec<SemanticRecord> {
+    let affected_paths = snapshot
+        .files
+        .iter()
+        .filter(|file| affected_file_ids.contains(&file.file_id))
+        .map(|file| file.path.clone())
+        .collect::<BTreeSet<_>>();
+
+    snapshot
+        .semantic_records
+        .iter()
+        .filter(|record| affected_paths.contains(&record.path))
+        .filter(|record| {
+            matches!(
+                record.entity_type,
+                SemanticEntityType::Snippet | SemanticEntityType::Symbol
+            )
+        })
+        .cloned()
+        .collect()
 }
 
 fn build_file_contexts(
@@ -739,15 +990,18 @@ fn build_file_contexts(
         for import in file.imports.iter().filter(|import| import.is_internal) {
             if let Some(target_id) = &import.resolved_file_id {
                 if let Some(target_file) = file_by_id.get(target_id) {
-                    imported_by.entry(target_id.clone()).or_default().push(RelatedFileContext {
-                        file_id: file.file_id.clone(),
-                        path: file.path.clone(),
-                        relationship: "imported_by".into(),
-                        detail: format!(
-                            "{} imports {} via {}.",
-                            file.path, target_file.path, import.module
-                        ),
-                    });
+                    imported_by
+                        .entry(target_id.clone())
+                        .or_default()
+                        .push(RelatedFileContext {
+                            file_id: file.file_id.clone(),
+                            path: file.path.clone(),
+                            relationship: "imported_by".into(),
+                            detail: format!(
+                                "{} imports {} via {}.",
+                                file.path, target_file.path, import.module
+                            ),
+                        });
                 }
             }
         }
@@ -761,7 +1015,8 @@ fn build_file_contexts(
                 .files
                 .iter()
                 .filter(|candidate| {
-                    candidate.parent_folder_id == file.parent_folder_id && candidate.file_id != file.file_id
+                    candidate.parent_folder_id == file.parent_folder_id
+                        && candidate.file_id != file.file_id
                 })
                 .map(|candidate| candidate.file_id.clone())
                 .take(12)
@@ -879,8 +1134,12 @@ fn build_folder_contexts(
 
             let context = FolderEnrichmentContext {
                 parent_folder_id: folder.parent_folder_id.clone(),
-                incoming_dependencies: dedupe_related(incoming.remove(&folder.folder_id).unwrap_or_default()),
-                outgoing_dependencies: dedupe_related(outgoing.remove(&folder.folder_id).unwrap_or_default()),
+                incoming_dependencies: dedupe_related(
+                    incoming.remove(&folder.folder_id).unwrap_or_default(),
+                ),
+                outgoing_dependencies: dedupe_related(
+                    outgoing.remove(&folder.folder_id).unwrap_or_default(),
+                ),
                 representative_child_files,
             };
             (folder.folder_id.clone(), context)

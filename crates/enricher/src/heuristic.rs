@@ -2,9 +2,9 @@ use crate::CodeEnricher;
 use anyhow::Result;
 use chrono::Utc;
 use matryoshka_core_ir::{
-    DependencyInterpretation, FileCard, FileEnrichmentContext, FileFact, FolderCard,
-    FolderEnrichmentContext, FolderFact, Provenance, RelatedFileContext, RepoCard, SubareaSummary,
-    SymbolBehavior, SymbolFact,
+    DependencyInterpretation, FileCard, FileEnrichmentContext, FileFact, FileOwnershipKind,
+    FolderCard, FolderEnrichmentContext, FolderFact, Provenance, RelatedFileContext, RepoCard,
+    SubareaSummary, SymbolBehavior, SymbolFact,
 };
 
 #[derive(Debug, Default, Clone)]
@@ -29,7 +29,11 @@ impl CodeEnricher for HeuristicEnricher {
         let dependency_summary = dependency_summary(file, context);
         let behavior_intents = behavior_intents(file, &intent_phrases, context, is_facade);
         let edit_intents = edit_intents(file, &symbol_names, context, is_facade);
-        let retrieval_tags = retrieval_tags(file, &behavior_intents, &edit_intents, context, is_facade);
+        let retrieval_tags =
+            retrieval_tags(file, &behavior_intents, &edit_intents, context, is_facade);
+        let ownership_kind = ownership_kind(file, symbols, context, is_facade);
+        let owns_behaviors = owns_behaviors(&behavior_intents, is_facade);
+        let delegates_to = delegates_to(context, is_facade);
         let summary = format!(
             "{} is a {} file in {} with {} top-level symbols and {} imports. {} {}",
             file.path,
@@ -55,6 +59,9 @@ impl CodeEnricher for HeuristicEnricher {
             behavior_intents,
             edit_intents,
             retrieval_tags,
+            ownership_kind,
+            owns_behaviors,
+            delegates_to,
             side_effects: side_effects(file, context),
             key_entities: key_entities(file, &symbol_names, context),
             external_systems: context
@@ -81,13 +88,7 @@ impl CodeEnricher for HeuristicEnricher {
                 .collect(),
             blast_radius: blast_radius(file, context),
             agent_read_hints: agent_read_hints(file, &top_symbols, context),
-            search_phrases: search_phrases(
-                file,
-                &top_symbols,
-                context,
-                &intent_phrases,
-                is_facade,
-            ),
+            search_phrases: search_phrases(file, &top_symbols, context, &intent_phrases, is_facade),
             risk_notes: risk_notes(file, context),
             provenance: Provenance {
                 source_hash: file.source_hash.clone(),
@@ -109,11 +110,27 @@ impl CodeEnricher for HeuristicEnricher {
             .iter()
             .map(|card| card.file_id.clone())
             .collect::<Vec<_>>();
+        let owner_files = folder_owner_files(child_files);
+        let surface_files = folder_surface_files(child_files);
         let behavior_intents = dedupe_take(
             child_files
                 .iter()
                 .flat_map(|card| card.behavior_intents.clone())
-                .chain(child_files.iter().flat_map(|card| card.primary_behaviors.clone())),
+                .chain(
+                    child_files
+                        .iter()
+                        .flat_map(|card| card.primary_behaviors.clone()),
+                ),
+            12,
+        );
+        let common_behaviors = dedupe_take(
+            child_files.iter().flat_map(|card| {
+                if card.owns_behaviors.is_empty() {
+                    card.primary_behaviors.clone()
+                } else {
+                    card.owns_behaviors.clone()
+                }
+            }),
             12,
         );
         let edit_intents = dedupe_take(
@@ -131,29 +148,75 @@ impl CodeEnricher for HeuristicEnricher {
                 .chain(std::iter::once(format!("layer:{}", tagify(&folder.name)))),
             20,
         );
+        let focus_behaviors = folder_focus_behaviors(child_files);
+        let owner_summary = if owner_files.is_empty() {
+            "Behavior is spread across the folder without one obvious implementation owner.".into()
+        } else {
+            format!(
+                "Implementation ownership sits mainly in {}.",
+                owner_files.join(", ")
+            )
+        };
+        let surface_summary = if surface_files.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "Public or entrypoint surfaces include {}.",
+                surface_files.join(", ")
+            )
+        };
+        let focus_source = if focus_behaviors.is_empty() {
+            common_behaviors.clone()
+        } else {
+            focus_behaviors.clone()
+        };
+        let responsibility_focus = if common_behaviors.is_empty() {
+            format!("the code grouped under {}", folder.path)
+        } else {
+            focus_source
+                .iter()
+                .take(3)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("; ")
+        };
         Ok(FolderCard {
             folder_id: folder.folder_id.clone(),
             summary: format!(
-                "{} groups {} direct files and {} direct subfolders. It has {} incoming cross-file dependencies and {} outgoing cross-file dependencies in the current graph.",
+                "{} groups {} direct files and {} direct subfolders. {} {} Common behavior here centers on {}. {} {}",
                 folder.path,
                 folder.child_file_ids.len(),
                 folder.child_folder_ids.len(),
-                context.incoming_dependencies.len(),
-                context.outgoing_dependencies.len(),
+                owner_summary,
+                surface_summary,
+                responsibility_focus,
+                dependency_party_summary(&context.incoming_dependencies, 3),
+                dependency_party_summary(&context.outgoing_dependencies, 3),
             ),
             responsibility: format!(
-                "Coordinates the behavior represented by {} and acts as the {} layer of the codebase.",
-                child_names.join(", "),
-                folder.name
+                "Owns the {} layer of the codebase around {}. Start here when a task spans {}, then drop into {} for implementation details.",
+                folder.name,
+                responsibility_focus,
+                if surface_files.is_empty() {
+                    folder.path.clone()
+                } else {
+                    surface_files.join(", ")
+                },
+                if owner_files.is_empty() {
+                    child_names
+                        .iter()
+                        .take(3)
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                } else {
+                    owner_files.join(", ")
+                }
             ),
             behavior_intents,
             edit_intents,
             retrieval_tags,
-            contains_kinds_of_files: child_files
-                .iter()
-                .flat_map(|card| card.primary_behaviors.clone())
-                .take(8)
-                .collect(),
+            contains_kinds_of_files: folder_file_kinds(child_files),
             incoming_dependencies_meaning: context
                 .incoming_dependencies
                 .iter()
@@ -166,18 +229,17 @@ impl CodeEnricher for HeuristicEnricher {
                 .take(12)
                 .map(|item| item.detail.clone())
                 .collect(),
-            key_entrypoints: context
-                .representative_child_files
-                .iter()
-                .map(|item| item.path.clone())
-                .chain(child_names.iter().take(4).cloned())
-                .take(8)
-                .collect(),
-            common_behaviors: child_files
-                .iter()
-                .flat_map(|card| card.primary_behaviors.clone())
-                .take(12)
-                .collect(),
+            key_entrypoints: dedupe_take(
+                context
+                    .representative_child_files
+                    .iter()
+                    .map(|item| item.path.clone())
+                    .chain(surface_files.iter().cloned())
+                    .chain(owner_files.iter().cloned())
+                    .chain(child_names.iter().take(4).cloned()),
+                8,
+            ),
+            common_behaviors: common_behaviors.clone(),
             subareas: folder
                 .child_folder_ids
                 .iter()
@@ -188,14 +250,15 @@ impl CodeEnricher for HeuristicEnricher {
                 })
                 .collect(),
             agent_guidance: vec![format!(
-                "Start at {} when a query mentions files or behaviors grouped under this path or when cross-file dependency flow converges here.",
-                folder.path,
+                "Start at {} when a query spans {} or when dependency flow converges on this folder.",
+                folder.path, responsibility_focus
             )],
-            search_phrases: vec![
-                format!("folder responsibility {}", folder.path),
-                format!("code under {}", folder.path),
-                format!("{} dependency hub", folder.path),
-            ],
+            search_phrases: folder_search_phrases(
+                folder,
+                &common_behaviors,
+                &surface_files,
+                &owner_files,
+            ),
             provenance: Provenance {
                 source_hash: child_files
                     .iter()
@@ -211,11 +274,35 @@ impl CodeEnricher for HeuristicEnricher {
     }
 
     fn enrich_repo(&self, repo_root: &str, folders: &[FolderCard]) -> Result<RepoCard> {
+        let top_level_subsystems = folders
+            .iter()
+            .filter(|folder| !folder.folder_id.contains('/'))
+            .map(|folder| SubareaSummary {
+                id: folder.folder_id.clone(),
+                name: folder.folder_id.clone(),
+                responsibility: folder.responsibility.clone(),
+            })
+            .collect::<Vec<_>>();
+        let repo_name = std::path::Path::new(repo_root)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or(repo_root);
+        let subsystem_names = top_level_subsystems
+            .iter()
+            .map(|item| item.name.clone())
+            .take(6)
+            .collect::<Vec<_>>();
         Ok(RepoCard {
             repo_root: repo_root.into(),
             summary: format!(
-                "Repository at {repo_root} contains {} enriched folders and is indexed for agent search/read workflows.",
-                folders.len()
+                "Repository {repo_name} contains {} enriched folders across {} top-level subsystems. The main navigation surface is organized around {}. Start with subsystem folders, then read file cards to move from public facades into behavior-owning implementation files.",
+                folders.len(),
+                top_level_subsystems.len(),
+                if subsystem_names.is_empty() {
+                    "the indexed code map".into()
+                } else {
+                    subsystem_names.join(", ")
+                }
             ),
             behavior_intents: dedupe_take(
                 folders
@@ -233,18 +320,12 @@ impl CodeEnricher for HeuristicEnricher {
                 folders
                     .iter()
                     .flat_map(|folder| folder.retrieval_tags.clone())
-                    .chain(std::iter::once("artifact:repo-card".into())),
+                    .chain(std::iter::once("entity:repo".into()))
+                    .chain(std::iter::once("artifact:repo-card".into()))
+                    .chain(std::iter::once(format!("repo:{}", tagify(repo_name)))),
                 32,
             ),
-            top_level_subsystems: folders
-                .iter()
-                .filter(|folder| !folder.folder_id.contains('/'))
-                .map(|folder| SubareaSummary {
-                    id: folder.folder_id.clone(),
-                    name: folder.folder_id.clone(),
-                    responsibility: folder.responsibility.clone(),
-                })
-                .collect(),
+            top_level_subsystems: top_level_subsystems.clone(),
             cross_subsystem_flows: folders
                 .iter()
                 .flat_map(|folder| folder.outgoing_dependencies_meaning.clone())
@@ -255,17 +336,30 @@ impl CodeEnricher for HeuristicEnricher {
                 .flat_map(|folder| folder.key_entrypoints.clone())
                 .take(16)
                 .collect(),
-            high_risk_areas: vec![
-                "Use dependency and caller/callee edges to inspect blast radius before editing central files."
-                    .into(),
-            ],
+            high_risk_areas: folders
+                .iter()
+                .filter(|folder| !folder.incoming_dependencies_meaning.is_empty())
+                .take(8)
+                .map(|folder| {
+                    format!(
+                        "{} has {} incoming dependency signals and deserves blast-radius checks before edits.",
+                        folder.folder_id,
+                        folder.incoming_dependencies_meaning.len()
+                    )
+                })
+                .collect(),
             agent_navigation_hints: vec![
-                "Use semantic search first for behavior, then read the returned file card before opening raw source."
+                "Use semantic search first for behavior, then read the returned file or folder card before opening raw source."
+                    .into(),
+                "For public API or entrypoint changes, inspect facade files first and then follow delegates_to or behavior-owner files."
+                    .into(),
+                "For architecture questions, start at the repo card and top-level folders before drilling into implementation files."
                     .into(),
             ],
             search_phrases: vec![
-                format!("repository map {repo_root}"),
+                format!("repository map {repo_name}"),
                 "top level subsystem responsibilities".into(),
+                format!("{repo_name} architecture overview"),
             ],
             provenance: Provenance {
                 source_hash: folders
@@ -280,6 +374,128 @@ impl CodeEnricher for HeuristicEnricher {
             },
         })
     }
+}
+
+fn folder_owner_files(child_files: &[FileCard]) -> Vec<String> {
+    dedupe_take(
+        child_files
+            .iter()
+            .filter(|card| {
+                matches!(
+                    card.ownership_kind,
+                    FileOwnershipKind::Implementation | FileOwnershipKind::Mixed
+                )
+            })
+            .map(|card| card.file_id.clone()),
+        4,
+    )
+}
+
+fn folder_surface_files(child_files: &[FileCard]) -> Vec<String> {
+    dedupe_take(
+        child_files
+            .iter()
+            .filter(|card| card.ownership_kind == FileOwnershipKind::Facade)
+            .map(|card| card.file_id.clone()),
+        4,
+    )
+}
+
+fn folder_file_kinds(child_files: &[FileCard]) -> Vec<String> {
+    let owner_files = folder_owner_files(child_files);
+    let surface_files = folder_surface_files(child_files);
+    let supporting_files = dedupe_take(
+        child_files
+            .iter()
+            .filter(|card| {
+                !matches!(
+                    card.ownership_kind,
+                    FileOwnershipKind::Implementation | FileOwnershipKind::Mixed
+                ) && card.ownership_kind != FileOwnershipKind::Facade
+            })
+            .map(|card| card.file_id.clone()),
+        4,
+    );
+
+    let mut kinds = Vec::new();
+    if !owner_files.is_empty() {
+        kinds.push(format!(
+            "Behavior-owner implementation files such as {}.",
+            owner_files.join(", ")
+        ));
+    }
+    if !surface_files.is_empty() {
+        kinds.push(format!(
+            "Facade or entrypoint files such as {} that route readers to deeper implementation.",
+            surface_files.join(", ")
+        ));
+    }
+    if !supporting_files.is_empty() {
+        kinds.push(format!(
+            "Supporting modules such as {} that round out the folder's behavior surface.",
+            supporting_files.join(", ")
+        ));
+    }
+    if kinds.is_empty() {
+        kinds.push("Source files grouped under this path that collectively implement the folder's behavior.".into());
+    }
+    kinds
+}
+
+fn folder_focus_behaviors(child_files: &[FileCard]) -> Vec<String> {
+    let owner_behaviors = dedupe_take(
+        child_files
+            .iter()
+            .filter(|card| {
+                matches!(
+                    card.ownership_kind,
+                    FileOwnershipKind::Implementation | FileOwnershipKind::Mixed
+                )
+            })
+            .flat_map(|card| card.owns_behaviors.clone()),
+        8,
+    );
+    if !owner_behaviors.is_empty() {
+        return owner_behaviors;
+    }
+    dedupe_take(
+        child_files
+            .iter()
+            .flat_map(|card| card.primary_behaviors.clone()),
+        8,
+    )
+}
+
+fn dependency_party_summary(items: &[RelatedFileContext], limit: usize) -> String {
+    if items.is_empty() {
+        return "No strong cross-folder dependency signal was recorded here yet.".into();
+    }
+    let parties = dedupe_take(items.iter().map(|item| item.path.clone()), limit);
+    format!(
+        "Cross-folder dependencies currently mention {}.",
+        parties.join(", ")
+    )
+}
+
+fn folder_search_phrases(
+    folder: &FolderFact,
+    common_behaviors: &[String],
+    surface_files: &[String],
+    owner_files: &[String],
+) -> Vec<String> {
+    let mut phrases = vec![
+        format!("folder responsibility {}", folder.path),
+        format!("code under {}", folder.path),
+        format!("{} dependency hub", folder.path),
+    ];
+    phrases.extend(common_behaviors.iter().take(3).cloned());
+    if !surface_files.is_empty() {
+        phrases.push(format!("{} entrypoints", folder.path));
+    }
+    if !owner_files.is_empty() {
+        phrases.push(format!("{} implementation owners", folder.path));
+    }
+    dedupe_take(phrases, 10)
 }
 
 fn file_role(
@@ -305,8 +521,7 @@ fn file_role(
         }
         return format!(
             "Acts as a thin crate or module entrypoint in {} and mainly exposes sibling implementation such as {} instead of owning deep behavior directly.",
-            context.parent_folder_id,
-            sibling
+            context.parent_folder_id, sibling
         );
     }
 
@@ -333,9 +548,13 @@ fn file_role(
 }
 
 fn file_role_family(file: &FileFact) -> &'static str {
-    if file.path.contains("sqlite") || file.path.contains("store") || file.path.contains("storage") {
+    if file.path.contains("sqlite") || file.path.contains("store") || file.path.contains("storage")
+    {
         "persistence-oriented"
-    } else if file.path.contains("search") || file.path.contains("index") || file.path.contains("embed") {
+    } else if file.path.contains("search")
+        || file.path.contains("index")
+        || file.path.contains("embed")
+    {
         "retrieval or indexing"
     } else if file.path.contains("resolver") {
         "resolution"
@@ -396,10 +615,7 @@ fn primary_behaviors(
         }
     }
     if let Some(first_symbol) = top_symbols.first() {
-        behaviors.push(format!(
-            "Defines {} through {}.",
-            file.name, first_symbol
-        ));
+        behaviors.push(format!("Defines {} through {}.", file.name, first_symbol));
     }
     behaviors.extend(
         intent_phrases
@@ -435,11 +651,19 @@ fn side_effects(file: &FileFact, context: &FileEnrichmentContext) -> Vec<String>
         .iter()
         .map(|import| import.module.as_str())
         .collect::<Vec<_>>();
-    if external.iter().any(|name| name.contains("rusqlite") || name.contains("sql")) {
+    if external
+        .iter()
+        .any(|name| name.contains("rusqlite") || name.contains("sql"))
+    {
         effects.push("Likely performs database IO through SQLite-related dependencies.".into());
     }
-    if external.iter().any(|name| name.contains("fs") || name.contains("path")) {
-        effects.push("Touches filesystem paths or local file metadata as part of its behavior.".into());
+    if external
+        .iter()
+        .any(|name| name.contains("fs") || name.contains("path"))
+    {
+        effects.push(
+            "Touches filesystem paths or local file metadata as part of its behavior.".into(),
+        );
     }
     if effects.is_empty() {
         effects.push(format!(
@@ -492,21 +716,17 @@ fn imports_interpreted(
             dependency_kind: "internal".into(),
         })
         .collect::<Vec<_>>();
-    interpreted.extend(
-        context
-            .external_imports
-            .iter()
-            .take(6)
-            .map(|import| DependencyInterpretation {
-                target_id: import.module.clone(),
-                target_path: import.module.clone(),
-                why: format!(
-                    "{} imports external dependency {}.",
-                    file.path, import.module
-                ),
-                dependency_kind: "external".into(),
-            }),
-    );
+    interpreted.extend(context.external_imports.iter().take(6).map(|import| {
+        DependencyInterpretation {
+            target_id: import.module.clone(),
+            target_path: import.module.clone(),
+            why: format!(
+                "{} imports external dependency {}.",
+                file.path, import.module
+            ),
+            dependency_kind: "external".into(),
+        }
+    }));
     interpreted
 }
 
@@ -559,7 +779,10 @@ fn agent_read_hints(
     let mut hints = vec![format!(
         "Read {} when investigating behavior around {}.",
         file.path,
-        top_symbols.first().cloned().unwrap_or_else(|| file.name.clone())
+        top_symbols
+            .first()
+            .cloned()
+            .unwrap_or_else(|| file.name.clone())
     )];
     if !context.imported_by_files.is_empty() {
         hints.push(
@@ -639,7 +862,10 @@ fn intent_phrases(
         || joined_symbols.contains("workspace_crate_candidates")
     {
         intents.push("import resolution and repository dependency graph construction".into());
-        intents.push("mapping Rust, Python, or workspace-crate imports onto concrete repository files".into());
+        intents.push(
+            "mapping Rust, Python, or workspace-crate imports onto concrete repository files"
+                .into(),
+        );
     }
     if path.contains("parser")
         || joined_symbols.contains("parse_rust_import")
@@ -652,13 +878,20 @@ fn intent_phrases(
         || joined_symbols.contains("find_rust_block_end")
         || joined_symbols.contains("update_brace_depth")
     {
-        intents.push("Rust symbol extraction, impl-method qualification, and block boundary detection".into());
+        intents.push(
+            "Rust symbol extraction, impl-method qualification, and block boundary detection"
+                .into(),
+        );
     }
     if path.contains("search") || joined_symbols.contains("score_record") {
-        intents.push("hybrid search ranking across embeddings, lexical hits, and graph-aware boosts".into());
+        intents.push(
+            "hybrid search ranking across embeddings, lexical hits, and graph-aware boosts".into(),
+        );
     }
     if path.contains("indexer") || joined_symbols.contains("embed_records") {
-        intents.push("building semantic records, cards, and embeddings for the indexed code map".into());
+        intents.push(
+            "building semantic records, cards, and embeddings for the indexed code map".into(),
+        );
     }
     if path.contains("watcher") || path.contains("invalidation") {
         intents.push("change detection, invalidation, and incremental refresh planning".into());
@@ -701,7 +934,10 @@ fn behavior_intents(
 ) -> Vec<String> {
     let mut intents = Vec::new();
     if is_facade {
-        intents.push(format!("Expose {} module entrypoint and re-export surface", context.parent_folder_id));
+        intents.push(format!(
+            "Expose {} module entrypoint and re-export surface",
+            context.parent_folder_id
+        ));
     }
     intents.extend(intent_phrases.iter().cloned());
     if !context.imported_by_files.is_empty() {
@@ -724,8 +960,14 @@ fn edit_intents(
 ) -> Vec<String> {
     let mut intents = Vec::new();
     if is_facade {
-        intents.push(format!("change public exports for {}", context.parent_folder_id));
-        intents.push(format!("route readers from {} to implementation modules", file.path));
+        intents.push(format!(
+            "change public exports for {}",
+            context.parent_folder_id
+        ));
+        intents.push(format!(
+            "route readers from {} to implementation modules",
+            file.path
+        ));
     }
     for symbol in symbol_names.iter().take(5) {
         intents.push(format!("change behavior around {symbol}"));
@@ -762,12 +1004,27 @@ fn retrieval_tags(
     is_facade: bool,
 ) -> Vec<String> {
     let mut tags = vec![
-        format!("artifact:{}", if is_facade { "facade" } else { "implementation" }),
+        format!(
+            "artifact:{}",
+            if is_facade {
+                "facade"
+            } else {
+                "implementation"
+            }
+        ),
         format!("entity:file"),
         format!("language:{}", tagify(&file.language)),
         format!("path:{}", tagify(&file.path)),
         format!("folder:{}", tagify(&context.parent_folder_id)),
         format!("role:{}", tagify(file_role_family(file))),
+        format!(
+            "ownership:{}",
+            if is_facade {
+                "surface"
+            } else {
+                "behavior-owner"
+            }
+        ),
     ];
     tags.extend(
         behavior_intents
@@ -791,6 +1048,45 @@ fn retrieval_tags(
         tags.push("dependency:external".into());
     }
     dedupe_take(tags, 32)
+}
+
+fn ownership_kind(
+    file: &FileFact,
+    symbols: &[SymbolFact],
+    context: &FileEnrichmentContext,
+    is_facade: bool,
+) -> FileOwnershipKind {
+    if is_facade {
+        return FileOwnershipKind::Facade;
+    }
+    if !symbols.is_empty() || !file.snippets.is_empty() {
+        return FileOwnershipKind::Implementation;
+    }
+    if !context.imported_by_files.is_empty() && !context.sibling_file_ids.is_empty() {
+        return FileOwnershipKind::Mixed;
+    }
+    FileOwnershipKind::Unknown
+}
+
+fn owns_behaviors(behavior_intents: &[String], is_facade: bool) -> Vec<String> {
+    if is_facade {
+        return Vec::new();
+    }
+    dedupe_take(behavior_intents.iter().cloned(), 10)
+}
+
+fn delegates_to(context: &FileEnrichmentContext, is_facade: bool) -> Vec<String> {
+    if !is_facade {
+        return Vec::new();
+    }
+    dedupe_take(
+        context
+            .sibling_file_ids
+            .iter()
+            .filter(|id| !id.ends_with("/lib.rs") && !id.ends_with("/mod.rs"))
+            .cloned(),
+        8,
+    )
 }
 
 fn tagify(value: &str) -> String {

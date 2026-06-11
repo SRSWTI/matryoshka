@@ -265,8 +265,7 @@ mod tests {
         ];
         let symbols = parse_rust_symbols("store.rs", &lines);
         assert!(symbols.iter().any(|symbol| {
-            symbol.qualified_name == "MatryoshkaStore::open"
-                && symbol.kind == SymbolKind::Method
+            symbol.qualified_name == "MatryoshkaStore::open" && symbol.kind == SymbolKind::Method
         }));
         assert!(symbols.iter().any(|symbol| {
             symbol.qualified_name == "MatryoshkaStore" && symbol.kind == SymbolKind::Struct

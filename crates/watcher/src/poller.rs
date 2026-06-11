@@ -15,7 +15,9 @@ pub struct ChangeBatch {
 
 impl ChangeBatch {
     pub fn is_empty(&self) -> bool {
-        self.changed_paths.is_empty() && self.added_paths.is_empty() && self.removed_paths.is_empty()
+        self.changed_paths.is_empty()
+            && self.added_paths.is_empty()
+            && self.removed_paths.is_empty()
     }
 }
 
@@ -111,7 +113,10 @@ impl RepoWatcher {
     }
 }
 
-fn diff_states(previous: &BTreeMap<String, String>, current: &BTreeMap<String, String>) -> ChangeBatch {
+fn diff_states(
+    previous: &BTreeMap<String, String>,
+    current: &BTreeMap<String, String>,
+) -> ChangeBatch {
     let mut changed_paths = Vec::new();
     let mut added_paths = Vec::new();
     let mut removed_paths = Vec::new();
@@ -153,14 +158,22 @@ fn merge_path_lists(existing: &[String], incoming: &[String]) -> Vec<String> {
         .collect()
 }
 
-fn scan_repo_state(repo_root: &Path, parser_config: &ParserConfig) -> Result<BTreeMap<String, String>> {
+fn scan_repo_state(
+    repo_root: &Path,
+    parser_config: &ParserConfig,
+) -> Result<BTreeMap<String, String>> {
     let mut state = BTreeMap::new();
 
     for entry in WalkDir::new(repo_root).into_iter().filter_entry(|entry| {
         !entry
             .file_name()
             .to_str()
-            .map(|name| parser_config.ignored_dirs.iter().any(|ignored| ignored == name))
+            .map(|name| {
+                parser_config
+                    .ignored_dirs
+                    .iter()
+                    .any(|ignored| ignored == name)
+            })
             .unwrap_or(false)
     }) {
         let entry = entry?;
@@ -189,7 +202,12 @@ fn scan_repo_state(repo_root: &Path, parser_config: &ParserConfig) -> Result<BTr
 fn should_track(path: &Path, parser_config: &ParserConfig) -> bool {
     path.extension()
         .and_then(|ext| ext.to_str())
-        .map(|ext| parser_config.include_extensions.iter().any(|allowed| allowed == ext))
+        .map(|ext| {
+            parser_config
+                .include_extensions
+                .iter()
+                .any(|allowed| allowed == ext)
+        })
         .unwrap_or(false)
 }
 

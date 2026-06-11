@@ -8,7 +8,7 @@ use std::fs;
 
 #[test]
 fn indexes_searches_and_reads_file_cards() {
-    let repo_root = std::path::PathBuf::from("../../tests/fixtures/mini_repo");
+    let repo_root = std::path::PathBuf::from("tests/fixtures/mini_repo");
     let temp = tempfile::tempdir().unwrap();
     let db_path = temp.path().join("index.db");
     let store = MatryoshkaStore::open(&db_path).unwrap();
@@ -21,10 +21,40 @@ fn indexes_searches_and_reads_file_cards() {
     assert!(summary.symbol_count >= 2);
     assert!(summary.semantic_record_count >= 6);
 
+    let records = MatryoshkaStore::open(&db_path)
+        .unwrap()
+        .load_all_semantic_records()
+        .unwrap();
+    assert!(records.iter().any(|record| {
+        record
+            .metadata
+            .get("kind")
+            .and_then(serde_json::Value::as_str)
+            == Some("repo_card")
+    }));
+    assert!(records.iter().any(|record| {
+        matches!(
+            record.entity_type,
+            matryoshka_core_ir::SemanticEntityType::Snippet
+                | matryoshka_core_ir::SemanticEntityType::Symbol
+        ) && record
+            .embedding
+            .as_ref()
+            .is_some_and(|embedding| !embedding.is_empty())
+    }));
+
     let search = SearchEngine::new(
         MatryoshkaStore::open(&db_path).unwrap(),
         DeterministicEmbedder::default(),
     );
+    let repo_hits = search.search("repository architecture", 5).unwrap();
+    assert!(repo_hits.iter().any(|hit| {
+        matches!(
+            hit.entity_type,
+            matryoshka_core_ir::SemanticEntityType::Repo
+        )
+    }));
+
     let hits = search.search("api key loaded from environment", 5).unwrap();
     assert!(!hits.is_empty());
     assert!(hits.iter().any(|hit| hit.path.contains("env.py")));
@@ -96,4 +126,52 @@ fn incremental_update_refreshes_changed_entities_and_preserves_unaffected_cards(
     let search = SearchEngine::new(store, DeterministicEmbedder::default());
     let hits = search.search("cache_key util cache", 5).unwrap();
     assert!(hits.iter().any(|hit| hit.path == "src/util.rs"));
+}
+
+#[test]
+fn rebuild_semantic_recovers_search_without_full_reindex() {
+    let repo_root = std::path::PathBuf::from("tests/fixtures/mini_repo");
+    let temp = tempfile::tempdir().unwrap();
+    let db_path = temp.path().join("index.db");
+    let store = MatryoshkaStore::open(&db_path).unwrap();
+    let indexer = FullIndexer::new(store, HeuristicEnricher, DeterministicEmbedder::default());
+
+    indexer.index_repo(&repo_root).unwrap();
+
+    let store = MatryoshkaStore::open(&db_path).unwrap();
+    store.replace_semantic_records(&[]).unwrap();
+    assert!(store.load_all_semantic_records().unwrap().is_empty());
+
+    let summary = indexer.rebuild_semantic_index(&repo_root).unwrap();
+    assert!(summary.semantic_record_count >= 6);
+    assert!(summary.file_card_record_count >= 2);
+    assert!(summary.folder_card_record_count >= 1);
+    assert_eq!(summary.repo_card_record_count, 1);
+
+    let store = MatryoshkaStore::open(&db_path).unwrap();
+    let records = store.load_all_semantic_records().unwrap();
+    assert!(records.iter().any(|record| {
+        record.record_id.starts_with("semantic:file_card:")
+            || record.record_id.starts_with("semantic:folder_card:")
+            || record.record_id.starts_with("semantic:repo_card:")
+    }));
+    assert!(records.iter().any(|record| {
+        matches!(
+            record.entity_type,
+            matryoshka_core_ir::SemanticEntityType::Snippet
+                | matryoshka_core_ir::SemanticEntityType::Symbol
+        ) && record
+            .embedding
+            .as_ref()
+            .is_some_and(|embedding| !embedding.is_empty())
+    }));
+
+    let search = SearchEngine::new(store, DeterministicEmbedder::default());
+    let hits = search.search("repository architecture", 5).unwrap();
+    assert!(hits.iter().any(|hit| {
+        matches!(
+            hit.entity_type,
+            matryoshka_core_ir::SemanticEntityType::Repo
+        )
+    }));
 }
