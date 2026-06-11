@@ -86,16 +86,6 @@ fn indexes_searches_and_reads_file_cards() {
     );
     assert!(!card.symbols.is_empty());
     assert!(!card.imports.is_empty());
-    assert!(card.source_excerpts.is_empty());
-
-    let card_more = read.read_more("src/auth/middleware.py").unwrap();
-    assert!(!card_more.source_excerpts.is_empty());
-    assert!(
-        card_more
-            .import_lines
-            .iter()
-            .any(|line| line.contains("src.config.env"))
-    );
 }
 
 #[test]

@@ -118,13 +118,6 @@ enum Command {
         repo_root: PathBuf,
         file: String,
     },
-    ReadMore {
-        #[arg(long)]
-        db: PathBuf,
-        #[arg(long)]
-        repo_root: PathBuf,
-        file: String,
-    },
 }
 
 fn main() -> Result<()> {
@@ -309,14 +302,6 @@ fn main() -> Result<()> {
         } => {
             let read = ReadApi::new(MatryoshkaStore::open(&db)?, repo_root);
             println!("{}", serde_json::to_string_pretty(&read.read(&file)?)?);
-        }
-        Command::ReadMore {
-            db,
-            repo_root,
-            file,
-        } => {
-            let read = ReadApi::new(MatryoshkaStore::open(&db)?, repo_root);
-            println!("{}", serde_json::to_string_pretty(&read.read_more(&file)?)?);
         }
     }
     Ok(())

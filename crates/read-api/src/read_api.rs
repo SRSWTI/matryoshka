@@ -2,7 +2,7 @@ use anyhow::{Result, anyhow};
 use matryoshka_core_ir::{
     DependencyInterpretation, EdgeFact, FileCard, FileFact, FolderCard, ImportFact, ReadCard,
     ReadDependencies, ReadDependency, ReadFileOverview, ReadFolderOverview, ReadImport, ReadSymbol,
-    SnippetFact, SymbolBehavior, SymbolFact,
+    SymbolBehavior, SymbolFact,
 };
 use matryoshka_store_sqlite::MatryoshkaStore;
 use std::fs;
@@ -22,14 +22,6 @@ impl ReadApi {
     }
 
     pub fn read(&self, file_id: &str) -> Result<ReadCard> {
-        self.read_impl(file_id, false)
-    }
-
-    pub fn read_more(&self, file_id: &str) -> Result<ReadCard> {
-        self.read_impl(file_id, true)
-    }
-
-    fn read_impl(&self, file_id: &str, include_source_blocks: bool) -> Result<ReadCard> {
         let file = self
             .store
             .load_file(file_id)?
@@ -49,16 +41,6 @@ impl ReadApi {
             .as_ref()
             .and_then(|card| card.provenance.model.as_deref())
             == Some("heuristic");
-        let symbol_blocks = if include_source_blocks {
-            self.symbol_blocks(&file.path, &symbols)?
-        } else {
-            Vec::new()
-        };
-        let import_lines = if include_source_blocks {
-            self.import_lines(&file.path)?
-        } else {
-            Vec::new()
-        };
         Ok(ReadCard {
             file: file_overview(&file),
             summary: read_summary(&file, file_card.as_ref(), &module_docs, card_is_heuristic),
@@ -79,50 +61,7 @@ impl ReadApi {
             ),
             dependencies: read_dependencies(&incoming_edges, &outgoing_edges),
             agent_hints: read_hints(file_card.as_ref(), card_is_heuristic),
-            source_excerpts: symbol_blocks,
-            import_lines,
         })
-    }
-
-    fn symbol_blocks(
-        &self,
-        file_path: &str,
-        symbols: &[matryoshka_core_ir::SymbolFact],
-    ) -> Result<Vec<SnippetFact>> {
-        let source_path = self.repo_root.join(file_path);
-        let lines = read_lines(&source_path)?;
-        Ok(symbols
-            .iter()
-            .map(|symbol| {
-                let start = symbol.start_line.saturating_sub(1);
-                let end = symbol.end_line.min(lines.len());
-                SnippetFact {
-                    snippet_id: format!("{}#{}-{}", file_path, symbol.start_line, end),
-                    file_id: file_path.into(),
-                    title: symbol.qualified_name.clone(),
-                    start_line: symbol.start_line,
-                    end_line: end,
-                    text: lines[start..end].join("\n"),
-                }
-            })
-            .collect())
-    }
-
-    fn import_lines(&self, file_path: &str) -> Result<Vec<String>> {
-        let source_path = self.repo_root.join(file_path);
-        Ok(read_lines(&source_path)?
-            .into_iter()
-            .filter(|line| {
-                let trimmed = line.trim_start();
-                trimmed.starts_with("import ")
-                    || trimmed.starts_with("from ")
-                    || trimmed.starts_with("use ")
-                    || trimmed.starts_with("mod ")
-                    || trimmed.starts_with("pub mod ")
-                    || trimmed.starts_with("pub use ")
-                    || trimmed.starts_with("export ")
-            })
-            .collect())
     }
 }
 

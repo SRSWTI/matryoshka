@@ -332,10 +332,6 @@ pub struct ReadCard {
     pub dependencies: ReadDependencies,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub agent_hints: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub source_excerpts: Vec<SnippetFact>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub import_lines: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
