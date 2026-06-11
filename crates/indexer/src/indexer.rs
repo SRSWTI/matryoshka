@@ -1,7 +1,8 @@
-use anyhow::{Result, bail};
+use anyhow::Result;
 use matryoshka_core_ir::{
     FileCard, FileEnrichmentContext, FileFact, FolderCard, FolderEnrichmentContext, ImportContext,
-    RelatedFileContext, RepoCard, RepositorySnapshot, SemanticEntityType, SemanticRecord,
+    MatryoshkaProgressEvent, RelatedFileContext, RepoCard, RepositorySnapshot, SemanticEntityType,
+    SemanticRecord,
 };
 use matryoshka_embed_client::Embedder;
 use matryoshka_enricher::CodeEnricher;
@@ -12,6 +13,8 @@ use rayon::prelude::*;
 use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+use std::sync::mpsc;
+use std::thread;
 
 pub struct FullIndexer<E, M> {
     store: MatryoshkaStore,
@@ -40,10 +43,34 @@ where
     }
 
     pub fn index_repo(&self, repo_root: impl AsRef<Path>) -> Result<IndexSummary> {
+        self.index_repo_with_progress(repo_root, |_| {})
+    }
+
+    pub fn index_repo_with_progress(
+        &self,
+        repo_root: impl AsRef<Path>,
+        mut progress: impl FnMut(MatryoshkaProgressEvent),
+    ) -> Result<IndexSummary> {
+        let repo_root = repo_root.as_ref();
+        progress(MatryoshkaProgressEvent::Started { total_steps: None });
         let parser = SourceParser::new(self.parser_config.clone());
-        let parsed = parser.parse_repo(repo_root.as_ref())?;
+        let parsed = match parser.parse_repo_with_progress(repo_root, |event| progress(event)) {
+            Ok(parsed) => parsed,
+            Err(err) => return fail_with_progress("parsing", err, &mut progress),
+        };
         let snapshot = GraphResolver::resolve(parsed);
-        self.store.replace_snapshot(&snapshot)?;
+        progress(MatryoshkaProgressEvent::WritingDatabase {
+            records_written: Some(
+                snapshot.files.len()
+                    + snapshot.folders.len()
+                    + snapshot.symbols.len()
+                    + snapshot.edges.len()
+                    + snapshot.semantic_records.len(),
+            ),
+        });
+        if let Err(err) = self.store.replace_snapshot(&snapshot) {
+            return fail_with_progress("writing_database", err, &mut progress);
+        }
         let file_ids = snapshot
             .files
             .iter()
@@ -61,23 +88,44 @@ where
             true,
             BTreeSet::new(),
             BTreeSet::new(),
+            &mut progress,
         )?;
 
-        Ok(IndexSummary {
+        let summary = IndexSummary {
             db_path: PathBuf::new(),
             file_count: snapshot.files.len(),
             folder_count: snapshot.folders.len(),
             symbol_count: snapshot.symbols.len(),
             semantic_record_count: records,
             embedding_model: self.embedder.model().into(),
-        })
+        };
+        progress(MatryoshkaProgressEvent::Completed {
+            file_count: summary.file_count,
+            folder_count: summary.folder_count,
+            symbol_count: summary.symbol_count,
+            semantic_record_count: summary.semantic_record_count,
+            embedding_model: summary.embedding_model.clone(),
+        });
+        Ok(summary)
     }
 
     pub fn update_repo(&self, repo_root: impl AsRef<Path>) -> Result<UpdateSummary> {
+        self.update_repo_with_progress(repo_root, |_| {})
+    }
+
+    pub fn update_repo_with_progress(
+        &self,
+        repo_root: impl AsRef<Path>,
+        mut progress: impl FnMut(MatryoshkaProgressEvent),
+    ) -> Result<UpdateSummary> {
         let repo_root = repo_root.as_ref();
-        let old_snapshot = load_snapshot(&self.store, repo_root)?;
+        progress(MatryoshkaProgressEvent::Started { total_steps: None });
+        let old_snapshot = match load_snapshot(&self.store, repo_root) {
+            Ok(snapshot) => snapshot,
+            Err(err) => return fail_with_progress("loading_snapshot", err, &mut progress),
+        };
         if old_snapshot.files.is_empty() {
-            let summary = self.index_repo(repo_root)?;
+            let summary = self.index_repo_with_progress(repo_root, |event| progress(event))?;
             return Ok(UpdateSummary {
                 file_count: summary.file_count,
                 folder_count: summary.folder_count,
@@ -92,27 +140,51 @@ where
         }
 
         let parser = SourceParser::new(self.parser_config.clone());
-        let parsed = parser.parse_repo(repo_root)?;
+        let parsed = match parser.parse_repo_with_progress(repo_root, |event| progress(event)) {
+            Ok(parsed) => parsed,
+            Err(err) => return fail_with_progress("parsing", err, &mut progress),
+        };
         let new_snapshot = GraphResolver::resolve(parsed);
         let delta = compute_delta(&old_snapshot, &new_snapshot);
 
         if delta.is_noop() {
-            self.store.clear_invalidation_queue()?;
-            return Ok(UpdateSummary {
+            if let Err(err) = self.store.clear_invalidation_queue() {
+                return fail_with_progress("clearing_invalidation_queue", err, &mut progress);
+            }
+            let summary = UpdateSummary {
                 file_count: new_snapshot.files.len(),
                 folder_count: new_snapshot.folders.len(),
                 symbol_count: new_snapshot.symbols.len(),
-                semantic_record_count: self.store.load_all_semantic_records()?.len(),
+                semantic_record_count: match self.store.load_all_semantic_records() {
+                    Ok(records) => records.len(),
+                    Err(err) => {
+                        return fail_with_progress("loading_semantic_records", err, &mut progress);
+                    }
+                },
                 changed_files: 0,
                 removed_files: 0,
                 changed_folders: 0,
                 repo_card_updated: false,
                 embedding_model: self.embedder.model().into(),
+            };
+            progress(MatryoshkaProgressEvent::Completed {
+                file_count: summary.file_count,
+                folder_count: summary.folder_count,
+                symbol_count: summary.symbol_count,
+                semantic_record_count: summary.semantic_record_count,
+                embedding_model: summary.embedding_model.clone(),
             });
+            return Ok(summary);
         }
 
-        mark_invalidation_queue(&self.store, &old_snapshot, &new_snapshot, &delta)?;
-        apply_structural_delta(&self.store, &old_snapshot, &new_snapshot, &delta)?;
+        if let Err(err) = mark_invalidation_queue(&self.store, &old_snapshot, &new_snapshot, &delta)
+        {
+            return fail_with_progress("marking_invalidation_queue", err, &mut progress);
+        }
+        if let Err(err) = apply_structural_delta(&self.store, &old_snapshot, &new_snapshot, &delta)
+        {
+            return fail_with_progress("applying_structural_delta", err, &mut progress);
+        }
         let semantic_record_count = self.refresh_artifacts(
             &new_snapshot,
             &delta.affected_file_ids,
@@ -120,10 +192,13 @@ where
             delta.repo_card_stale,
             delta.removed_file_ids.clone(),
             delta.removed_folder_ids.clone(),
+            &mut progress,
         )?;
-        self.store.clear_invalidation_queue()?;
+        if let Err(err) = self.store.clear_invalidation_queue() {
+            return fail_with_progress("clearing_invalidation_queue", err, &mut progress);
+        }
 
-        Ok(UpdateSummary {
+        let summary = UpdateSummary {
             file_count: new_snapshot.files.len(),
             folder_count: new_snapshot.folders.len(),
             symbol_count: new_snapshot.symbols.len(),
@@ -133,49 +208,121 @@ where
             changed_folders: delta.affected_folder_ids.len(),
             repo_card_updated: delta.repo_card_stale,
             embedding_model: self.embedder.model().into(),
-        })
+        };
+        progress(MatryoshkaProgressEvent::Completed {
+            file_count: summary.file_count,
+            folder_count: summary.folder_count,
+            symbol_count: summary.symbol_count,
+            semantic_record_count: summary.semantic_record_count,
+            embedding_model: summary.embedding_model.clone(),
+        });
+        Ok(summary)
     }
 
     pub fn rebuild_semantic_index(
         &self,
         repo_root: impl AsRef<Path>,
     ) -> Result<SemanticRebuildSummary> {
+        self.rebuild_semantic_index_with_progress(repo_root, |_| {})
+    }
+
+    pub fn rebuild_semantic_index_with_progress(
+        &self,
+        repo_root: impl AsRef<Path>,
+        mut progress: impl FnMut(MatryoshkaProgressEvent),
+    ) -> Result<SemanticRebuildSummary> {
         let repo_root = repo_root.as_ref();
-        let snapshot = load_snapshot(&self.store, repo_root)?;
+        progress(MatryoshkaProgressEvent::Started { total_steps: None });
+        let snapshot = match load_snapshot(&self.store, repo_root) {
+            Ok(snapshot) => snapshot,
+            Err(err) => return fail_with_progress("loading_snapshot", err, &mut progress),
+        };
         if snapshot.files.is_empty() {
-            bail!("no indexed files found in store; run index first");
+            return fail_with_progress(
+                "rebuild_semantic",
+                anyhow::anyhow!("no indexed files found in store; run index first"),
+                &mut progress,
+            );
         }
 
-        let file_cards = self.store.load_all_file_cards()?;
-        let folder_cards = self.store.load_all_folder_cards()?;
-        let repo_card = self.store.load_repo_card(&snapshot.repo_root)?;
+        let file_cards = match self.store.load_all_file_cards() {
+            Ok(cards) => cards,
+            Err(err) => return fail_with_progress("loading_file_cards", err, &mut progress),
+        };
+        let folder_cards = match self.store.load_all_folder_cards() {
+            Ok(cards) => cards,
+            Err(err) => return fail_with_progress("loading_folder_cards", err, &mut progress),
+        };
+        let repo_card = match self.store.load_repo_card(&snapshot.repo_root) {
+            Ok(card) => card,
+            Err(err) => return fail_with_progress("loading_repo_card", err, &mut progress),
+        };
 
         let mut raw_records = raw_semantic_records(&snapshot);
-        embed_selected_records(&self.embedder, &mut raw_records, |record| {
+        let raw_batches = selected_batch_count(&raw_records, |record| {
             matches!(
                 record.entity_type,
                 SemanticEntityType::Snippet | SemanticEntityType::Symbol
             )
-        })?;
+        });
 
         let mut card_records =
             card_semantic_records(&file_cards, &folder_cards, repo_card.as_ref());
-        embed_records(&self.embedder, &mut card_records)?;
+        let card_batches = selected_batch_count(&card_records, |_| true);
+        let mut embedding_progress = EmbeddingProgress::new(raw_batches + card_batches);
+
+        if let Err(err) = embed_selected_records(
+            &self.embedder,
+            &mut raw_records,
+            |record| {
+                matches!(
+                    record.entity_type,
+                    SemanticEntityType::Snippet | SemanticEntityType::Symbol
+                )
+            },
+            Some(&mut progress),
+            Some(&mut embedding_progress),
+        ) {
+            return fail_with_progress("embedding_raw_records", err, &mut progress);
+        }
+
+        if let Err(err) = embed_selected_records(
+            &self.embedder,
+            &mut card_records,
+            |_| true,
+            Some(&mut progress),
+            Some(&mut embedding_progress),
+        ) {
+            return fail_with_progress("embedding_card_records", err, &mut progress);
+        }
 
         let file_card_record_count = file_cards.len();
         let folder_card_record_count = folder_cards.len();
         let repo_card_record_count = usize::from(repo_card.is_some());
 
         raw_records.extend(card_records);
-        self.store.replace_semantic_records(&raw_records)?;
+        progress(MatryoshkaProgressEvent::WritingDatabase {
+            records_written: Some(raw_records.len()),
+        });
+        if let Err(err) = self.store.replace_semantic_records(&raw_records) {
+            return fail_with_progress("writing_database", err, &mut progress);
+        }
 
-        Ok(SemanticRebuildSummary {
+        let summary = SemanticRebuildSummary {
             semantic_record_count: raw_records.len(),
             file_card_record_count,
             folder_card_record_count,
             repo_card_record_count,
             embedding_model: self.embedder.model().into(),
-        })
+        };
+        progress(MatryoshkaProgressEvent::Completed {
+            file_count: snapshot.files.len(),
+            folder_count: snapshot.folders.len(),
+            symbol_count: snapshot.symbols.len(),
+            semantic_record_count: summary.semantic_record_count,
+            embedding_model: summary.embedding_model.clone(),
+        });
+        Ok(summary)
     }
 }
 
@@ -250,13 +397,15 @@ fn embedding_batch_size() -> usize {
 }
 
 pub fn embed_records(embedder: &impl Embedder, records: &mut [SemanticRecord]) -> Result<()> {
-    embed_selected_records(embedder, records, |_| true)
+    embed_selected_records(embedder, records, |_| true, None, None)
 }
 
 fn embed_selected_records<F>(
     embedder: &impl Embedder,
     records: &mut [SemanticRecord],
     include: F,
+    mut progress: Option<&mut dyn FnMut(MatryoshkaProgressEvent)>,
+    mut embedding_progress: Option<&mut EmbeddingProgress>,
 ) -> Result<()>
 where
     F: Fn(&SemanticRecord) -> bool,
@@ -268,6 +417,16 @@ where
         .filter_map(|(index, record)| include(record).then_some(index))
         .collect::<Vec<_>>();
     for batch in selected_indices.chunks(batch_size) {
+        if let Some(state) = embedding_progress.as_deref_mut() {
+            state.next_batch_index += 1;
+            if let Some(progress) = progress.as_deref_mut() {
+                progress(MatryoshkaProgressEvent::EmbeddingBatch {
+                    batch_index: state.next_batch_index,
+                    total_batches: state.total_batches,
+                    records_in_batch: batch.len(),
+                });
+            }
+        }
         let inputs = batch
             .iter()
             .map(|index| semantic_embedding_input(&records[*index]))
@@ -276,8 +435,29 @@ where
         for (index, embedding) in batch.iter().zip(embeddings) {
             records[*index].embedding = Some(embedding);
         }
+        if let Some(state) = embedding_progress.as_deref_mut() {
+            if let Some(progress) = progress.as_deref_mut() {
+                progress(MatryoshkaProgressEvent::EmbeddedBatch {
+                    batch_index: state.next_batch_index,
+                    total_batches: state.total_batches,
+                    records_in_batch: batch.len(),
+                });
+            }
+        }
     }
     Ok(())
+}
+
+fn selected_batch_count<F>(records: &[SemanticRecord], include: F) -> usize
+where
+    F: Fn(&SemanticRecord) -> bool,
+{
+    let selected = records.iter().filter(|record| include(record)).count();
+    if selected == 0 {
+        0
+    } else {
+        selected.div_ceil(embedding_batch_size())
+    }
 }
 
 fn semantic_embedding_input(record: &SemanticRecord) -> String {
@@ -362,6 +542,38 @@ fn raw_file_record_content(file: &matryoshka_core_ir::FileFact) -> String {
         "path: {}\nlanguage: {}\nimports: {}\nimportant snippets: {}\nlines: {}",
         file.path, file.language, imports, snippets, file.line_count
     )
+}
+
+#[derive(Debug)]
+struct EmbeddingProgress {
+    next_batch_index: usize,
+    total_batches: usize,
+}
+
+impl EmbeddingProgress {
+    fn new(total_batches: usize) -> Self {
+        Self {
+            next_batch_index: 0,
+            total_batches,
+        }
+    }
+}
+
+enum ProgressMessage<T> {
+    Event(MatryoshkaProgressEvent),
+    Finished(Result<T>),
+}
+
+fn fail_with_progress<T>(
+    stage: &str,
+    err: anyhow::Error,
+    progress: &mut dyn FnMut(MatryoshkaProgressEvent),
+) -> Result<T> {
+    progress(MatryoshkaProgressEvent::Failed {
+        stage: stage.to_string(),
+        message: format!("{err:#}"),
+    });
+    Err(err)
 }
 
 fn load_snapshot(store: &MatryoshkaStore, repo_root: &Path) -> Result<RepositorySnapshot> {
@@ -701,39 +913,36 @@ where
         repo_card_stale: bool,
         removed_file_ids: BTreeSet<String>,
         removed_folder_ids: BTreeSet<String>,
+        progress: &mut dyn FnMut(MatryoshkaProgressEvent),
     ) -> Result<usize> {
         let file_contexts = build_file_contexts(snapshot);
         let folder_contexts = build_folder_contexts(snapshot);
         let enrichment_pool = rayon::ThreadPoolBuilder::new()
             .num_threads(enrichment_concurrency())
-            .build()?;
+            .build()
+            .map_err(anyhow::Error::from)?;
 
-        let file_cards = enrichment_pool.install(|| {
-            snapshot
-                .files
-                .par_iter()
-                .filter(|file| affected_file_ids.contains(&file.file_id))
-                .map(|file| {
-                    let symbols = snapshot
-                        .symbols
-                        .iter()
-                        .filter(|symbol| symbol.file_id == file.file_id)
-                        .cloned()
-                        .collect::<Vec<_>>();
-                    let context = file_contexts
-                        .get(&file.file_id)
-                        .cloned()
-                        .unwrap_or_else(|| empty_file_context(&file.parent_folder_id));
-                    self.enricher.enrich_file(file, &symbols, &context)
-                })
-                .collect::<Result<Vec<_>>>()
-        })?;
+        let file_cards = match self.collect_file_cards_with_progress(
+            snapshot,
+            affected_file_ids,
+            &file_contexts,
+            &enrichment_pool,
+            progress,
+        ) {
+            Ok(cards) => cards,
+            Err(err) => return fail_with_progress("enriching_file_cards", err, progress),
+        };
 
+        progress(MatryoshkaProgressEvent::WritingDatabase {
+            records_written: Some(file_cards.len()),
+        });
         for card in &file_cards {
-            self.store.upsert_file_card(card)?;
+            if let Err(err) = self.store.upsert_file_card(card) {
+                return fail_with_progress("writing_database", err, progress);
+            }
         }
 
-        let folder_cards = enrichment_pool.install(|| {
+        let folder_cards = match enrichment_pool.install(|| {
             let store = self.store.clone();
             snapshot
                 .folders
@@ -758,19 +967,35 @@ where
                     self.enricher.enrich_folder(folder, &child_cards, &context)
                 })
                 .collect::<Result<Vec<_>>>()
-        })?;
+        }) {
+            Ok(cards) => cards,
+            Err(err) => return fail_with_progress("enriching_folder_cards", err, progress),
+        };
 
+        progress(MatryoshkaProgressEvent::WritingDatabase {
+            records_written: Some(folder_cards.len()),
+        });
         for card in &folder_cards {
-            self.store.upsert_folder_card(card)?;
+            if let Err(err) = self.store.upsert_folder_card(card) {
+                return fail_with_progress("writing_database", err, progress);
+            }
         }
 
         if !removed_file_ids.is_empty() {
-            self.store
-                .delete_file_cards(&removed_file_ids.into_iter().collect::<Vec<_>>())?;
+            if let Err(err) = self
+                .store
+                .delete_file_cards(&removed_file_ids.into_iter().collect::<Vec<_>>())
+            {
+                return fail_with_progress("writing_database", err, progress);
+            }
         }
         if !removed_folder_ids.is_empty() {
-            self.store
-                .delete_folder_cards(&removed_folder_ids.into_iter().collect::<Vec<_>>())?;
+            if let Err(err) = self
+                .store
+                .delete_folder_cards(&removed_folder_ids.into_iter().collect::<Vec<_>>())
+            {
+                return fail_with_progress("writing_database", err, progress);
+            }
         }
 
         let repo_card = if repo_card_stale {
@@ -807,24 +1032,159 @@ where
                         })
                 })
                 .collect::<Vec<_>>();
-            let repo_card = self
+            let repo_card = match self
                 .enricher
-                .enrich_repo(&snapshot.repo_root, &all_folder_cards)?;
-            self.store.upsert_repo_card(&repo_card)?;
+                .enrich_repo(&snapshot.repo_root, &all_folder_cards)
+            {
+                Ok(card) => card,
+                Err(err) => return fail_with_progress("enriching_repo_card", err, progress),
+            };
+            progress(MatryoshkaProgressEvent::WritingDatabase {
+                records_written: Some(1),
+            });
+            if let Err(err) = self.store.upsert_repo_card(&repo_card) {
+                return fail_with_progress("writing_database", err, progress);
+            }
             Some(repo_card)
         } else {
             None
         };
 
         let mut raw_records = selected_embedded_raw_records(snapshot, affected_file_ids);
-        embed_records(&self.embedder, &mut raw_records)?;
-        self.store.upsert_semantic_records(&raw_records)?;
-
         let mut card_records =
             card_semantic_records(&file_cards, &folder_cards, repo_card.as_ref());
-        embed_records(&self.embedder, &mut card_records)?;
-        self.store.upsert_semantic_records(&card_records)?;
-        Ok(self.store.load_all_semantic_records()?.len())
+        let raw_batches = selected_batch_count(&raw_records, |_| true);
+        let card_batches = selected_batch_count(&card_records, |_| true);
+        let mut embedding_progress = EmbeddingProgress::new(raw_batches + card_batches);
+
+        if let Err(err) = embed_selected_records(
+            &self.embedder,
+            &mut raw_records,
+            |_| true,
+            Some(progress),
+            Some(&mut embedding_progress),
+        ) {
+            return fail_with_progress("embedding_raw_records", err, progress);
+        }
+        progress(MatryoshkaProgressEvent::WritingDatabase {
+            records_written: Some(raw_records.len()),
+        });
+        if let Err(err) = self.store.upsert_semantic_records(&raw_records) {
+            return fail_with_progress("writing_database", err, progress);
+        }
+
+        if let Err(err) = embed_selected_records(
+            &self.embedder,
+            &mut card_records,
+            |_| true,
+            Some(progress),
+            Some(&mut embedding_progress),
+        ) {
+            return fail_with_progress("embedding_card_records", err, progress);
+        }
+        progress(MatryoshkaProgressEvent::WritingDatabase {
+            records_written: Some(card_records.len()),
+        });
+        if let Err(err) = self.store.upsert_semantic_records(&card_records) {
+            return fail_with_progress("writing_database", err, progress);
+        }
+
+        match self.store.load_all_semantic_records() {
+            Ok(records) => Ok(records.len()),
+            Err(err) => fail_with_progress("loading_semantic_records", err, progress),
+        }
+    }
+
+    fn collect_file_cards_with_progress(
+        &self,
+        snapshot: &RepositorySnapshot,
+        affected_file_ids: &BTreeSet<String>,
+        file_contexts: &BTreeMap<String, FileEnrichmentContext>,
+        enrichment_pool: &rayon::ThreadPool,
+        progress: &mut dyn FnMut(MatryoshkaProgressEvent),
+    ) -> Result<Vec<FileCard>> {
+        let files_to_enrich = snapshot
+            .files
+            .iter()
+            .filter(|file| affected_file_ids.contains(&file.file_id))
+            .collect::<Vec<_>>();
+        let total_files = files_to_enrich.len();
+        if total_files == 0 {
+            return Ok(Vec::new());
+        }
+
+        let (tx, rx) = mpsc::channel();
+        thread::scope(|scope| {
+            scope.spawn(|| {
+                let progress_tx = tx.clone();
+                let result = enrichment_pool
+                    .install(|| {
+                        files_to_enrich
+                            .par_iter()
+                            .enumerate()
+                            .map_init(
+                                || progress_tx.clone(),
+                                |event_tx, (position, file)| {
+                                    let index = position + 1;
+                                    let path = file.path.clone();
+                                    let _ = event_tx.send(ProgressMessage::Event(
+                                        MatryoshkaProgressEvent::EnrichingFile {
+                                            path: path.clone(),
+                                            index,
+                                            total_files,
+                                        },
+                                    ));
+                                    let symbols = snapshot
+                                        .symbols
+                                        .iter()
+                                        .filter(|symbol| symbol.file_id == file.file_id)
+                                        .cloned()
+                                        .collect::<Vec<_>>();
+                                    let context =
+                                        file_contexts.get(&file.file_id).cloned().unwrap_or_else(
+                                            || empty_file_context(&file.parent_folder_id),
+                                        );
+                                    let card =
+                                        self.enricher.enrich_file(file, &symbols, &context)?;
+                                    let _ = event_tx.send(ProgressMessage::Event(
+                                        MatryoshkaProgressEvent::EnrichedFile {
+                                            path,
+                                            index,
+                                            total_files,
+                                        },
+                                    ));
+                                    Ok((position, card))
+                                },
+                            )
+                            .collect::<Result<Vec<_>>>()
+                    })
+                    .map(|mut indexed_cards| {
+                        indexed_cards.sort_by_key(|(position, _)| *position);
+                        indexed_cards
+                            .into_iter()
+                            .map(|(_, card)| card)
+                            .collect::<Vec<_>>()
+                    });
+                let _ = tx.send(ProgressMessage::Finished(result));
+            });
+
+            let mut finished = None;
+            while let Ok(message) = rx.recv() {
+                match message {
+                    ProgressMessage::Event(event) => progress(event),
+                    ProgressMessage::Finished(result) => {
+                        finished = Some(result);
+                        break;
+                    }
+                }
+            }
+
+            finished.unwrap_or_else(|| {
+                Err(anyhow::anyhow!(
+                    "file enrichment progress channel closed unexpectedly"
+                ))
+            })
+        })
     }
 }
 

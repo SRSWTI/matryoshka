@@ -1,8 +1,9 @@
 use anyhow::Result;
-use matryoshka_core_ir::{SearchHit, SemanticRecord};
+use matryoshka_core_ir::{FileCard, FolderCard, RepoCard, SearchHit, SemanticRecord};
 use matryoshka_embed_client::{Embedder, cosine};
 use matryoshka_store_sqlite::MatryoshkaStore;
 use serde_json::Value;
+use std::collections::BTreeMap;
 
 pub struct SearchEngine<M> {
     store: MatryoshkaStore,
@@ -33,7 +34,77 @@ impl<M: Embedder> SearchEngine<M> {
                 .then_with(|| left.path.cmp(&right.path))
         });
         hits.truncate(limit);
+        self.hydrate_hits(&mut hits, &records)?;
         Ok(hits)
+    }
+
+    fn hydrate_hits(&self, hits: &mut [SearchHit], records: &[SemanticRecord]) -> Result<()> {
+        let file_cards = self
+            .store
+            .load_all_file_cards()?
+            .into_iter()
+            .map(|card| (card.file_id.clone(), card))
+            .collect::<BTreeMap<_, _>>();
+        let folder_cards = self
+            .store
+            .load_all_folder_cards()?
+            .into_iter()
+            .map(|card| (card.folder_id.clone(), card))
+            .collect::<BTreeMap<_, _>>();
+        let repo_card = self
+            .store
+            .load_repo_root()?
+            .and_then(|repo_root| self.store.load_repo_card(&repo_root).ok().flatten());
+        let records_by_id = records
+            .iter()
+            .map(|record| (record.record_id.as_str(), record))
+            .collect::<BTreeMap<_, _>>();
+
+        for hit in hits {
+            let record = records_by_id.get(hit.record_id.as_str()).copied();
+            match hit.entity_type {
+                matryoshka_core_ir::SemanticEntityType::File => {
+                    if let Some(card) = file_cards
+                        .get(&hit.path)
+                        .or_else(|| file_cards.get(&hit.entity_id))
+                    {
+                        apply_file_card(hit, card, record);
+                    } else if let Some(record) = record {
+                        apply_record_fallback(hit, record);
+                    }
+                }
+                matryoshka_core_ir::SemanticEntityType::Folder => {
+                    if let Some(card) = folder_cards
+                        .get(&hit.path)
+                        .or_else(|| folder_cards.get(&hit.entity_id))
+                    {
+                        apply_folder_card(hit, card);
+                    } else if let Some(record) = record {
+                        apply_record_fallback(hit, record);
+                    }
+                }
+                matryoshka_core_ir::SemanticEntityType::Repo => {
+                    if let Some(card) = repo_card.as_ref() {
+                        apply_repo_card(hit, card);
+                    } else if let Some(record) = record {
+                        apply_record_fallback(hit, record);
+                    }
+                }
+                matryoshka_core_ir::SemanticEntityType::Snippet
+                | matryoshka_core_ir::SemanticEntityType::Symbol => {
+                    if let Some(card) = file_cards
+                        .get(&hit.path)
+                        .or_else(|| file_cards.get(&hit.entity_id))
+                    {
+                        apply_file_card(hit, card, record);
+                    } else if let Some(record) = record {
+                        apply_record_fallback(hit, record);
+                    }
+                }
+            }
+        }
+
+        Ok(())
     }
 }
 
@@ -62,10 +133,12 @@ fn score_record(
     if semantic_score > 0.2 {
         why.push("semantic behavior match".into());
     }
-    let token_hits = query_tokens
+    let matched_terms = query_tokens
         .iter()
         .filter(|token| haystack.contains(token.as_str()))
-        .count();
+        .cloned()
+        .collect::<Vec<_>>();
+    let token_hits = matched_terms.len();
     if token_hits > 0 {
         score += token_hits as f32 * 0.08;
         why.push(format!("{} lexical/path/symbol token matches", token_hits));
@@ -198,9 +271,182 @@ fn score_record(
         path: record.path.clone(),
         title: record.title.clone(),
         entity_type: record.entity_type.clone(),
+        summary: None,
+        description: None,
+        key_behaviors: Vec::new(),
+        agent_hints: Vec::new(),
+        matched_terms,
         score,
         why_matched: why,
     })
+}
+
+fn apply_file_card(hit: &mut SearchHit, card: &FileCard, record: Option<&SemanticRecord>) {
+    hit.summary = non_empty(card.summary.clone());
+    let mut description_parts = Vec::new();
+    push_labeled(&mut description_parts, "Role", &card.role);
+    if !card.owns_behaviors.is_empty() {
+        push_labeled(
+            &mut description_parts,
+            "Owns",
+            &card.owns_behaviors.join("; "),
+        );
+    }
+    if !card.delegates_to.is_empty() {
+        push_labeled(
+            &mut description_parts,
+            "Delegates to",
+            &card.delegates_to.join("; "),
+        );
+    }
+    if !card.side_effects.is_empty() {
+        push_labeled(
+            &mut description_parts,
+            "Side effects",
+            &card.side_effects.join("; "),
+        );
+    }
+    if !card.blast_radius.is_empty() {
+        push_labeled(
+            &mut description_parts,
+            "Blast radius",
+            &card.blast_radius.join("; "),
+        );
+    }
+    if let Some(record) = record {
+        if matches!(
+            record.entity_type,
+            matryoshka_core_ir::SemanticEntityType::Snippet
+        ) {
+            push_labeled(&mut description_parts, "Matched snippet", &record.content);
+        } else if matches!(
+            record.entity_type,
+            matryoshka_core_ir::SemanticEntityType::Symbol
+        ) {
+            push_labeled(
+                &mut description_parts,
+                "Matched symbol",
+                &symbol_description(card, record),
+            );
+        }
+    }
+    hit.description = non_empty(description_parts.join("\n"));
+    hit.key_behaviors = prefer_non_empty(&[
+        &card.owns_behaviors,
+        &card.primary_behaviors,
+        &card.behavior_intents,
+    ]);
+    hit.agent_hints = card.agent_read_hints.clone();
+}
+
+fn apply_folder_card(hit: &mut SearchHit, card: &FolderCard) {
+    hit.summary = non_empty(card.summary.clone());
+    let mut description_parts = Vec::new();
+    push_labeled(
+        &mut description_parts,
+        "Responsibility",
+        &card.responsibility,
+    );
+    if !card.contains_kinds_of_files.is_empty() {
+        push_labeled(
+            &mut description_parts,
+            "Contains",
+            &card.contains_kinds_of_files.join("; "),
+        );
+    }
+    if !card.outgoing_dependencies_meaning.is_empty() {
+        push_labeled(
+            &mut description_parts,
+            "Uses",
+            &card.outgoing_dependencies_meaning.join("; "),
+        );
+    }
+    if !card.incoming_dependencies_meaning.is_empty() {
+        push_labeled(
+            &mut description_parts,
+            "Used by",
+            &card.incoming_dependencies_meaning.join("; "),
+        );
+    }
+    hit.description = non_empty(description_parts.join("\n"));
+    hit.key_behaviors = prefer_non_empty(&[&card.common_behaviors, &card.behavior_intents]);
+    hit.agent_hints = card.agent_guidance.clone();
+}
+
+fn apply_repo_card(hit: &mut SearchHit, card: &RepoCard) {
+    hit.summary = non_empty(card.summary.clone());
+    let mut description_parts = Vec::new();
+    if !card.top_level_subsystems.is_empty() {
+        push_labeled(
+            &mut description_parts,
+            "Subsystems",
+            &card
+                .top_level_subsystems
+                .iter()
+                .map(|subsystem| format!("{}: {}", subsystem.name, subsystem.responsibility))
+                .collect::<Vec<_>>()
+                .join("; "),
+        );
+    }
+    if !card.cross_subsystem_flows.is_empty() {
+        push_labeled(
+            &mut description_parts,
+            "Flows",
+            &card.cross_subsystem_flows.join("; "),
+        );
+    }
+    if !card.high_risk_areas.is_empty() {
+        push_labeled(
+            &mut description_parts,
+            "High-risk areas",
+            &card.high_risk_areas.join("; "),
+        );
+    }
+    hit.description = non_empty(description_parts.join("\n"));
+    hit.key_behaviors = prefer_non_empty(&[&card.behavior_intents, &card.cross_subsystem_flows]);
+    hit.agent_hints = card.agent_navigation_hints.clone();
+}
+
+fn apply_record_fallback(hit: &mut SearchHit, record: &SemanticRecord) {
+    hit.summary = non_empty(record.content.clone());
+}
+
+fn symbol_description(card: &FileCard, record: &SemanticRecord) -> String {
+    let symbol_note = card
+        .important_symbols
+        .iter()
+        .find(|symbol| {
+            symbol.symbol_id == record.entity_id
+                || record.title.contains(&symbol.name)
+                || record.entity_id.contains(&symbol.name)
+        })
+        .map(|symbol| format!("{}: {} {}", symbol.name, symbol.role, symbol.behavior));
+    match symbol_note {
+        Some(note) => format!("{note}\n{}", record.content),
+        None => record.content.clone(),
+    }
+}
+
+fn prefer_non_empty(groups: &[&Vec<String>]) -> Vec<String> {
+    groups
+        .iter()
+        .find(|items| !items.is_empty())
+        .map(|items| (*items).clone())
+        .unwrap_or_default()
+}
+
+fn push_labeled(parts: &mut Vec<String>, label: &str, value: &str) {
+    if !value.trim().is_empty() {
+        parts.push(format!("{label}: {}", value.trim()));
+    }
+}
+
+fn non_empty(value: String) -> Option<String> {
+    if value.trim().is_empty() {
+        None
+    } else {
+        Some(value)
+    }
 }
 
 fn record_kind(record: &SemanticRecord) -> &str {

@@ -1,5 +1,7 @@
 use anyhow::{Context, Result};
-use matryoshka_core_ir::{FileFact, ImportFact, SnippetFact, SymbolFact, SymbolKind};
+use matryoshka_core_ir::{
+    FileFact, ImportFact, MatryoshkaProgressEvent, SnippetFact, SymbolFact, SymbolKind,
+};
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -49,11 +51,52 @@ impl SourceParser {
     }
 
     pub fn parse_repo(&self, repo_root: impl AsRef<Path>) -> Result<ParsedRepository> {
+        self.parse_repo_with_progress(repo_root, |_| {})
+    }
+
+    pub fn parse_repo_with_progress(
+        &self,
+        repo_root: impl AsRef<Path>,
+        mut progress: impl FnMut(MatryoshkaProgressEvent),
+    ) -> Result<ParsedRepository> {
         let repo_root = repo_root.as_ref().to_path_buf();
+        progress(MatryoshkaProgressEvent::DiscoveringFiles);
+        let candidate_paths = self.discover_paths(&repo_root)?;
+        let total_files = candidate_paths.len();
+        progress(MatryoshkaProgressEvent::FilesDiscovered { total_files });
         let mut files = Vec::new();
         let mut symbols = Vec::new();
 
-        for entry in WalkDir::new(&repo_root).into_iter().filter_entry(|entry| {
+        for (index, path) in candidate_paths.iter().enumerate() {
+            let relative = relative_path(&repo_root, path);
+            progress(MatryoshkaProgressEvent::ParsingFile {
+                path: relative.clone(),
+                index: index + 1,
+                total_files,
+            });
+            let (file, mut file_symbols) = self.parse_file(&repo_root, path)?;
+            progress(MatryoshkaProgressEvent::ParsedFile {
+                path: relative,
+                index: index + 1,
+                total_files,
+            });
+            files.push(file);
+            symbols.append(&mut file_symbols);
+        }
+
+        files.sort_by(|left, right| left.path.cmp(&right.path));
+        symbols.sort_by(|left, right| left.symbol_id.cmp(&right.symbol_id));
+
+        Ok(ParsedRepository {
+            repo_root,
+            files,
+            symbols,
+        })
+    }
+
+    fn discover_paths(&self, repo_root: &Path) -> Result<Vec<PathBuf>> {
+        let mut paths = Vec::new();
+        for entry in WalkDir::new(repo_root).into_iter().filter_entry(|entry| {
             !entry
                 .file_name()
                 .to_str()
@@ -69,23 +112,13 @@ impl SourceParser {
             if !entry.file_type().is_file() {
                 continue;
             }
-            let path = entry.path();
-            if !self.should_parse(path) {
-                continue;
+            let path = entry.into_path();
+            if self.should_parse(&path) {
+                paths.push(path);
             }
-            let (file, mut file_symbols) = self.parse_file(&repo_root, path)?;
-            files.push(file);
-            symbols.append(&mut file_symbols);
         }
-
-        files.sort_by(|left, right| left.path.cmp(&right.path));
-        symbols.sort_by(|left, right| left.symbol_id.cmp(&right.symbol_id));
-
-        Ok(ParsedRepository {
-            repo_root,
-            files,
-            symbols,
-        })
+        paths.sort();
+        Ok(paths)
     }
 
     fn should_parse(&self, path: &Path) -> bool {
@@ -139,6 +172,13 @@ impl SourceParser {
 
         Ok((file, symbols))
     }
+}
+
+fn relative_path(repo_root: &Path, path: &Path) -> String {
+    path.strip_prefix(repo_root)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .replace('\\', "/")
 }
 
 pub fn hash_text(text: &str) -> String {

@@ -2,7 +2,9 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use matryoshka_embed_client::{DeterministicEmbedder, EndpointEmbedder};
 use matryoshka_enricher::{HeuristicEnricher, MlxChatEnricher};
-use matryoshka_indexer::{FullIndexer, IndexSummary, SemanticRebuildSummary, UpdateSummary};
+use matryoshka_indexer::{
+    FullIndexer, IndexSummary, MatryoshkaProgressEvent, SemanticRebuildSummary, UpdateSummary,
+};
 use matryoshka_read_api::ReadApi;
 use matryoshka_search::SearchEngine;
 use matryoshka_store_sqlite::MatryoshkaStore;
@@ -40,6 +42,8 @@ enum Command {
         embed_model: String,
         #[arg(long = "model", visible_alias = "chat-model", default_value = DEFAULT_CHAT_MODEL)]
         chat_model: String,
+        #[arg(long, default_value_t = false)]
+        progress_jsonl: bool,
     },
     Update {
         repo_root: PathBuf,
@@ -55,6 +59,8 @@ enum Command {
         embed_model: String,
         #[arg(long = "model", visible_alias = "chat-model", default_value = DEFAULT_CHAT_MODEL)]
         chat_model: String,
+        #[arg(long, default_value_t = false)]
+        progress_jsonl: bool,
     },
     Watch {
         repo_root: PathBuf,
@@ -87,6 +93,8 @@ enum Command {
         api_key: String,
         #[arg(long = "embedding-model", visible_alias = "embed-model", default_value = DEFAULT_EMBED_MODEL)]
         embed_model: String,
+        #[arg(long, default_value_t = false)]
+        progress_jsonl: bool,
     },
     Search {
         #[arg(long)]
@@ -130,19 +138,32 @@ fn main() -> Result<()> {
             api_key,
             embed_model,
             chat_model,
+            progress_jsonl,
         } => {
             let store = MatryoshkaStore::open(&db)?;
             if offline {
                 let indexer =
                     FullIndexer::new(store, HeuristicEnricher, DeterministicEmbedder::default());
-                let summary = indexer.index_repo(repo_root)?;
-                print_index_summary(summary);
+                let summary = if progress_jsonl {
+                    indexer.index_repo_with_progress(repo_root, print_progress_jsonl)?
+                } else {
+                    indexer.index_repo(repo_root)?
+                };
+                if !progress_jsonl {
+                    print_index_summary(summary);
+                }
             } else {
                 let enricher = MlxChatEnricher::new(&base_url, &api_key).with_model(chat_model);
                 let embedder = EndpointEmbedder::new(&base_url, &api_key, embed_model);
                 let indexer = FullIndexer::new(store, enricher, embedder);
-                let summary = indexer.index_repo(repo_root)?;
-                print_index_summary(summary);
+                let summary = if progress_jsonl {
+                    indexer.index_repo_with_progress(repo_root, print_progress_jsonl)?
+                } else {
+                    indexer.index_repo(repo_root)?
+                };
+                if !progress_jsonl {
+                    print_index_summary(summary);
+                }
             }
         }
         Command::Update {
@@ -153,19 +174,32 @@ fn main() -> Result<()> {
             api_key,
             embed_model,
             chat_model,
+            progress_jsonl,
         } => {
             let store = MatryoshkaStore::open(&db)?;
             if offline {
                 let indexer =
                     FullIndexer::new(store, HeuristicEnricher, DeterministicEmbedder::default());
-                let summary = indexer.update_repo(repo_root)?;
-                print_update_summary(summary);
+                let summary = if progress_jsonl {
+                    indexer.update_repo_with_progress(repo_root, print_progress_jsonl)?
+                } else {
+                    indexer.update_repo(repo_root)?
+                };
+                if !progress_jsonl {
+                    print_update_summary(summary);
+                }
             } else {
                 let enricher = MlxChatEnricher::new(&base_url, &api_key).with_model(chat_model);
                 let embedder = EndpointEmbedder::new(&base_url, &api_key, embed_model);
                 let indexer = FullIndexer::new(store, enricher, embedder);
-                let summary = indexer.update_repo(repo_root)?;
-                print_update_summary(summary);
+                let summary = if progress_jsonl {
+                    indexer.update_repo_with_progress(repo_root, print_progress_jsonl)?
+                } else {
+                    indexer.update_repo(repo_root)?
+                };
+                if !progress_jsonl {
+                    print_update_summary(summary);
+                }
             }
         }
         Command::Watch {
@@ -241,20 +275,32 @@ fn main() -> Result<()> {
             base_url,
             api_key,
             embed_model,
+            progress_jsonl,
         } => {
             let store = MatryoshkaStore::open(&db)?;
             let summary = if offline {
-                FullIndexer::new(store, HeuristicEnricher, DeterministicEmbedder::default())
-                    .rebuild_semantic_index(repo_root)?
+                let indexer =
+                    FullIndexer::new(store, HeuristicEnricher, DeterministicEmbedder::default());
+                if progress_jsonl {
+                    indexer.rebuild_semantic_index_with_progress(repo_root, print_progress_jsonl)?
+                } else {
+                    indexer.rebuild_semantic_index(repo_root)?
+                }
             } else {
-                FullIndexer::new(
+                let indexer = FullIndexer::new(
                     store,
                     HeuristicEnricher,
                     EndpointEmbedder::new(base_url, api_key, embed_model),
-                )
-                .rebuild_semantic_index(repo_root)?
+                );
+                if progress_jsonl {
+                    indexer.rebuild_semantic_index_with_progress(repo_root, print_progress_jsonl)?
+                } else {
+                    indexer.rebuild_semantic_index(repo_root)?
+                }
             };
-            print_semantic_rebuild_summary(summary);
+            if !progress_jsonl {
+                print_semantic_rebuild_summary(summary);
+            }
         }
         Command::Read {
             db,
@@ -274,6 +320,13 @@ fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn print_progress_jsonl(event: MatryoshkaProgressEvent) {
+    println!(
+        "{}",
+        serde_json::to_string(&event).expect("progress event should serialize")
+    );
 }
 
 fn print_index_summary(summary: IndexSummary) {

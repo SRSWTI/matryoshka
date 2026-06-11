@@ -304,22 +304,97 @@ pub struct SearchHit {
     pub path: String,
     pub title: String,
     pub entity_type: SemanticEntityType,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub key_behaviors: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub agent_hints: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub matched_terms: Vec<String>,
     pub score: f32,
     pub why_matched: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ReadCard {
-    pub file: FileFact,
-    pub file_card: Option<FileCard>,
-    pub folder_card: Option<FolderCard>,
-    pub symbols: Vec<SymbolFact>,
-    pub imports: Vec<ImportFact>,
-    pub incoming_edges: Vec<EdgeFact>,
-    pub outgoing_edges: Vec<EdgeFact>,
-    pub snippets: Vec<SnippetFact>,
-    pub symbol_blocks: Vec<SnippetFact>,
+    pub file: ReadFileOverview,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub folder: Option<ReadFolderOverview>,
+    pub symbols: Vec<ReadSymbol>,
+    pub imports: Vec<ReadImport>,
+    pub dependencies: ReadDependencies,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub agent_hints: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub source_excerpts: Vec<SnippetFact>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub import_lines: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReadFileOverview {
+    pub file_id: String,
+    pub path: String,
+    pub name: String,
+    pub language: String,
+    pub parent_folder_id: String,
+    pub source_hash: String,
+    pub line_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReadFolderOverview {
+    pub folder_id: String,
+    pub summary: String,
+    pub responsibility: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReadSymbol {
+    pub name: String,
+    pub qualified_name: String,
+    pub kind: SymbolKind,
+    pub signature: String,
+    pub start_line: usize,
+    pub end_line: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub doc: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub behavior: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReadImport {
+    pub module: String,
+    pub names: Vec<String>,
+    pub line: usize,
+    pub is_internal: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resolved_file_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub purpose: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReadDependencies {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub incoming: Vec<ReadDependency>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub outgoing: Vec<ReadDependency>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReadDependency {
+    pub entity_id: String,
+    pub kind: EdgeKind,
+    pub detail: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -328,4 +403,60 @@ pub struct InvalidationSet {
     pub folder_ids: Vec<String>,
     pub repo_stale: bool,
     pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum MatryoshkaProgressEvent {
+    Started {
+        total_steps: Option<usize>,
+    },
+    DiscoveringFiles,
+    FilesDiscovered {
+        total_files: usize,
+    },
+    ParsingFile {
+        path: String,
+        index: usize,
+        total_files: usize,
+    },
+    ParsedFile {
+        path: String,
+        index: usize,
+        total_files: usize,
+    },
+    EnrichingFile {
+        path: String,
+        index: usize,
+        total_files: usize,
+    },
+    EnrichedFile {
+        path: String,
+        index: usize,
+        total_files: usize,
+    },
+    EmbeddingBatch {
+        batch_index: usize,
+        total_batches: usize,
+        records_in_batch: usize,
+    },
+    EmbeddedBatch {
+        batch_index: usize,
+        total_batches: usize,
+        records_in_batch: usize,
+    },
+    WritingDatabase {
+        records_written: Option<usize>,
+    },
+    Completed {
+        file_count: usize,
+        folder_count: usize,
+        symbol_count: usize,
+        semantic_record_count: usize,
+        embedding_model: String,
+    },
+    Failed {
+        stage: String,
+        message: String,
+    },
 }
