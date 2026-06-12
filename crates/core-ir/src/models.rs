@@ -309,11 +309,13 @@ pub struct SearchHit {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub key_behaviors: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub agent_hints: Vec<String>,
+    pub behaviors: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub matched_terms: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub matched_symbols: Vec<String>,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub total_matched_symbols: usize,
     pub score: f32,
     pub why_matched: Vec<String>,
 }

@@ -1,9 +1,13 @@
 use anyhow::Result;
-use matryoshka_core_ir::{FileCard, FolderCard, RepoCard, SearchHit, SemanticRecord};
+use matryoshka_core_ir::{
+    FileCard, FolderCard, RepoCard, SearchHit, SemanticEntityType, SemanticRecord,
+};
 use matryoshka_embed_client::{Embedder, cosine};
 use matryoshka_store_sqlite::MatryoshkaStore;
 use serde_json::Value;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+
+const MAX_MATCHED_SYMBOLS: usize = 12;
 
 pub struct SearchEngine<M> {
     store: MatryoshkaStore,
@@ -27,6 +31,7 @@ impl<M: Embedder> SearchEngine<M> {
             .iter()
             .filter_map(|record| score_record(record, &query_embedding, &query_tokens))
             .collect::<Vec<_>>();
+        hits = collapse_file_hits(hits, &records);
         hits.sort_by(|left, right| {
             right
                 .score
@@ -108,6 +113,147 @@ impl<M: Embedder> SearchEngine<M> {
     }
 }
 
+fn collapse_file_hits(hits: Vec<SearchHit>, records: &[SemanticRecord]) -> Vec<SearchHit> {
+    let records_by_id = records
+        .iter()
+        .map(|record| (record.record_id.as_str(), record))
+        .collect::<BTreeMap<_, _>>();
+    let mut groups: BTreeMap<String, CollapsedHit> = BTreeMap::new();
+    let mut standalone = Vec::new();
+
+    for hit in hits {
+        let Some(record) = records_by_id.get(hit.record_id.as_str()).copied() else {
+            standalone.push(hit);
+            continue;
+        };
+        if !is_file_level_result(record) {
+            standalone.push(hit);
+            continue;
+        }
+
+        let key = format!("file:{}", hit.path);
+        groups
+            .entry(key)
+            .or_insert_with(|| CollapsedHit::new(hit.path.clone()))
+            .add(hit, record);
+    }
+
+    standalone.extend(groups.into_values().filter_map(CollapsedHit::into_hit));
+    standalone
+}
+
+fn is_file_level_result(record: &SemanticRecord) -> bool {
+    matches!(
+        record.entity_type,
+        SemanticEntityType::File | SemanticEntityType::Symbol | SemanticEntityType::Snippet
+    )
+}
+
+#[derive(Debug, Clone)]
+struct CollapsedHit {
+    path: String,
+    best: Option<SearchHit>,
+    file_card: Option<SearchHit>,
+    matched_terms: BTreeSet<String>,
+    matched_symbols: BTreeSet<String>,
+    why: BTreeSet<String>,
+    max_score: f32,
+    related_hit_count: usize,
+}
+
+impl CollapsedHit {
+    fn new(path: String) -> Self {
+        Self {
+            path,
+            best: None,
+            file_card: None,
+            matched_terms: BTreeSet::new(),
+            matched_symbols: BTreeSet::new(),
+            why: BTreeSet::new(),
+            max_score: 0.0,
+            related_hit_count: 0,
+        }
+    }
+
+    fn add(&mut self, hit: SearchHit, record: &SemanticRecord) {
+        self.max_score = self.max_score.max(hit.score);
+        self.related_hit_count += 1;
+        self.matched_terms.extend(hit.matched_terms.iter().cloned());
+        self.matched_symbols
+            .extend(hit.matched_symbols.iter().cloned());
+        self.why.extend(hit.why_matched.iter().cloned());
+
+        if matches!(record.entity_type, SemanticEntityType::Symbol) {
+            if let Some(symbol) = symbol_name_from_record(record) {
+                self.matched_symbols.insert(symbol);
+            }
+        }
+
+        if record_kind(record) == "file_card"
+            || matches!(record.entity_type, SemanticEntityType::File)
+        {
+            if self
+                .file_card
+                .as_ref()
+                .map(|existing| hit.score > existing.score)
+                .unwrap_or(true)
+            {
+                self.file_card = Some(hit.clone());
+            }
+        }
+
+        if self
+            .best
+            .as_ref()
+            .map(|existing| hit.score > existing.score)
+            .unwrap_or(true)
+        {
+            self.best = Some(hit);
+        }
+    }
+
+    fn into_hit(self) -> Option<SearchHit> {
+        let mut hit = self.file_card.or(self.best)?;
+        let total_matched_symbols = self.matched_symbols.len();
+        let matched_symbols = self
+            .matched_symbols
+            .iter()
+            .take(MAX_MATCHED_SYMBOLS)
+            .cloned()
+            .collect::<Vec<_>>();
+        hit.entity_id = self.path.clone();
+        hit.path = self.path;
+        hit.entity_type = SemanticEntityType::File;
+        hit.title = format!("File {}", hit.path);
+        hit.score =
+            self.max_score + ((self.related_hit_count.saturating_sub(1) as f32) * 0.015).min(0.06);
+        hit.matched_terms = self.matched_terms.into_iter().collect();
+        hit.matched_symbols = matched_symbols;
+        hit.total_matched_symbols = total_matched_symbols;
+        hit.why_matched = self.why.into_iter().collect();
+        if !hit.matched_symbols.is_empty() {
+            if total_matched_symbols > hit.matched_symbols.len() {
+                hit.why_matched.push(format!(
+                    "Matched {total_matched_symbols} symbols in this file, including: {}",
+                    hit.matched_symbols.join(", ")
+                ));
+            } else {
+                hit.why_matched.push(format!(
+                    "Matched symbols in this file: {}",
+                    hit.matched_symbols.join(", ")
+                ));
+            }
+        }
+        if self.related_hit_count > 1 {
+            hit.why_matched.push(format!(
+                "{count} indexed file, symbol, or snippet records from this file matched and were shown as one result",
+                count = self.related_hit_count
+            ));
+        }
+        Some(hit)
+    }
+}
+
 fn score_record(
     record: &SemanticRecord,
     query_embedding: &[f32],
@@ -126,12 +272,26 @@ fn score_record(
     let entrypoint_query = is_entrypoint_query(query_tokens);
     let folder_query = is_folder_query(query_tokens);
     let repo_query = is_repo_query(query_tokens);
+    let test_query = is_test_query(query_tokens);
     let owner_query = (edit_like_query || behavior_like_query) && !entrypoint_query;
     let facade = looks_like_facade(record);
     let behavior_owner = looks_like_behavior_owner(record);
     let mut why = Vec::new();
+    if looks_like_test_path(&record.path) && !test_query {
+        score -= 0.28;
+        why.push("Test file de-prioritized because the query does not ask for tests".into());
+    } else if !looks_like_test_path(&record.path)
+        && !test_query
+        && matches!(
+            record.entity_type,
+            SemanticEntityType::File | SemanticEntityType::Symbol | SemanticEntityType::Snippet
+        )
+    {
+        score += 0.04;
+        why.push("Implementation/source file preferred for a non-test query".into());
+    }
     if semantic_score > 0.2 {
-        why.push("semantic behavior match".into());
+        why.push("Summary/content is semantically close to the query".into());
     }
     let matched_terms = query_tokens
         .iter()
@@ -141,18 +301,21 @@ fn score_record(
     let token_hits = matched_terms.len();
     if token_hits > 0 {
         score += token_hits as f32 * 0.08;
-        why.push(format!("{} lexical/path/symbol token matches", token_hits));
+        why.push(format!(
+            "Path, title, or indexed text contains: {}",
+            matched_terms.join(", ")
+        ));
     }
     let behavior_hits = metadata_token_hits(record, "behavior_intents", query_tokens);
     if behavior_hits > 0 {
         let weight = if facade && owner_query { 0.03 } else { 0.07 };
         score += behavior_hits as f32 * weight;
-        why.push(format!("{behavior_hits} behavior-intent matches"));
+        why.push("Behavior phrases match the query".into());
     }
     let owns_behavior_hits = metadata_token_hits(record, "owns_behaviors", query_tokens);
     if owns_behavior_hits > 0 {
         score += owns_behavior_hits as f32 * if owner_query { 0.14 } else { 0.08 };
-        why.push(format!("{owns_behavior_hits} owned-behavior matches"));
+        why.push("This result claims ownership of matching behavior".into());
     }
     let edit_hits = metadata_token_hits(record, "edit_intents", query_tokens);
     if edit_hits > 0 {
@@ -170,53 +333,56 @@ fn score_record(
             0.05
         };
         score += edit_hits as f32 * weight;
-        why.push(format!("{edit_hits} edit-intent matches"));
+        why.push("Edit/search phrases match the query".into());
     }
     let tag_hits = metadata_token_hits(record, "retrieval_tags", query_tokens);
     if tag_hits > 0 {
         let weight = if facade && owner_query { 0.025 } else { 0.06 };
         score += tag_hits as f32 * weight;
-        why.push(format!("{tag_hits} retrieval-tag matches"));
+        why.push("Retrieval tags match the query concepts".into());
     }
     match record_kind {
         "file_card" => {
             score += 0.12;
-            why.push("rich file-card boost".into());
+            why.push("Matched the enriched file summary".into());
             if facade && owner_query {
                 score -= 0.55;
-                why.push("facade penalty for edit/behavior query".into());
+                why.push(
+                    "Entrypoint/facade result was de-prioritized for an implementation query"
+                        .into(),
+                );
             } else if behavior_owner && owner_query {
                 score += 0.28;
-                why.push("behavior-owner boost".into());
+                why.push("Implementation file appears to own the requested behavior".into());
             } else if facade && entrypoint_query {
                 score += 0.18;
-                why.push("facade surface boost".into());
+                why.push("Entrypoint/facade result fits a public-surface query".into());
             }
         }
         "folder_card" => {
             score += 0.08;
-            why.push("folder-responsibility boost".into());
+            why.push("Matched the enriched folder responsibility".into());
             if edit_like_query && !folder_query {
                 score -= 0.20;
-                why.push("folder penalty for file-level edit query".into());
+                why.push("Folder result was de-prioritized for a file-level edit query".into());
             }
         }
         "repo_card" => {
             score += 0.16;
-            why.push("repo-map boost".into());
+            why.push("Matched the repository-level map".into());
             if repo_query {
                 score += 0.30;
-                why.push("repository architecture boost".into());
+                why.push("Repository architecture query fits the repo map".into());
             }
         }
         "file_fact" => {
             score -= 0.05;
-            why.push("raw-file penalty".into());
+            why.push("Raw structural file record matched, but enriched cards are preferred".into());
         }
         "symbol_fact" => {
             if token_hits > 0 {
                 score += 0.12;
-                why.push("exact symbol boost".into());
+                why.push("Matched a concrete symbol in this file".into());
             }
         }
         _ => {}
@@ -227,7 +393,7 @@ fn score_record(
             .any(|token| token == "dependency" || token == "import" || token == "resolution")
     {
         score += 0.05;
-        why.push("import-neighborhood boost".into());
+        why.push("Import/dependency context matches the query".into());
     }
     if query_tokens.iter().any(|token| token == "import")
         && query_tokens
@@ -238,7 +404,7 @@ fn score_record(
             || haystack.contains("imports onto concrete repository files"))
     {
         score += 0.14;
-        why.push("import-resolution phrase boost".into());
+        why.push("Import-resolution wording matches directly".into());
     }
     if query_tokens
         .iter()
@@ -249,7 +415,7 @@ fn score_record(
             || haystack.contains("what depends on"))
     {
         score += 0.12;
-        why.push("dependency-direction boost".into());
+        why.push("Downstream/dependency direction matches the query".into());
     }
     if haystack.contains("snippet")
         || matches!(
@@ -259,7 +425,7 @@ fn score_record(
     {
         if token_hits > 0 {
             score += 0.05;
-            why.push("snippet-level match".into());
+            why.push("Matched a source snippet in this file".into());
         }
     }
     if why.is_empty() && score < 0.15 {
@@ -273,9 +439,10 @@ fn score_record(
         entity_type: record.entity_type.clone(),
         summary: None,
         description: None,
-        key_behaviors: Vec::new(),
-        agent_hints: Vec::new(),
+        behaviors: Vec::new(),
         matched_terms,
+        matched_symbols: symbol_name_from_record(record).into_iter().collect(),
+        total_matched_symbols: usize::from(symbol_name_from_record(record).is_some()),
         score,
         why_matched: why,
     })
@@ -285,12 +452,9 @@ fn apply_file_card(hit: &mut SearchHit, card: &FileCard, record: Option<&Semanti
     hit.summary = non_empty(card.summary.clone());
     let mut description_parts = Vec::new();
     push_labeled(&mut description_parts, "Role", &card.role);
-    if !card.owns_behaviors.is_empty() {
-        push_labeled(
-            &mut description_parts,
-            "Owns",
-            &card.owns_behaviors.join("; "),
-        );
+    let owns = clean_behaviors(card.owns_behaviors.clone());
+    if !owns.is_empty() {
+        push_labeled(&mut description_parts, "Owns", &owns.join("; "));
     }
     if !card.delegates_to.is_empty() {
         push_labeled(
@@ -299,11 +463,12 @@ fn apply_file_card(hit: &mut SearchHit, card: &FileCard, record: Option<&Semanti
             &card.delegates_to.join("; "),
         );
     }
-    if !card.side_effects.is_empty() {
+    let side_effects = clean_description_items(&card.side_effects);
+    if !side_effects.is_empty() {
         push_labeled(
             &mut description_parts,
             "Side effects",
-            &card.side_effects.join("; "),
+            &side_effects.join("; "),
         );
     }
     if !card.blast_radius.is_empty() {
@@ -331,12 +496,11 @@ fn apply_file_card(hit: &mut SearchHit, card: &FileCard, record: Option<&Semanti
         }
     }
     hit.description = non_empty(description_parts.join("\n"));
-    hit.key_behaviors = prefer_non_empty(&[
+    hit.behaviors = clean_behaviors(prefer_non_empty(&[
         &card.owns_behaviors,
         &card.primary_behaviors,
         &card.behavior_intents,
-    ]);
-    hit.agent_hints = card.agent_read_hints.clone();
+    ]));
 }
 
 fn apply_folder_card(hit: &mut SearchHit, card: &FolderCard) {
@@ -369,8 +533,10 @@ fn apply_folder_card(hit: &mut SearchHit, card: &FolderCard) {
         );
     }
     hit.description = non_empty(description_parts.join("\n"));
-    hit.key_behaviors = prefer_non_empty(&[&card.common_behaviors, &card.behavior_intents]);
-    hit.agent_hints = card.agent_guidance.clone();
+    hit.behaviors = clean_behaviors(prefer_non_empty(&[
+        &card.common_behaviors,
+        &card.behavior_intents,
+    ]));
 }
 
 fn apply_repo_card(hit: &mut SearchHit, card: &RepoCard) {
@@ -403,8 +569,10 @@ fn apply_repo_card(hit: &mut SearchHit, card: &RepoCard) {
         );
     }
     hit.description = non_empty(description_parts.join("\n"));
-    hit.key_behaviors = prefer_non_empty(&[&card.behavior_intents, &card.cross_subsystem_flows]);
-    hit.agent_hints = card.agent_navigation_hints.clone();
+    hit.behaviors = clean_behaviors(prefer_non_empty(&[
+        &card.behavior_intents,
+        &card.cross_subsystem_flows,
+    ]));
 }
 
 fn apply_record_fallback(hit: &mut SearchHit, record: &SemanticRecord) {
@@ -427,12 +595,56 @@ fn symbol_description(card: &FileCard, record: &SemanticRecord) -> String {
     }
 }
 
+fn symbol_name_from_record(record: &SemanticRecord) -> Option<String> {
+    if !matches!(record.entity_type, SemanticEntityType::Symbol) {
+        return None;
+    }
+    record
+        .entity_id
+        .rsplit_once("::")
+        .map(|(_, symbol)| symbol)
+        .unwrap_or(record.entity_id.as_str())
+        .split(':')
+        .next()
+        .map(str::trim)
+        .filter(|symbol| !symbol.is_empty())
+        .map(ToString::to_string)
+}
+
 fn prefer_non_empty(groups: &[&Vec<String>]) -> Vec<String> {
     groups
         .iter()
         .find(|items| !items.is_empty())
         .map(|items| (*items).clone())
         .unwrap_or_default()
+}
+
+fn clean_behaviors(values: Vec<String>) -> Vec<String> {
+    values
+        .into_iter()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .filter(|value| !is_generic_behavior(value))
+        .take(8)
+        .collect()
+}
+
+fn clean_description_items(values: &[String]) -> Vec<String> {
+    values
+        .iter()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .filter(|value| !is_generic_behavior(value))
+        .collect()
+}
+
+fn is_generic_behavior(value: &str) -> bool {
+    let normalized = value.to_ascii_lowercase();
+    normalized == "provide behavior used by downstream dependents"
+        || normalized == "coordinate internal dependencies used by this file"
+        || normalized == "coordinate internal dependencies used by this folder"
+        || normalized.starts_with("no side effects were proven statically")
+        || normalized.starts_with("acts as a general module")
 }
 
 fn push_labeled(parts: &mut Vec<String>, label: &str, value: &str) {
@@ -578,6 +790,35 @@ fn is_repo_query(query_tokens: &[String]) -> bool {
     })
 }
 
+fn is_test_query(query_tokens: &[String]) -> bool {
+    query_tokens.iter().any(|token| {
+        matches!(
+            token.as_str(),
+            "test"
+                | "tests"
+                | "testing"
+                | "pytest"
+                | "unit"
+                | "integration"
+                | "spec"
+                | "fixture"
+                | "mock"
+                | "assert"
+                | "coverage"
+        )
+    })
+}
+
+fn looks_like_test_path(path: &str) -> bool {
+    path.starts_with("tests/")
+        || path.contains("/tests/")
+        || path.contains("/__tests__/")
+        || path.ends_with("_test.rs")
+        || path.ends_with("_test.py")
+        || path.contains(".test.")
+        || path.contains(".spec.")
+}
+
 fn tokens(query: &str) -> Vec<String> {
     const STOPWORDS: &[&str] = &[
         "the", "and", "for", "with", "from", "into", "that", "this", "what", "where", "when",
@@ -598,6 +839,92 @@ mod tests {
     use matryoshka_core_ir::{SemanticEntityType, SemanticRecord};
     use serde_json::json;
     use std::collections::BTreeMap;
+
+    #[test]
+    fn collapse_file_hits_keeps_one_result_with_matched_symbols() {
+        let file_record = SemanticRecord {
+            record_id: "file".into(),
+            entity_id: "octane/cli/mesh.py".into(),
+            entity_type: SemanticEntityType::File,
+            title: "FileCard octane/cli/mesh.py".into(),
+            content: "mesh peer discovery".into(),
+            path: "octane/cli/mesh.py".into(),
+            source_hash: "a".into(),
+            embedding: Some(vec![1.0]),
+            metadata: BTreeMap::from([("kind".into(), json!("file_card"))]),
+        };
+        let symbol_record = SemanticRecord {
+            record_id: "symbol".into(),
+            entity_id: "octane/cli/mesh.py::resolve_peer:448".into(),
+            entity_type: SemanticEntityType::Symbol,
+            title: "Symbol resolve_peer in octane/cli/mesh.py".into(),
+            content: "resolve peer endpoint".into(),
+            path: "octane/cli/mesh.py".into(),
+            source_hash: "a".into(),
+            embedding: Some(vec![1.0]),
+            metadata: BTreeMap::from([("kind".into(), json!("symbol_fact"))]),
+        };
+        let records = vec![file_record, symbol_record];
+        let hits = vec![
+            SearchHit {
+                entity_id: "octane/cli/mesh.py".into(),
+                record_id: "file".into(),
+                path: "octane/cli/mesh.py".into(),
+                title: "FileCard octane/cli/mesh.py".into(),
+                entity_type: SemanticEntityType::File,
+                summary: None,
+                description: None,
+                behaviors: Vec::new(),
+                matched_terms: vec!["mesh".into()],
+                matched_symbols: Vec::new(),
+                total_matched_symbols: 0,
+                score: 0.4,
+                why_matched: vec!["Matched the enriched file summary".into()],
+            },
+            SearchHit {
+                entity_id: "octane/cli/mesh.py::resolve_peer:448".into(),
+                record_id: "symbol".into(),
+                path: "octane/cli/mesh.py".into(),
+                title: "Symbol resolve_peer in octane/cli/mesh.py".into(),
+                entity_type: SemanticEntityType::Symbol,
+                summary: None,
+                description: None,
+                behaviors: Vec::new(),
+                matched_terms: vec!["mesh".into()],
+                matched_symbols: vec!["resolve_peer".into()],
+                total_matched_symbols: 1,
+                score: 0.5,
+                why_matched: vec!["Matched a concrete symbol in this file".into()],
+            },
+        ];
+
+        let collapsed = collapse_file_hits(hits, &records);
+
+        assert_eq!(collapsed.len(), 1);
+        assert_eq!(collapsed[0].entity_type, SemanticEntityType::File);
+        assert_eq!(collapsed[0].path, "octane/cli/mesh.py");
+        assert_eq!(collapsed[0].matched_symbols, vec!["resolve_peer"]);
+        assert!(
+            collapsed[0]
+                .why_matched
+                .iter()
+                .any(|why| { why.contains("2 indexed file, symbol, or snippet records") })
+        );
+    }
+
+    #[test]
+    fn behavior_cleanup_drops_generic_fallback_phrases() {
+        let cleaned = clean_behaviors(vec![
+            "Provide behavior used by downstream dependents".into(),
+            "Coordinate internal dependencies used by this file".into(),
+            "discovers mesh peers across LAN and Tailscale".into(),
+        ]);
+
+        assert_eq!(
+            cleaned,
+            vec!["discovers mesh peers across LAN and Tailscale"]
+        );
+    }
 
     #[test]
     fn behavior_edit_queries_prefer_implementation_files_over_facades() {
@@ -669,13 +996,13 @@ mod tests {
             implementation_hit
                 .why_matched
                 .iter()
-                .any(|item| item.contains("behavior-owner boost"))
+                .any(|item| item.contains("Implementation file appears to own"))
         );
         assert!(
             facade_hit
                 .why_matched
                 .iter()
-                .any(|item| item.contains("facade penalty"))
+                .any(|item| item.contains("facade result was de-prioritized"))
         );
     }
 
@@ -725,7 +1052,7 @@ mod tests {
             facade_hit
                 .why_matched
                 .iter()
-                .any(|item| item.contains("facade surface boost"))
+                .any(|item| item.contains("public-surface query"))
         );
     }
 }

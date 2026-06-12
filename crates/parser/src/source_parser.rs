@@ -18,6 +18,7 @@ pub struct ParsedRepository {
 pub struct ParserConfig {
     pub include_extensions: Vec<String>,
     pub ignored_dirs: Vec<String>,
+    pub ignored_paths: Vec<String>,
     pub max_snippets_per_file: usize,
 }
 
@@ -36,8 +37,34 @@ impl Default for ParserConfig {
                 ".pytest_cache".into(),
                 "target".into(),
             ],
+            ignored_paths: Vec::new(),
             max_snippets_per_file: 6,
         }
+    }
+}
+
+impl ParserConfig {
+    pub fn with_ignored_paths(mut self, ignored_paths: impl IntoIterator<Item = String>) -> Self {
+        self.ignored_paths.extend(
+            ignored_paths
+                .into_iter()
+                .map(|path| normalize_ignored_path(&path))
+                .filter(|path| !path.is_empty()),
+        );
+        self
+    }
+
+    pub fn ignores_entry(&self, repo_root: &Path, path: &Path) -> bool {
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            return false;
+        };
+        if self.ignored_dirs.iter().any(|ignored| ignored == name) {
+            return true;
+        }
+        let relative = relative_path(repo_root, path);
+        self.ignored_paths
+            .iter()
+            .any(|ignored| path_matches_ignore(&relative, ignored))
     }
 }
 
@@ -96,24 +123,16 @@ impl SourceParser {
 
     fn discover_paths(&self, repo_root: &Path) -> Result<Vec<PathBuf>> {
         let mut paths = Vec::new();
-        for entry in WalkDir::new(repo_root).into_iter().filter_entry(|entry| {
-            !entry
-                .file_name()
-                .to_str()
-                .map(|name| {
-                    self.config
-                        .ignored_dirs
-                        .iter()
-                        .any(|ignored| ignored == name)
-                })
-                .unwrap_or(false)
-        }) {
+        for entry in WalkDir::new(repo_root)
+            .into_iter()
+            .filter_entry(|entry| !self.config.ignores_entry(repo_root, entry.path()))
+        {
             let entry = entry?;
             if !entry.file_type().is_file() {
                 continue;
             }
             let path = entry.into_path();
-            if self.should_parse(&path) {
+            if !self.config.ignores_entry(repo_root, &path) && self.should_parse(&path) {
                 paths.push(path);
             }
         }
@@ -171,6 +190,29 @@ impl SourceParser {
         };
 
         Ok((file, symbols))
+    }
+}
+
+fn normalize_ignored_path(path: &str) -> String {
+    path.trim()
+        .trim_matches('/')
+        .replace('\\', "/")
+        .split('/')
+        .filter(|part| !part.is_empty() && *part != ".")
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+fn path_matches_ignore(relative_path: &str, ignored_path: &str) -> bool {
+    if ignored_path.is_empty() || relative_path.is_empty() {
+        return false;
+    }
+    if ignored_path.contains('/') {
+        relative_path == ignored_path || relative_path.starts_with(&format!("{ignored_path}/"))
+    } else {
+        relative_path
+            .split('/')
+            .any(|component| component == ignored_path)
     }
 }
 
@@ -273,8 +315,11 @@ fn parse_python_import(line: &str) -> Option<(String, Vec<String>)> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_python_import, parse_rust_import, parse_rust_symbols};
+    use super::{
+        ParserConfig, SourceParser, parse_python_import, parse_rust_import, parse_rust_symbols,
+    };
     use matryoshka_core_ir::SymbolKind;
+    use std::fs;
 
     #[test]
     fn python_relative_imports_preserve_leading_dots() {
@@ -310,6 +355,38 @@ mod tests {
         assert!(symbols.iter().any(|symbol| {
             symbol.qualified_name == "MatryoshkaStore" && symbol.kind == SymbolKind::Struct
         }));
+    }
+
+    #[test]
+    fn parser_config_ignores_path_components_and_subtrees() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(temp.path().join("src")).unwrap();
+        fs::create_dir_all(temp.path().join("tests")).unwrap();
+        fs::create_dir_all(temp.path().join("packages/web")).unwrap();
+        fs::write(temp.path().join("src/lib.rs"), "pub fn keep() {}\n").unwrap();
+        fs::write(
+            temp.path().join("tests/test_api.py"),
+            "def drop_me(): pass\n",
+        )
+        .unwrap();
+        fs::write(
+            temp.path().join("packages/web/app.ts"),
+            "export function app() {}\n",
+        )
+        .unwrap();
+
+        let parser = SourceParser::new(
+            ParserConfig::default()
+                .with_ignored_paths(["tests".to_string(), "packages/web".to_string()]),
+        );
+        let parsed = parser.parse_repo(temp.path()).unwrap();
+        let paths = parsed
+            .files
+            .iter()
+            .map(|file| file.path.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(paths, vec!["src/lib.rs"]);
     }
 }
 

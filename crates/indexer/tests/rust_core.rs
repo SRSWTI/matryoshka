@@ -72,7 +72,6 @@ fn indexes_searches_and_reads_file_cards() {
                 .description
                 .as_deref()
                 .is_some_and(|description| description.contains("Role:"))
-            && !hit.key_behaviors.is_empty()
     }));
 
     let read = ReadApi::new(MatryoshkaStore::open(&db_path).unwrap(), repo_root);

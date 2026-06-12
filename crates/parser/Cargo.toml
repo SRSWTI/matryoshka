@@ -9,3 +9,6 @@ anyhow.workspace = true
 matryoshka-core-ir.workspace = true
 sha2.workspace = true
 walkdir.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

@@ -14,6 +14,7 @@ clap.workspace = true
 matryoshka-embed-client.workspace = true
 matryoshka-enricher.workspace = true
 matryoshka-indexer.workspace = true
+matryoshka-parser.workspace = true
 matryoshka-read-api.workspace = true
 matryoshka-search.workspace = true
 matryoshka-store-sqlite.workspace = true

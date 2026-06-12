@@ -5,6 +5,7 @@ use matryoshka_enricher::{HeuristicEnricher, MlxChatEnricher};
 use matryoshka_indexer::{
     FullIndexer, IndexSummary, MatryoshkaProgressEvent, SemanticRebuildSummary, UpdateSummary,
 };
+use matryoshka_parser::ParserConfig;
 use matryoshka_read_api::ReadApi;
 use matryoshka_search::SearchEngine;
 use matryoshka_store_sqlite::MatryoshkaStore;
@@ -44,6 +45,8 @@ enum Command {
         chat_model: String,
         #[arg(long, default_value_t = false)]
         progress_jsonl: bool,
+        #[arg(long = "ignore", value_name = "PATH")]
+        ignore: Vec<String>,
     },
     Update {
         repo_root: PathBuf,
@@ -61,6 +64,8 @@ enum Command {
         chat_model: String,
         #[arg(long, default_value_t = false)]
         progress_jsonl: bool,
+        #[arg(long = "ignore", value_name = "PATH")]
+        ignore: Vec<String>,
     },
     Watch {
         repo_root: PathBuf,
@@ -80,6 +85,8 @@ enum Command {
         interval_ms: u64,
         #[arg(long, default_value_t = 3_000)]
         debounce_ms: u64,
+        #[arg(long = "ignore", value_name = "PATH")]
+        ignore: Vec<String>,
     },
     RebuildSemantic {
         repo_root: PathBuf,
@@ -132,11 +139,14 @@ fn main() -> Result<()> {
             embed_model,
             chat_model,
             progress_jsonl,
+            ignore,
         } => {
             let store = MatryoshkaStore::open(&db)?;
+            let parser_config = parser_config(ignore);
             if offline {
                 let indexer =
-                    FullIndexer::new(store, HeuristicEnricher, DeterministicEmbedder::default());
+                    FullIndexer::new(store, HeuristicEnricher, DeterministicEmbedder::default())
+                        .with_parser_config(parser_config);
                 let summary = if progress_jsonl {
                     indexer.index_repo_with_progress(repo_root, print_progress_jsonl)?
                 } else {
@@ -148,7 +158,8 @@ fn main() -> Result<()> {
             } else {
                 let enricher = MlxChatEnricher::new(&base_url, &api_key).with_model(chat_model);
                 let embedder = EndpointEmbedder::new(&base_url, &api_key, embed_model);
-                let indexer = FullIndexer::new(store, enricher, embedder);
+                let indexer =
+                    FullIndexer::new(store, enricher, embedder).with_parser_config(parser_config);
                 let summary = if progress_jsonl {
                     indexer.index_repo_with_progress(repo_root, print_progress_jsonl)?
                 } else {
@@ -168,11 +179,14 @@ fn main() -> Result<()> {
             embed_model,
             chat_model,
             progress_jsonl,
+            ignore,
         } => {
             let store = MatryoshkaStore::open(&db)?;
+            let parser_config = parser_config(ignore);
             if offline {
                 let indexer =
-                    FullIndexer::new(store, HeuristicEnricher, DeterministicEmbedder::default());
+                    FullIndexer::new(store, HeuristicEnricher, DeterministicEmbedder::default())
+                        .with_parser_config(parser_config);
                 let summary = if progress_jsonl {
                     indexer.update_repo_with_progress(repo_root, print_progress_jsonl)?
                 } else {
@@ -184,7 +198,8 @@ fn main() -> Result<()> {
             } else {
                 let enricher = MlxChatEnricher::new(&base_url, &api_key).with_model(chat_model);
                 let embedder = EndpointEmbedder::new(&base_url, &api_key, embed_model);
-                let indexer = FullIndexer::new(store, enricher, embedder);
+                let indexer =
+                    FullIndexer::new(store, enricher, embedder).with_parser_config(parser_config);
                 let summary = if progress_jsonl {
                     indexer.update_repo_with_progress(repo_root, print_progress_jsonl)?
                 } else {
@@ -205,8 +220,11 @@ fn main() -> Result<()> {
             chat_model,
             interval_ms,
             debounce_ms,
+            ignore,
         } => {
+            let parser_config = parser_config(ignore);
             let mut watcher = RepoWatcher::new(&repo_root)?
+                .with_parser_config(parser_config.clone())?
                 .with_poll_interval(Duration::from_millis(interval_ms))
                 .with_debounce_window(Duration::from_millis(debounce_ms));
             println!(
@@ -229,14 +247,16 @@ fn main() -> Result<()> {
                             store,
                             HeuristicEnricher,
                             DeterministicEmbedder::default(),
-                        );
+                        )
+                        .with_parser_config(parser_config.clone());
                         print_update_summary(indexer.update_repo(&repo_root)?);
                     } else {
                         let enricher = MlxChatEnricher::new(&base_url, &api_key)
                             .with_model(chat_model.clone());
                         let embedder =
                             EndpointEmbedder::new(&base_url, &api_key, embed_model.clone());
-                        let indexer = FullIndexer::new(store, enricher, embedder);
+                        let indexer = FullIndexer::new(store, enricher, embedder)
+                            .with_parser_config(parser_config.clone());
                         print_update_summary(indexer.update_repo(&repo_root)?);
                     }
                 }
@@ -312,6 +332,10 @@ fn print_progress_jsonl(event: MatryoshkaProgressEvent) {
         "{}",
         serde_json::to_string(&event).expect("progress event should serialize")
     );
+}
+
+fn parser_config(ignore: Vec<String>) -> ParserConfig {
+    ParserConfig::default().with_ignored_paths(ignore)
 }
 
 fn print_index_summary(summary: IndexSummary) {

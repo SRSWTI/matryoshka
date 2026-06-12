@@ -164,25 +164,17 @@ fn scan_repo_state(
 ) -> Result<BTreeMap<String, String>> {
     let mut state = BTreeMap::new();
 
-    for entry in WalkDir::new(repo_root).into_iter().filter_entry(|entry| {
-        !entry
-            .file_name()
-            .to_str()
-            .map(|name| {
-                parser_config
-                    .ignored_dirs
-                    .iter()
-                    .any(|ignored| ignored == name)
-            })
-            .unwrap_or(false)
-    }) {
+    for entry in WalkDir::new(repo_root)
+        .into_iter()
+        .filter_entry(|entry| !parser_config.ignores_entry(repo_root, entry.path()))
+    {
         let entry = entry?;
         if !entry.file_type().is_file() {
             continue;
         }
 
         let path = entry.path();
-        if !should_track(path, parser_config) {
+        if parser_config.ignores_entry(repo_root, path) || !should_track(path, parser_config) {
             continue;
         }
 

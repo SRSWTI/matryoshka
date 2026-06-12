@@ -810,6 +810,7 @@ dependencies = [
  "matryoshka-embed-client",
  "matryoshka-enricher",
  "matryoshka-indexer",
+ "matryoshka-parser",
  "matryoshka-read-api",
  "matryoshka-search",
  "matryoshka-store-sqlite",
@@ -878,6 +879,7 @@ dependencies = [
  "anyhow",
  "matryoshka-core-ir",
  "sha2",
+ "tempfile",
  "walkdir",
 ]
 
