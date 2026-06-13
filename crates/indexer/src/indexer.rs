@@ -148,6 +148,44 @@ where
         let delta = compute_delta(&old_snapshot, &new_snapshot);
 
         if delta.is_noop() {
+            let repair = match artifact_repair_set(&self.store, &new_snapshot) {
+                Ok(repair) => repair,
+                Err(err) => return fail_with_progress("checking_artifacts", err, &mut progress),
+            };
+            if !repair.is_empty() {
+                let semantic_record_count = self.refresh_artifacts(
+                    &new_snapshot,
+                    &repair.affected_file_ids,
+                    &repair.affected_folder_ids,
+                    repair.repo_card_stale,
+                    BTreeSet::new(),
+                    BTreeSet::new(),
+                    &mut progress,
+                )?;
+                if let Err(err) = self.store.clear_invalidation_queue() {
+                    return fail_with_progress("clearing_invalidation_queue", err, &mut progress);
+                }
+                let summary = UpdateSummary {
+                    file_count: new_snapshot.files.len(),
+                    folder_count: new_snapshot.folders.len(),
+                    symbol_count: new_snapshot.symbols.len(),
+                    semantic_record_count,
+                    changed_files: 0,
+                    removed_files: 0,
+                    changed_folders: repair.affected_folder_ids.len(),
+                    repo_card_updated: repair.repo_card_stale,
+                    embedding_model: self.embedder.model().into(),
+                };
+                progress(MatryoshkaProgressEvent::Completed {
+                    file_count: summary.file_count,
+                    folder_count: summary.folder_count,
+                    symbol_count: summary.symbol_count,
+                    semantic_record_count: summary.semantic_record_count,
+                    embedding_model: summary.embedding_model.clone(),
+                });
+                return Ok(summary);
+            }
+
             if let Err(err) = self.store.clear_invalidation_queue() {
                 return fail_with_progress("clearing_invalidation_queue", err, &mut progress);
             }
@@ -377,6 +415,33 @@ impl SnapshotDelta {
             && self.removed_file_ids.is_empty()
             && self.removed_folder_ids.is_empty()
             && self.affected_folder_ids.is_empty()
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct ArtifactRepairSet {
+    affected_file_ids: BTreeSet<String>,
+    affected_folder_ids: BTreeSet<String>,
+    repo_card_stale: bool,
+}
+
+impl ArtifactRepairSet {
+    fn is_empty(&self) -> bool {
+        self.affected_file_ids.is_empty()
+            && self.affected_folder_ids.is_empty()
+            && !self.repo_card_stale
+    }
+
+    fn repair_file(&mut self, file: &FileFact) {
+        self.affected_file_ids.insert(file.file_id.clone());
+        self.affected_folder_ids
+            .insert(file.parent_folder_id.clone());
+        self.repo_card_stale = true;
+    }
+
+    fn repair_folder(&mut self, folder_id: impl Into<String>) {
+        self.affected_folder_ids.insert(folder_id.into());
+        self.repo_card_stale = true;
     }
 }
 
@@ -898,6 +963,92 @@ fn apply_structural_delta(
 
     let _ = old;
     Ok(())
+}
+
+fn artifact_repair_set(
+    store: &MatryoshkaStore,
+    snapshot: &RepositorySnapshot,
+) -> Result<ArtifactRepairSet> {
+    let mut repair = ArtifactRepairSet::default();
+    let files_by_id = snapshot
+        .files
+        .iter()
+        .map(|file| (file.file_id.as_str(), file))
+        .collect::<BTreeMap<_, _>>();
+    let files_by_path = snapshot
+        .files
+        .iter()
+        .map(|file| (file.path.as_str(), file))
+        .collect::<BTreeMap<_, _>>();
+
+    let file_cards = store.load_all_file_cards()?;
+    let file_cards_by_id = file_cards
+        .iter()
+        .map(|card| (card.file_id.as_str(), card))
+        .collect::<BTreeMap<_, _>>();
+    for file in &snapshot.files {
+        match file_cards_by_id.get(file.file_id.as_str()) {
+            Some(card) if card.provenance.source_hash == file.source_hash => {}
+            _ => repair.repair_file(file),
+        }
+    }
+
+    let folder_cards = store.load_all_folder_cards()?;
+    let folder_card_ids = folder_cards
+        .iter()
+        .map(|card| card.folder_id.as_str())
+        .collect::<BTreeSet<_>>();
+    for folder in &snapshot.folders {
+        if !folder_card_ids.contains(folder.folder_id.as_str()) {
+            repair.repair_folder(folder.folder_id.clone());
+        }
+    }
+
+    let repo_card = store.load_repo_card(&snapshot.repo_root)?;
+    if repo_card.is_none() {
+        repair.repo_card_stale = true;
+    }
+
+    let semantic_records = store.load_all_semantic_records()?;
+    let semantic_record_ids = semantic_records
+        .iter()
+        .map(|record| record.record_id.as_str())
+        .collect::<BTreeSet<_>>();
+    for record in raw_semantic_records(snapshot) {
+        if semantic_record_ids.contains(record.record_id.as_str()) {
+            continue;
+        }
+        if let Some(file) = files_by_path.get(record.path.as_str()) {
+            repair.repair_file(file);
+        }
+    }
+
+    let card_records = card_semantic_records(&file_cards, &folder_cards, repo_card.as_ref());
+    for record in card_records {
+        if semantic_record_ids.contains(record.record_id.as_str()) {
+            continue;
+        }
+        match record.entity_type {
+            SemanticEntityType::File => {
+                if let Some(file) = files_by_id.get(record.entity_id.as_str()) {
+                    repair.repair_file(file);
+                }
+            }
+            SemanticEntityType::Folder => {
+                repair.repair_folder(record.entity_id);
+            }
+            SemanticEntityType::Repo => {
+                repair.repo_card_stale = true;
+            }
+            SemanticEntityType::Symbol | SemanticEntityType::Snippet => {
+                if let Some(file) = files_by_path.get(record.path.as_str()) {
+                    repair.repair_file(file);
+                }
+            }
+        }
+    }
+
+    Ok(repair)
 }
 
 impl<E, M> FullIndexer<E, M>

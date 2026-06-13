@@ -339,6 +339,78 @@ fn rebuild_semantic_with_progress_emits_batch_events() {
 }
 
 #[test]
+fn update_repairs_missing_enriched_artifacts_after_interrupted_prewarm() {
+    let repo_root = std::path::PathBuf::from("tests/fixtures/mini_repo");
+    let temp = tempfile::tempdir().unwrap();
+    let db_path = temp.path().join("index.db");
+    let store = MatryoshkaStore::open(&db_path).unwrap();
+    let indexer = FullIndexer::new(
+        store.clone(),
+        HeuristicEnricher,
+        DeterministicEmbedder::default(),
+    );
+
+    indexer.index_repo(&repo_root).unwrap();
+    store
+        .connect()
+        .unwrap()
+        .execute_batch(
+            "DELETE FROM file_cards; DELETE FROM folder_cards; DELETE FROM repo_cards; DELETE FROM semantic_records WHERE record_id LIKE 'semantic:%_card:%';",
+        )
+        .unwrap();
+
+    assert_eq!(store.load_all_file_cards().unwrap().len(), 0);
+    assert_eq!(store.load_all_folder_cards().unwrap().len(), 0);
+    assert!(
+        store
+            .load_repo_card(&repo_root.to_string_lossy())
+            .unwrap()
+            .is_none()
+    );
+
+    let mut events = Vec::new();
+    let summary = indexer
+        .update_repo_with_progress(&repo_root, |event| events.push(event))
+        .unwrap();
+
+    assert_eq!(summary.changed_files, 0);
+    assert!(summary.changed_folders > 0);
+    assert!(summary.repo_card_updated);
+    assert!(!store.load_all_file_cards().unwrap().is_empty());
+    assert!(!store.load_all_folder_cards().unwrap().is_empty());
+    assert!(
+        store
+            .load_repo_card(&repo_root.to_string_lossy())
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        store
+            .load_all_semantic_records()
+            .unwrap()
+            .iter()
+            .any(|record| record.record_id.starts_with("semantic:file_card:"))
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, MatryoshkaProgressEvent::EnrichingFile { .. }))
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, MatryoshkaProgressEvent::EmbeddingBatch { .. }))
+    );
+    assert!(matches!(
+        events.last(),
+        Some(MatryoshkaProgressEvent::Completed {
+            semantic_record_count,
+            ..
+        }) if *semantic_record_count == summary.semantic_record_count
+    ));
+}
+
+#[test]
 #[ignore = "requires a reachable local MLX endpoint and explicit env vars"]
 fn real_mlx_progress_integration() {
     let base_url = std::env::var("MATRYOSHKA_MLX_BASE_URL")

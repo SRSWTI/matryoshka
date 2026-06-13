@@ -5,6 +5,53 @@ use serde_json::{Value, json};
 
 pub const ENRICHMENT_MODEL: &str = "MercuriusDream--Qwen3.5-4B-MLX-mxfp8";
 
+pub fn file_single_pass_enrichment_prompt(
+    file: &FileFact,
+    symbols: &[SymbolFact],
+    context: &FileEnrichmentContext,
+) -> Value {
+    json!({
+        "task": "Create one production-quality FileCard enrichment pass. Focus on what this file does, why it exists, behaviors it owns, when a coding agent should read it, edit/search intents that should route here, retrieval tags, key entities, side effects, important symbols, and editing risks. Dependency interpretation and blast radius are provided by deterministic graph analysis outside this LLM call, so do not return imports_interpreted, used_by_interpreted, or blast_radius.",
+        "output_rules": [
+            "Return strict JSON only.",
+            "Prefer quality over exhaustiveness.",
+            "Ground claims in the file context, graph context, snippets, symbols, imports, and path.",
+            "Keep the summary to 120-220 words.",
+            "Keep the role to 2-4 sentences.",
+            "Use 4-8 primary_behaviors.",
+            "Use 4-10 behavior_intents as concise behavioral responsibilities or conceptual query targets.",
+            "Use 4-10 edit_intents as concrete editing/debugging/refactoring tasks.",
+            "Use 8-18 retrieval_tags as compact decomposed tags like behavior:import-resolution, edit:change-parser, artifact:implementation, dependency:upstream.",
+            "Use 6-12 search_phrases.",
+            "Use 2-5 agent_read_hints.",
+            "Use 0-5 side_effects, and omit uncertain side effects.",
+            "Use 0-6 key_entities.",
+            "Use 0-4 external_systems and only include truly external packages, services, storage, network, or OS concerns.",
+            "Use 0-8 important_symbols and focus on symbols that matter for navigation or editing.",
+            "Use 0-4 risk_notes.",
+            "Tags should be lowercase, hyphenated where useful, and should not invent facts not present in the graph or source context."
+        ],
+        "required_json_shape": {
+            "summary": "rich paragraph",
+            "role": "why this file exists",
+            "primary_behaviors": ["behavior strings"],
+            "behavior_intents": ["dynamic behavioral responsibilities and query intents"],
+            "edit_intents": ["editing/debugging tasks that should route here"],
+            "retrieval_tags": ["compact decomposed retrieval tags"],
+            "search_phrases": ["natural language search phrases"],
+            "agent_read_hints": ["when to read this file"],
+            "side_effects": ["side effects"],
+            "key_entities": ["important domain/API/config entities"],
+            "external_systems": ["external packages, services, filesystems, networks, DBs"],
+            "important_symbols": [{"symbol_id": "...", "name": "...", "role": "...", "behavior": "..."}],
+            "risk_notes": ["editing risks"]
+        },
+        "file_context": compact_file_context(file),
+        "graph_context": compact_file_graph_context(context),
+        "symbols": compact_symbols(symbols),
+    })
+}
+
 pub fn file_core_enrichment_prompt(
     file: &FileFact,
     symbols: &[SymbolFact],
@@ -129,6 +176,48 @@ pub fn folder_core_enrichment_prompt(
             "contains_kinds_of_files": ["kinds of files and behaviors"],
             "common_behaviors": ["shared behaviors"],
             "subareas": [{"id": "...", "name": "...", "responsibility": "..."}]
+        },
+        "folder_context": compact_folder_context(folder),
+        "graph_context": compact_folder_graph_context(context),
+        "child_file_cards": compact_child_file_cards(child_file_cards),
+    })
+}
+
+pub fn folder_single_pass_enrichment_prompt(
+    folder: &FolderFact,
+    child_file_cards: &[Value],
+    context: &FolderEnrichmentContext,
+) -> Value {
+    json!({
+        "task": "Create one production-quality FolderCard enrichment pass. Explain what responsibility this folder owns, what child files collaborate on, behavior intents, common behaviors, meaningful subareas, key entrypoints, edit intents, retrieval tags, when an agent should start here, and search phrases. Cross-folder dependency meanings are provided by deterministic graph analysis outside this LLM call, so do not return incoming_dependencies_meaning or outgoing_dependencies_meaning.",
+        "output_rules": [
+            "Return strict JSON only.",
+            "Prefer quality over exhaustiveness.",
+            "Ground claims in folder context, graph context, and child file cards.",
+            "Keep the summary to 120-220 words.",
+            "Keep responsibility to 2-4 sentences.",
+            "Use 4-10 behavior_intents.",
+            "Use 3-6 contains_kinds_of_files items.",
+            "Use 3-6 common_behaviors items.",
+            "Use 0-6 subareas and only when they are meaningful.",
+            "Use 2-6 key_entrypoints items.",
+            "Use 4-10 edit_intents.",
+            "Use 8-18 retrieval_tags as compact decomposed tags.",
+            "Use 2-5 agent_guidance items.",
+            "Use 6-10 search_phrases."
+        ],
+        "required_json_shape": {
+            "summary": "rich paragraph",
+            "responsibility": "main ownership of this folder",
+            "behavior_intents": ["dynamic folder-level responsibilities and query intents"],
+            "contains_kinds_of_files": ["kinds of files and behaviors"],
+            "common_behaviors": ["shared behaviors"],
+            "subareas": [{"id": "...", "name": "...", "responsibility": "..."}],
+            "key_entrypoints": ["important child files/symbols"],
+            "edit_intents": ["editing/debugging tasks that should start here"],
+            "retrieval_tags": ["compact decomposed retrieval tags"],
+            "agent_guidance": ["when to start here"],
+            "search_phrases": ["natural language search phrases"]
         },
         "folder_context": compact_folder_context(folder),
         "graph_context": compact_folder_graph_context(context),

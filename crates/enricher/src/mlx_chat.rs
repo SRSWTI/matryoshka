@@ -1,14 +1,12 @@
 use crate::{
-    CodeEnricher, ENRICHMENT_MODEL, HeuristicEnricher, file_core_enrichment_prompt,
-    file_dependencies_enrichment_prompt, file_navigation_enrichment_prompt,
-    folder_core_enrichment_prompt, folder_navigation_enrichment_prompt,
+    CodeEnricher, ENRICHMENT_MODEL, HeuristicEnricher, file_single_pass_enrichment_prompt,
+    folder_single_pass_enrichment_prompt,
 };
 use anyhow::{Context, Result, anyhow};
 use chrono::Utc;
 use matryoshka_core_ir::{
-    DependencyInterpretation, FileCard, FileEnrichmentContext, FileFact, FolderCard,
-    FolderEnrichmentContext, FolderFact, Provenance, RepoCard, SubareaSummary, SymbolBehavior,
-    SymbolFact,
+    FileCard, FileEnrichmentContext, FileFact, FolderCard, FolderEnrichmentContext, FolderFact,
+    Provenance, RepoCard, SubareaSummary, SymbolBehavior, SymbolFact,
 };
 use reqwest::blocking::Client;
 use reqwest::blocking::Response;
@@ -145,145 +143,19 @@ impl CodeEnricher for MlxChatEnricher {
         let is_facade = is_thin_facade(file, symbols, context);
 
         if !is_facade {
-            let core_prompt = file_core_enrichment_prompt(file, symbols, context);
-            prompt_hashes.push(hash_json(&core_prompt)?);
-            let core = self.complete_typed::<FileCardCoreDraft>(
-                core_prompt,
-                "file_card_core_draft",
-                "Core behavioral understanding for a code-intelligence file card",
-                1400,
+            let prompt = file_single_pass_enrichment_prompt(file, symbols, context);
+            prompt_hashes.push(hash_json(&prompt)?);
+            let draft = self.complete_typed::<FileCardSinglePassDraft>(
+                prompt,
+                "file_card_single_pass_draft",
+                "Single-pass behavioral, retrieval, and editing-risk enrichment for a code-intelligence file card",
+                2600,
             );
-            match core {
-                Ok(core) => {
-                    card.summary = core.summary;
-                    card.role = core.role;
-                    card.primary_behaviors = core.primary_behaviors;
-                    let anchors = file_anchor_strings(file, symbols, context, &card);
-                    let behavior_intents =
-                        sanitize_grounded_strings(core.behavior_intents, &anchors, 12);
-                    if !behavior_intents.is_empty() {
-                        card.behavior_intents = behavior_intents;
-                    }
-                    card.side_effects =
-                        sanitize_side_effects(core.side_effects, file, context, &card.side_effects);
-                    card.key_entities = sanitize_key_entities(
-                        core.key_entities,
-                        file,
-                        symbols,
-                        context,
-                        &card.key_entities,
-                    );
-                    card.external_systems = sanitize_external_systems(
-                        core.external_systems,
-                        context,
-                        &card.external_systems,
-                    );
-                    card.important_symbols =
-                        sanitize_important_symbols(core.important_symbols, symbols);
-                }
-                Err(error) => {
-                    card.risk_notes.push(format!(
-                        "MLX core enrichment degraded to heuristic synthesis: {error:#}"
-                    ));
-                }
-            }
-        }
-
-        let core_summary = serde_json::to_value(json!({
-            "summary": card.summary.clone(),
-            "role": card.role.clone(),
-            "primary_behaviors": card.primary_behaviors.clone(),
-            "behavior_intents": card.behavior_intents.clone(),
-            "important_symbols": card.important_symbols.clone(),
-        }))?;
-
-        if !is_facade {
-            let dependency_prompt =
-                file_dependencies_enrichment_prompt(file, symbols, context, &core_summary);
-            prompt_hashes.push(hash_json(&dependency_prompt)?);
-            let dependencies = self.complete_typed::<FileCardDependencyDraft>(
-                dependency_prompt,
-                "file_card_dependency_draft",
-                "Dependency interpretation and blast-radius layer for a code-intelligence file card",
-                1200,
-            );
-            match dependencies {
-                Ok(dependencies) => {
-                    card.imports_interpreted =
-                        sanitize_import_interpretations(dependencies.imports_interpreted, context);
-                    card.used_by_interpreted =
-                        sanitize_used_by_interpretations(dependencies.used_by_interpreted, context);
-                    card.blast_radius = sanitize_blast_radius(dependencies.blast_radius, file);
-                }
-                Err(error) => {
-                    card.risk_notes.push(format!(
-                        "MLX dependency enrichment degraded to heuristic synthesis: {error:#}"
-                    ));
-                }
-            }
-        }
-
-        let dependency_summary = serde_json::to_value(json!({
-            "imports_interpreted": card.imports_interpreted.clone(),
-            "used_by_interpreted": card.used_by_interpreted.clone(),
-            "blast_radius": card.blast_radius.clone(),
-        }))?;
-
-        if !is_facade {
-            let navigation_prompt = file_navigation_enrichment_prompt(
-                file,
-                symbols,
-                context,
-                &core_summary,
-                &dependency_summary,
-            );
-            prompt_hashes.push(hash_json(&navigation_prompt)?);
-            let navigation = self.complete_typed::<FileCardNavigationDraft>(
-                navigation_prompt,
-                "file_card_navigation_draft",
-                "Navigation, retrieval, and editing-risk layer for a code-intelligence file card",
-                1000,
-            );
-            match navigation {
-                Ok(navigation) => {
-                    let anchors = file_anchor_strings(file, symbols, context, &card);
-                    let agent_read_hints =
-                        sanitize_grounded_strings(navigation.agent_read_hints, &anchors, 6);
-                    if !agent_read_hints.is_empty() {
-                        card.agent_read_hints = agent_read_hints;
-                    }
-                    let edit_intents =
-                        sanitize_grounded_strings(navigation.edit_intents, &anchors, 12);
-                    if !edit_intents.is_empty() {
-                        card.edit_intents = edit_intents;
-                    }
-                    let retrieval_tags = sanitize_grounded_tags(
-                        sanitize_retrieval_tags(navigation.retrieval_tags, 24),
-                        &anchors,
-                        file,
-                        context.parent_folder_id.as_str(),
-                    );
-                    if !retrieval_tags.is_empty() {
-                        card.retrieval_tags =
-                            merge_retrieval_tags(retrieval_tags, card.retrieval_tags, 24);
-                    }
-                    let search_phrases =
-                        sanitize_search_phrases(navigation.search_phrases, &anchors, 12);
-                    if !search_phrases.is_empty() {
-                        card.search_phrases = search_phrases;
-                    }
-                    card.risk_notes.extend(sanitize_risk_notes(
-                        navigation.risk_notes,
-                        &anchors,
-                        file,
-                        6,
-                    ));
-                }
-                Err(error) => {
-                    card.risk_notes.push(format!(
-                        "MLX navigation enrichment degraded to heuristic synthesis: {error:#}"
-                    ));
-                }
+            match draft {
+                Ok(draft) => apply_file_single_pass_draft(&mut card, draft, file, symbols, context),
+                Err(error) => card.risk_notes.push(format!(
+                    "MLX file enrichment degraded to heuristic synthesis: {error:#}"
+                )),
             }
         }
 
@@ -317,85 +189,43 @@ impl CodeEnricher for MlxChatEnricher {
             .collect::<Result<Vec<_>, _>>()?;
         let mut prompt_hashes = Vec::new();
 
-        let core_prompt = folder_core_enrichment_prompt(folder, &child_values, context);
-        prompt_hashes.push(hash_json(&core_prompt)?);
-        let core = self.complete_typed::<FolderCardCoreDraft>(
-            core_prompt,
-            "folder_card_core_draft",
-            "Core responsibility map for a code-intelligence folder card",
-            1200,
+        let prompt = folder_single_pass_enrichment_prompt(folder, &child_values, context);
+        prompt_hashes.push(hash_json(&prompt)?);
+        let draft = self.complete_typed::<FolderCardSinglePassDraft>(
+            prompt,
+            "folder_card_single_pass_draft",
+            "Single-pass responsibility, retrieval, and editing-risk enrichment for a code-intelligence folder card",
+            2200,
         );
-        match core {
-            Ok(core) => {
+        match draft {
+            Ok(draft) => {
                 let anchors = folder_anchor_strings(folder, child_files, context, &card);
+                card.summary = draft.summary;
+                card.responsibility = draft.responsibility;
                 let behavior_intents =
-                    sanitize_grounded_strings(core.behavior_intents, &anchors, 12);
+                    sanitize_grounded_strings(draft.behavior_intents, &anchors, 12);
                 if !behavior_intents.is_empty() {
                     card.behavior_intents =
                         merge_preferred_strings(behavior_intents, card.behavior_intents, 12);
                 }
                 let common_behaviors =
-                    sanitize_grounded_strings(core.common_behaviors, &anchors, 12);
+                    sanitize_grounded_strings(draft.common_behaviors, &anchors, 12);
                 if !common_behaviors.is_empty() {
                     card.common_behaviors =
                         merge_preferred_strings(common_behaviors, card.common_behaviors, 12);
                 }
-            }
-            Err(error) => {
-                card.agent_guidance.push(format!(
-                    "MLX folder core enrichment degraded to heuristic synthesis: {error:#}"
-                ));
-            }
-        }
-
-        let core_summary = serde_json::to_value(json!({
-            "summary": card.summary.clone(),
-            "responsibility": card.responsibility.clone(),
-            "behavior_intents": card.behavior_intents.clone(),
-            "contains_kinds_of_files": card.contains_kinds_of_files.clone(),
-            "common_behaviors": card.common_behaviors.clone(),
-            "subareas": card.subareas.clone(),
-        }))?;
-        let navigation_prompt =
-            folder_navigation_enrichment_prompt(folder, &child_values, context, &core_summary);
-        prompt_hashes.push(hash_json(&navigation_prompt)?);
-        let navigation = self.complete_typed::<FolderCardNavigationDraft>(
-            navigation_prompt,
-            "folder_card_navigation_draft",
-            "Dependency interpretation and navigation layer for a code-intelligence folder card",
-            1000,
-        );
-        match navigation {
-            Ok(navigation) => {
-                let anchors = folder_anchor_strings(folder, child_files, context, &card);
-                let incoming = sanitize_folder_dependency_meaning(
-                    navigation.incoming_dependencies_meaning,
-                    &context.incoming_dependencies,
-                    12,
-                );
-                if !incoming.is_empty() {
-                    card.incoming_dependencies_meaning = incoming;
-                }
-                let outgoing = sanitize_folder_dependency_meaning(
-                    navigation.outgoing_dependencies_meaning,
-                    &context.outgoing_dependencies,
-                    12,
-                );
-                if !outgoing.is_empty() {
-                    card.outgoing_dependencies_meaning = outgoing;
-                }
                 let key_entrypoints =
-                    sanitize_key_entrypoints(navigation.key_entrypoints, folder, child_files, 8);
+                    sanitize_key_entrypoints(draft.key_entrypoints, folder, child_files, 8);
                 if !key_entrypoints.is_empty() {
                     card.key_entrypoints = key_entrypoints;
                 }
-                let edit_intents = sanitize_grounded_strings(navigation.edit_intents, &anchors, 12);
+                let edit_intents = sanitize_grounded_strings(draft.edit_intents, &anchors, 12);
                 if !edit_intents.is_empty() {
                     card.edit_intents =
                         merge_preferred_strings(edit_intents, card.edit_intents, 12);
                 }
                 let retrieval_tags = sanitize_grounded_tags(
-                    sanitize_retrieval_tags(navigation.retrieval_tags, 24),
+                    sanitize_retrieval_tags(draft.retrieval_tags, 24),
                     &anchors,
                     &FileFact {
                         file_id: folder.folder_id.clone(),
@@ -417,14 +247,21 @@ impl CodeEnricher for MlxChatEnricher {
                     card.retrieval_tags =
                         merge_retrieval_tags(retrieval_tags, card.retrieval_tags, 24);
                 }
-                let agent_guidance =
-                    sanitize_grounded_strings(navigation.agent_guidance, &anchors, 6);
+                let contains_kinds_of_files =
+                    sanitize_string_items(draft.contains_kinds_of_files, 8);
+                if !contains_kinds_of_files.is_empty() {
+                    card.contains_kinds_of_files = contains_kinds_of_files;
+                }
+                let subareas = sanitize_subareas(draft.subareas, folder);
+                if !subareas.is_empty() {
+                    card.subareas = subareas;
+                }
+                let agent_guidance = sanitize_grounded_strings(draft.agent_guidance, &anchors, 6);
                 if !agent_guidance.is_empty() {
                     card.agent_guidance =
                         merge_preferred_strings(agent_guidance, card.agent_guidance, 6);
                 }
-                let search_phrases =
-                    sanitize_search_phrases(navigation.search_phrases, &anchors, 12);
+                let search_phrases = sanitize_search_phrases(draft.search_phrases, &anchors, 12);
                 if !search_phrases.is_empty() {
                     card.search_phrases =
                         merge_preferred_strings(search_phrases, card.search_phrases, 12);
@@ -432,7 +269,7 @@ impl CodeEnricher for MlxChatEnricher {
             }
             Err(error) => {
                 card.agent_guidance.push(format!(
-                    "MLX folder navigation enrichment degraded to heuristic synthesis: {error:#}"
+                    "MLX folder enrichment degraded to heuristic synthesis: {error:#}"
                 ));
             }
         }
@@ -521,51 +358,31 @@ struct ChatErrorBody {
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 #[schemars(deny_unknown_fields)]
-struct FileCardCoreDraft {
+struct FileCardSinglePassDraft {
     summary: String,
     role: String,
     primary_behaviors: Vec<String>,
     behavior_intents: Vec<String>,
+    edit_intents: Vec<String>,
+    retrieval_tags: Vec<String>,
+    search_phrases: Vec<String>,
+    agent_read_hints: Vec<String>,
     side_effects: Vec<String>,
     key_entities: Vec<String>,
     external_systems: Vec<String>,
     important_symbols: Vec<SymbolBehavior>,
-}
-
-#[derive(Debug, Serialize, Deserialize, JsonSchema)]
-#[schemars(deny_unknown_fields)]
-struct FileCardDependencyDraft {
-    imports_interpreted: Vec<DependencyInterpretation>,
-    used_by_interpreted: Vec<DependencyInterpretation>,
-    blast_radius: Vec<String>,
-}
-
-#[derive(Debug, Serialize, Deserialize, JsonSchema)]
-#[schemars(deny_unknown_fields)]
-struct FileCardNavigationDraft {
-    agent_read_hints: Vec<String>,
-    edit_intents: Vec<String>,
-    retrieval_tags: Vec<String>,
-    search_phrases: Vec<String>,
     risk_notes: Vec<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 #[schemars(deny_unknown_fields)]
-struct FolderCardCoreDraft {
+struct FolderCardSinglePassDraft {
     summary: String,
     responsibility: String,
     behavior_intents: Vec<String>,
     contains_kinds_of_files: Vec<String>,
     common_behaviors: Vec<String>,
     subareas: Vec<SubareaSummary>,
-}
-
-#[derive(Debug, Serialize, Deserialize, JsonSchema)]
-#[schemars(deny_unknown_fields)]
-struct FolderCardNavigationDraft {
-    incoming_dependencies_meaning: Vec<String>,
-    outgoing_dependencies_meaning: Vec<String>,
     key_entrypoints: Vec<String>,
     edit_intents: Vec<String>,
     retrieval_tags: Vec<String>,
@@ -586,6 +403,65 @@ fn is_thin_facade(
         && !context.sibling_file_ids.is_empty()
 }
 
+fn apply_file_single_pass_draft(
+    card: &mut FileCard,
+    draft: FileCardSinglePassDraft,
+    file: &FileFact,
+    symbols: &[SymbolFact],
+    context: &FileEnrichmentContext,
+) {
+    card.summary = draft.summary;
+    card.role = draft.role;
+    let primary_behaviors = sanitize_string_items(draft.primary_behaviors, 8);
+    if !primary_behaviors.is_empty() {
+        card.primary_behaviors = primary_behaviors;
+    }
+
+    let anchors = file_anchor_strings(file, symbols, context, card);
+    let behavior_intents = sanitize_grounded_strings(draft.behavior_intents, &anchors, 12);
+    if !behavior_intents.is_empty() {
+        card.behavior_intents = behavior_intents;
+    }
+    let edit_intents = sanitize_grounded_strings(draft.edit_intents, &anchors, 12);
+    if !edit_intents.is_empty() {
+        card.edit_intents = edit_intents;
+    }
+    let retrieval_tags = sanitize_grounded_tags(
+        sanitize_retrieval_tags(draft.retrieval_tags, 24),
+        &anchors,
+        file,
+        context.parent_folder_id.as_str(),
+    );
+    if !retrieval_tags.is_empty() {
+        card.retrieval_tags = merge_retrieval_tags(retrieval_tags, card.retrieval_tags.clone(), 24);
+    }
+    let search_phrases = sanitize_search_phrases(draft.search_phrases, &anchors, 12);
+    if !search_phrases.is_empty() {
+        card.search_phrases = search_phrases;
+    }
+    let agent_read_hints = sanitize_grounded_strings(draft.agent_read_hints, &anchors, 6);
+    if !agent_read_hints.is_empty() {
+        card.agent_read_hints = agent_read_hints;
+    }
+    card.side_effects =
+        sanitize_side_effects(draft.side_effects, file, context, &card.side_effects);
+    card.key_entities = sanitize_key_entities(
+        draft.key_entities,
+        file,
+        symbols,
+        context,
+        &card.key_entities,
+    );
+    card.external_systems =
+        sanitize_external_systems(draft.external_systems, context, &card.external_systems);
+    let important_symbols = sanitize_important_symbols(draft.important_symbols, symbols);
+    if !important_symbols.is_empty() {
+        card.important_symbols = important_symbols;
+    }
+    card.risk_notes
+        .extend(sanitize_risk_notes(draft.risk_notes, &anchors, file, 6));
+}
+
 fn sanitize_important_symbols(
     symbols_from_model: Vec<SymbolBehavior>,
     actual_symbols: &[SymbolFact],
@@ -598,89 +474,6 @@ fn sanitize_important_symbols(
         .into_iter()
         .filter(|symbol| allowed.contains(symbol.symbol_id.as_str()))
         .take(8)
-        .collect()
-}
-
-fn sanitize_import_interpretations(
-    interpretations: Vec<DependencyInterpretation>,
-    context: &FileEnrichmentContext,
-) -> Vec<DependencyInterpretation> {
-    let allowed_targets = context
-        .internal_imports
-        .iter()
-        .filter_map(|import| import.resolved_file_id.as_ref())
-        .map(|id| id.as_str())
-        .chain(
-            context
-                .external_imports
-                .iter()
-                .map(|import| import.module.as_str()),
-        )
-        .collect::<std::collections::BTreeSet<_>>();
-
-    interpretations
-        .into_iter()
-        .filter(|item| {
-            allowed_targets.contains(item.target_id.as_str())
-                || allowed_targets.contains(item.target_path.as_str())
-        })
-        .take(8)
-        .collect()
-}
-
-fn sanitize_used_by_interpretations(
-    interpretations: Vec<DependencyInterpretation>,
-    context: &FileEnrichmentContext,
-) -> Vec<DependencyInterpretation> {
-    let dependents = context
-        .imported_by_files
-        .iter()
-        .map(|item| {
-            (
-                item.file_id.as_str(),
-                item.path.as_str(),
-                item.detail.as_str(),
-                item.relationship.as_str(),
-            )
-        })
-        .collect::<Vec<_>>();
-
-    interpretations
-        .into_iter()
-        .filter(|item| {
-            dependents.iter().any(|(file_id, path, _, _)| {
-                item.target_id == *file_id || item.target_path == *path
-            })
-        })
-        .map(|mut item| {
-            if let Some((_, _, detail, relationship)) =
-                dependents.iter().find(|(file_id, path, _, _)| {
-                    item.target_id == *file_id || item.target_path == *path
-                })
-            {
-                item.why = (*detail).to_string();
-                item.dependency_kind = if relationship.is_empty() {
-                    "dependent".into()
-                } else {
-                    (*relationship).to_string()
-                };
-            }
-            item
-        })
-        .take(8)
-        .collect()
-}
-
-fn sanitize_blast_radius(items: Vec<String>, file: &FileFact) -> Vec<String> {
-    sanitize_string_items(items, 6)
-        .into_iter()
-        .filter(|item| {
-            let lowered = item.to_lowercase();
-            lowered.contains(&file.name.to_lowercase())
-                || lowered.contains(&file.path.to_lowercase())
-                || lowered.contains("changes")
-                || lowered.contains("modifying")
-        })
         .collect()
 }
 
@@ -956,22 +749,37 @@ fn sanitize_risk_notes(
         .collect()
 }
 
-fn sanitize_folder_dependency_meaning(
-    items: Vec<String>,
-    actual: &[matryoshka_core_ir::RelatedFileContext],
-    limit: usize,
-) -> Vec<String> {
-    let allowed = actual
+fn sanitize_subareas(items: Vec<SubareaSummary>, folder: &FolderFact) -> Vec<SubareaSummary> {
+    let allowed_child_folders = folder
+        .child_folder_ids
         .iter()
-        .flat_map(|item| [item.path.to_lowercase(), item.file_id.to_lowercase()])
+        .map(|id| id.as_str())
         .collect::<std::collections::BTreeSet<_>>();
-    sanitize_string_items(items, limit * 2)
+    if allowed_child_folders.is_empty() {
+        return Vec::new();
+    }
+
+    items
         .into_iter()
-        .filter(|item| {
-            let lowered = item.to_lowercase();
-            allowed.iter().any(|needle| lowered.contains(needle))
+        .filter_map(|item| {
+            let id = item.id.trim().to_string();
+            let name = item.name.trim().to_string();
+            let responsibility = item.responsibility.trim().to_string();
+            if id.is_empty() || name.is_empty() || responsibility.is_empty() {
+                return None;
+            }
+            if !allowed_child_folders.contains(id.as_str())
+                && !allowed_child_folders.contains(name.as_str())
+            {
+                return None;
+            }
+            Some(SubareaSummary {
+                id,
+                name,
+                responsibility,
+            })
         })
-        .take(limit)
+        .take(6)
         .collect()
 }
 
@@ -1224,9 +1032,9 @@ mod tests {
 
     #[test]
     fn staged_file_schema_payload_contains_nested_type_definitions() {
-        let payload = json_schema_payload::<FileCardCoreDraft>(
-            "file_card_core_draft",
-            "Core behavioral understanding for a code-intelligence file card",
+        let payload = json_schema_payload::<FileCardSinglePassDraft>(
+            "file_card_single_pass_draft",
+            "Single-pass behavioral, retrieval, and editing-risk enrichment for a code-intelligence file card",
         );
         let schema = payload
             .get("json_schema")

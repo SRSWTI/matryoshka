@@ -1,19 +1,30 @@
 {
   "server": {
     "host": "127.0.0.1",
-    "port": 44445
+    "port": 44445,
+    "log_level": "info",
+    "auto_start_on_launch": true
   },
   "auth": {
     "api_key": "2508"
   },
   "model": {
-    "model_dir": "/Users/rohit/cradle-embed/..."
+    "model_dir": "/Users/rohit/cradle-mlx/helpers/omlx/...",
+    "model_dirs": [
+      "/Users/rohit/cradle-mlx/helpers/omlx/..."
+    ]
   },
   "scheduler": {
-    "max_concurrent_requests": 6
+    "max_concurrent_requests": 6,
+    "embedding_batch_size": 32
   },
   "sampling": {
     "max_context_window": 111000,
     "max_tokens": 50000
-  }
+  },
+  "matryoshka": {
+    "chat_model": "MercuriusDream--Qwen3.5-4B-MLX-mxfp8",
+    "embedding_model": "mlx-community--embeddinggemma-300m-bf16"
+  },
+  "provider": {}
 }
