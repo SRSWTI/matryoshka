@@ -8,6 +8,10 @@ version.workspace = true
 anyhow.workspace = true
 matryoshka-core-ir.workspace = true
 sha2.workspace = true
+tree-sitter = "0.26.9"
+tree-sitter-python = "0.25.0"
+tree-sitter-rust = "0.24.2"
+tree-sitter-typescript = "0.23.2"
 walkdir.workspace = true
 
 [dev-dependencies]

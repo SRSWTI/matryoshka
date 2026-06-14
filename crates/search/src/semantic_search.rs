@@ -1,25 +1,73 @@
 use anyhow::Result;
 use matryoshka_core_ir::{
-    FileCard, FolderCard, RepoCard, SearchHit, SemanticEntityType, SemanticRecord,
+    FileCard, FolderCard, LateInteractionVector, RepoCard, SearchHit, SemanticEntityType,
+    SemanticRecord,
 };
 use matryoshka_embed_client::{Embedder, cosine};
 use matryoshka_store_sqlite::MatryoshkaStore;
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 
+use crate::{QueryPlan, RerankCandidate, Reranker, SearchMode, TestPreference, plan_query};
+
 const MAX_MATCHED_SYMBOLS: usize = 12;
+const DEFAULT_CANDIDATE_MULTIPLIER: usize = 24;
+const LATE_INTERACTION_CANDIDATE_LIMIT: usize = 80;
+const LATE_INTERACTION_BOOST: f32 = 0.30;
 
 pub struct SearchEngine<M> {
     store: MatryoshkaStore,
     embedder: M,
+    reranker: Option<Box<dyn Reranker>>,
+    late_interaction: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SearchPrewarmSummary {
+    pub fts_record_count: usize,
+    pub query_count: usize,
+    pub warmed_hit_count: usize,
 }
 
 impl<M: Embedder> SearchEngine<M> {
     pub fn new(store: MatryoshkaStore, embedder: M) -> Self {
-        Self { store, embedder }
+        Self {
+            store,
+            embedder,
+            reranker: None,
+            late_interaction: true,
+        }
+    }
+
+    pub fn with_reranker<R: Reranker + 'static>(mut self, reranker: R) -> Self {
+        self.reranker = Some(Box::new(reranker));
+        self
+    }
+
+    pub fn with_late_interaction(mut self, enabled: bool) -> Self {
+        self.late_interaction = enabled;
+        self
+    }
+
+    pub fn prewarm(
+        &self,
+        queries: &[String],
+        limit_per_query: usize,
+    ) -> Result<SearchPrewarmSummary> {
+        let fts_record_count = self.store.rebuild_semantic_fts()?;
+        let mut warmed_hit_count = 0usize;
+        for query in queries {
+            warmed_hit_count += self.search(query, limit_per_query)?.len();
+        }
+        Ok(SearchPrewarmSummary {
+            fts_record_count,
+            query_count: queries.len(),
+            warmed_hit_count,
+        })
     }
 
     pub fn search(&self, query: &str, limit: usize) -> Result<Vec<SearchHit>> {
+        let plan = plan_query(query);
         let query_embedding = self
             .embedder
             .embed(&[query.to_string()])?
@@ -27,11 +75,33 @@ impl<M: Embedder> SearchEngine<M> {
             .unwrap_or_default();
         let records = self.store.load_all_semantic_records()?;
         let query_tokens = tokens(query);
-        let mut hits = records
-            .iter()
-            .filter_map(|record| score_record(record, &query_embedding, &query_tokens))
+        let candidates = collect_candidates(
+            &self.store,
+            &records,
+            &query_embedding,
+            &query_tokens,
+            query,
+            limit,
+            &plan,
+        )?;
+        let candidate_records = candidates
+            .keys()
+            .filter_map(|record_id| records.iter().find(|record| &record.record_id == record_id))
+            .cloned()
             .collect::<Vec<_>>();
-        hits = collapse_file_hits(hits, &records);
+        let mut hits = candidate_records
+            .iter()
+            .filter_map(|record| {
+                let evidence = candidates
+                    .get(&record.record_id)
+                    .cloned()
+                    .unwrap_or_default();
+                score_record(record, &query_embedding, &query_tokens, &plan, &evidence)
+            })
+            .collect::<Vec<_>>();
+        self.apply_late_interaction(&query_tokens, &mut hits)?;
+        self.apply_reranker(query, &mut hits, &candidate_records)?;
+        hits = collapse_file_hits(hits, &candidate_records);
         hits.sort_by(|left, right| {
             right
                 .score
@@ -39,8 +109,116 @@ impl<M: Embedder> SearchEngine<M> {
                 .then_with(|| left.path.cmp(&right.path))
         });
         hits.truncate(limit);
-        self.hydrate_hits(&mut hits, &records)?;
+        self.hydrate_hits(&mut hits, &candidate_records)?;
         Ok(hits)
+    }
+
+    fn apply_late_interaction(
+        &self,
+        query_tokens: &[String],
+        hits: &mut [SearchHit],
+    ) -> Result<()> {
+        if !self.late_interaction || query_tokens.is_empty() || hits.is_empty() {
+            return Ok(());
+        }
+
+        hits.sort_by(|left, right| {
+            right
+                .score
+                .total_cmp(&left.score)
+                .then_with(|| left.path.cmp(&right.path))
+        });
+        let record_ids = hits
+            .iter()
+            .take(LATE_INTERACTION_CANDIDATE_LIMIT)
+            .map(|hit| hit.record_id.clone())
+            .collect::<Vec<_>>();
+        let doc_vectors = self.store.load_late_interaction_vectors(&record_ids)?;
+        if doc_vectors.is_empty() {
+            return Ok(());
+        }
+
+        let query_inputs = query_tokens
+            .iter()
+            .map(|token| late_interaction_embedding_input(token))
+            .collect::<Vec<_>>();
+        let query_vectors = self.embedder.embed(&query_inputs)?;
+        if query_vectors.is_empty() {
+            return Ok(());
+        }
+
+        for hit in hits {
+            let Some(vectors) = doc_vectors.get(&hit.record_id) else {
+                continue;
+            };
+            let score = late_interaction_score(&query_vectors, vectors);
+            if score <= 0.0 {
+                continue;
+            }
+            hit.score += score * LATE_INTERACTION_BOOST;
+            hit.why_matched
+                .push("Late-interaction MaxSim matched indexed code-token vectors".into());
+        }
+
+        Ok(())
+    }
+
+    fn apply_reranker(
+        &self,
+        query: &str,
+        hits: &mut [SearchHit],
+        records: &[SemanticRecord],
+    ) -> Result<()> {
+        let Some(reranker) = self.reranker.as_ref() else {
+            return Ok(());
+        };
+        if hits.is_empty() {
+            return Ok(());
+        }
+
+        hits.sort_by(|left, right| {
+            right
+                .score
+                .total_cmp(&left.score)
+                .then_with(|| left.path.cmp(&right.path))
+        });
+        let records_by_id = records
+            .iter()
+            .map(|record| (record.record_id.as_str(), record))
+            .collect::<BTreeMap<_, _>>();
+        let candidates = hits
+            .iter()
+            .take(40)
+            .filter_map(|hit| {
+                let record = records_by_id.get(hit.record_id.as_str()).copied()?;
+                Some(RerankCandidate::from_record(record, hit.score))
+            })
+            .collect::<Vec<_>>();
+        if candidates.is_empty() {
+            return Ok(());
+        }
+
+        let scores = reranker.rerank(query, &candidates)?;
+        let scores_by_id = scores
+            .into_iter()
+            .map(|score| (score.record_id.clone(), score))
+            .collect::<BTreeMap<_, _>>();
+        for hit in hits {
+            let Some(score) = scores_by_id.get(&hit.record_id) else {
+                continue;
+            };
+            hit.score += score.score * 0.24;
+            match score.reason.as_deref() {
+                Some(reason) => hit
+                    .why_matched
+                    .push(format!("Reranker preferred this result: {reason}")),
+                None => hit
+                    .why_matched
+                    .push("Reranker preferred this result".into()),
+            }
+        }
+
+        Ok(())
     }
 
     fn hydrate_hits(&self, hits: &mut [SearchHit], records: &[SemanticRecord]) -> Result<()> {
@@ -113,6 +291,108 @@ impl<M: Embedder> SearchEngine<M> {
     }
 }
 
+pub fn default_prewarm_queries() -> Vec<String> {
+    [
+        "repository architecture",
+        "where are symbols defined",
+        "where should I edit behavior",
+        "dependency impact blast radius",
+        "tests fixtures integration",
+        "read next implementation owner",
+    ]
+    .into_iter()
+    .map(ToString::to_string)
+    .collect()
+}
+
+#[derive(Debug, Clone, Default)]
+struct CandidateEvidence {
+    fts_rank: Option<f32>,
+    dense_rank: Option<usize>,
+    exact_score: f32,
+    graph_score: f32,
+    card_hint: bool,
+}
+
+fn collect_candidates(
+    store: &MatryoshkaStore,
+    records: &[SemanticRecord],
+    query_embedding: &[f32],
+    query_tokens: &[String],
+    query: &str,
+    limit: usize,
+    plan: &QueryPlan,
+) -> Result<BTreeMap<String, CandidateEvidence>> {
+    let candidate_limit = candidate_limit(limit);
+    let mut candidates = BTreeMap::<String, CandidateEvidence>::new();
+
+    for hit in store.search_semantic_fts(query, candidate_limit)? {
+        let evidence = candidates.entry(hit.record_id).or_default();
+        evidence.fts_rank = Some(hit.rank);
+    }
+
+    for record in records {
+        let exact_score = exact_candidate_score(record, query_tokens, plan);
+        if exact_score > 0.0 {
+            candidates
+                .entry(record.record_id.clone())
+                .or_default()
+                .exact_score += exact_score;
+        }
+        if plan.include_repo_card && record_kind(record) == "repo_card" {
+            candidates
+                .entry(record.record_id.clone())
+                .or_default()
+                .card_hint = true;
+        }
+        if plan.include_folder_cards && record_kind(record) == "folder_card" {
+            candidates
+                .entry(record.record_id.clone())
+                .or_default()
+                .card_hint = true;
+        }
+        if plan.include_graph_neighbors {
+            let graph_score = graph_candidate_score(record, query_tokens);
+            if graph_score > 0.0 {
+                candidates
+                    .entry(record.record_id.clone())
+                    .or_default()
+                    .graph_score += graph_score;
+            }
+        }
+    }
+
+    if !query_embedding.is_empty() {
+        let mut dense = records
+            .iter()
+            .filter_map(|record| {
+                let embedding = record.embedding.as_ref()?;
+                (!embedding.is_empty())
+                    .then(|| (record.record_id.clone(), cosine(query_embedding, embedding)))
+            })
+            .collect::<Vec<_>>();
+        dense.sort_by(|left, right| right.1.total_cmp(&left.1));
+        for (rank, (record_id, _)) in dense.into_iter().take(candidate_limit).enumerate() {
+            candidates.entry(record_id).or_default().dense_rank = Some(rank);
+        }
+    }
+
+    if candidates.is_empty() {
+        for record in records.iter().take(candidate_limit) {
+            candidates.entry(record.record_id.clone()).or_default();
+        }
+    }
+
+    Ok(candidates)
+}
+
+fn candidate_limit(limit: usize) -> usize {
+    limit
+        .max(8)
+        .saturating_mul(DEFAULT_CANDIDATE_MULTIPLIER)
+        .max(96)
+}
+
 fn collapse_file_hits(hits: Vec<SearchHit>, records: &[SemanticRecord]) -> Vec<SearchHit> {
     let records_by_id = records
         .iter()
@@ -147,6 +427,97 @@ fn is_file_level_result(record: &SemanticRecord) -> bool {
         record.entity_type,
         SemanticEntityType::File | SemanticEntityType::Symbol | SemanticEntityType::Snippet
     )
+}
+
+fn exact_candidate_score(
+    record: &SemanticRecord,
+    query_tokens: &[String],
+    plan: &QueryPlan,
+) -> f32 {
+    if query_tokens.is_empty() {
+        return 0.0;
+    }
+    let haystack = format!("{} {} {}", record.title, record.path, record.content).to_lowercase();
+    let token_hits = query_tokens
+        .iter()
+        .filter(|token| haystack.contains(token.as_str()))
+        .count();
+    let mut score = token_hits as f32 * 0.05 * plan.lexical_weight;
+
+    if matches!(record.entity_type, SemanticEntityType::Symbol) {
+        let symbol = symbol_name_from_record(record)
+            .unwrap_or_default()
+            .to_lowercase();
+        if query_tokens
+            .iter()
+            .any(|token| !symbol.is_empty() && token.eq_ignore_ascii_case(&symbol))
+        {
+            score += 0.35 * plan.symbol_weight;
+        }
+    }
+
+    if query_tokens
+        .iter()
+        .any(|token| record.path.to_lowercase().contains(token))
+    {
+        score += 0.08 * plan.lexical_weight;
+    }
+
+    score
+}
+
+fn graph_candidate_score(record: &SemanticRecord, query_tokens: &[String]) -> f32 {
+    let haystack = format!("{} {}", record.content, metadata_text(record)).to_lowercase();
+    let mut score = 0.0;
+    if query_tokens.iter().any(|token| {
+        matches!(
+            token.as_str(),
+            "dependency" | "dependencies" | "depends" | "dependent" | "downstream" | "upstream"
+        )
+    }) && (haystack.contains("depends")
+        || haystack.contains("dependency")
+        || haystack.contains("incoming")
+        || haystack.contains("outgoing")
+        || haystack.contains("used by"))
+    {
+        score += 0.25;
+    }
+    if query_tokens
+        .iter()
+        .any(|token| matches!(token.as_str(), "impact" | "breaks" | "blast"))
+        && (haystack.contains("blast_radius") || haystack.contains("blast radius"))
+    {
+        score += 0.25;
+    }
+    score
+}
+
+fn metadata_text(record: &SemanticRecord) -> String {
+    fn collect(value: &Value, out: &mut Vec<String>) {
+        match value {
+            Value::String(text) => out.push(text.clone()),
+            Value::Array(items) => {
+                for item in items {
+                    collect(item, out);
+                }
+            }
+            Value::Object(map) => {
+                for (key, value) in map {
+                    out.push(key.clone());
+                    collect(value, out);
+                }
+            }
+            Value::Number(number) => out.push(number.to_string()),
+            Value::Bool(value) => out.push(value.to_string()),
+            Value::Null => {}
+        }
+    }
+    let mut parts = Vec::new();
+    for (key, value) in &record.metadata {
+        parts.push(key.clone());
+        collect(value, &mut parts);
+    }
+    parts.join(" ")
 }
 
 #[derive(Debug, Clone)]
@@ -230,7 +601,18 @@ impl CollapsedHit {
         hit.matched_terms = self.matched_terms.into_iter().collect();
         hit.matched_symbols = matched_symbols;
         hit.total_matched_symbols = total_matched_symbols;
-        hit.why_matched = self.why.into_iter().collect();
+        let mut why_matched = self.why.into_iter().collect::<Vec<_>>();
+        let reranker_reason_count = why_matched
+            .iter()
+            .filter(|reason| reason.starts_with("Reranker preferred this result"))
+            .count();
+        if reranker_reason_count > 1 {
+            why_matched.retain(|reason| !reason.starts_with("Reranker preferred this result"));
+            why_matched.push(format!(
+                "Reranker preferred {reranker_reason_count} matching records in this file"
+            ));
+        }
+        hit.why_matched = why_matched;
         if !hit.matched_symbols.is_empty() {
             if total_matched_symbols > hit.matched_symbols.len() {
                 hit.why_matched.push(format!(
@@ -258,13 +640,16 @@ fn score_record(
     record: &SemanticRecord,
     query_embedding: &[f32],
     query_tokens: &[String],
+    plan: &QueryPlan,
+    evidence: &CandidateEvidence,
 ) -> Option<SearchHit> {
-    let embedding = record.embedding.as_ref()?;
-    if embedding.is_empty() || query_embedding.is_empty() {
-        return None;
-    }
-    let semantic_score = cosine(query_embedding, embedding);
-    let mut score = semantic_score;
+    let semantic_score = record
+        .embedding
+        .as_ref()
+        .filter(|embedding| !embedding.is_empty() && !query_embedding.is_empty())
+        .map(|embedding| cosine(query_embedding, embedding))
+        .unwrap_or_default();
+    let mut score = semantic_score * plan.semantic_weight;
     let haystack = format!("{} {} {}", record.title, record.path, record.content).to_lowercase();
     let record_kind = record_kind(record);
     let edit_like_query = is_edit_like_query(query_tokens);
@@ -272,16 +657,22 @@ fn score_record(
     let entrypoint_query = is_entrypoint_query(query_tokens);
     let folder_query = is_folder_query(query_tokens);
     let repo_query = is_repo_query(query_tokens);
-    let test_query = is_test_query(query_tokens);
+    let test_query = plan.test_preference == TestPreference::Prefer || is_test_query(query_tokens);
     let owner_query = (edit_like_query || behavior_like_query) && !entrypoint_query;
     let facade = looks_like_facade(record);
     let behavior_owner = looks_like_behavior_owner(record);
     let mut why = Vec::new();
-    if looks_like_test_path(&record.path) && !test_query {
+    if looks_like_test_path(&record.path)
+        && plan.test_preference == TestPreference::Penalize
+        && !test_query
+    {
         score -= 0.28;
         why.push("Test file de-prioritized because the query does not ask for tests".into());
+    } else if looks_like_test_path(&record.path) && plan.test_preference == TestPreference::Prefer {
+        score += 0.22;
+        why.push("Test file preferred because the query asks for tests".into());
     } else if !looks_like_test_path(&record.path)
-        && !test_query
+        && plan.test_preference == TestPreference::Penalize
         && matches!(
             record.entity_type,
             SemanticEntityType::File | SemanticEntityType::Symbol | SemanticEntityType::Snippet
@@ -292,6 +683,28 @@ fn score_record(
     }
     if semantic_score > 0.2 {
         why.push("Summary/content is semantically close to the query".into());
+    }
+    if let Some(rank) = evidence.fts_rank {
+        let fts_boost = (0.24 / (1.0 + rank.abs())).max(0.04) * plan.lexical_weight;
+        score += fts_boost;
+        why.push(
+            "SQLite FTS matched exact query terms in path, title, content, or metadata".into(),
+        );
+    }
+    if let Some(rank) = evidence.dense_rank {
+        score += (0.08 / (rank as f32 + 1.0).sqrt()) * plan.semantic_weight;
+    }
+    if evidence.exact_score > 0.0 {
+        score += evidence.exact_score;
+        why.push("Exact token, symbol, or path candidate matched the query".into());
+    }
+    if evidence.graph_score > 0.0 {
+        score += evidence.graph_score * plan.graph_weight;
+        why.push("Graph/dependency-oriented indexed context matched the query plan".into());
+    }
+    if evidence.card_hint {
+        score += 0.16 * plan.card_weight;
+        why.push("Query plan requested repository or folder card context".into());
     }
     let matched_terms = query_tokens
         .iter()
@@ -343,7 +756,7 @@ fn score_record(
     }
     match record_kind {
         "file_card" => {
-            score += 0.12;
+            score += 0.12 * plan.card_weight;
             why.push("Matched the enriched file summary".into());
             if facade && owner_query {
                 score -= 0.55;
@@ -360,17 +773,36 @@ fn score_record(
             }
         }
         "folder_card" => {
-            score += 0.08;
+            score += 0.08 * plan.card_weight;
             why.push("Matched the enriched folder responsibility".into());
+            if matches!(plan.mode, SearchMode::FindSymbol) && !folder_query {
+                score -= 0.38;
+                why.push("Folder result was de-prioritized for a file-level symbol query".into());
+            }
             if edit_like_query && !folder_query {
                 score -= 0.20;
                 why.push("Folder result was de-prioritized for a file-level edit query".into());
             }
+            if matches!(
+                plan.mode,
+                SearchMode::ArchitectureOverview | SearchMode::FindBehavior | SearchMode::ReadNext
+            ) {
+                score += 0.12 * plan.card_weight;
+                why.push("Folder card fits the planned search mode".into());
+            }
         }
         "repo_card" => {
-            score += 0.16;
+            score += 0.16 * plan.card_weight;
             why.push("Matched the repository-level map".into());
-            if repo_query {
+            if matches!(plan.mode, SearchMode::FindSymbol) && !repo_query {
+                score -= 0.48;
+                why.push("Repository map was de-prioritized for a file-level symbol query".into());
+            }
+            if matches!(plan.mode, SearchMode::EditTarget) && !repo_query {
+                score -= 0.32;
+                why.push("Repository map was de-prioritized for a file-level edit query".into());
+            }
+            if repo_query || plan.include_repo_card {
                 score += 0.30;
                 why.push("Repository architecture query fits the repo map".into());
             }
@@ -381,8 +813,12 @@ fn score_record(
         }
         "symbol_fact" => {
             if token_hits > 0 {
-                score += 0.12;
+                score += 0.12 * plan.symbol_weight;
                 why.push("Matched a concrete symbol in this file".into());
+            }
+            if matches!(plan.mode, SearchMode::FindSymbol) {
+                score += 0.12 * plan.symbol_weight;
+                why.push("Symbol query plan preferred concrete symbol records".into());
             }
         }
         _ => {}
@@ -819,6 +1255,46 @@ fn looks_like_test_path(path: &str) -> bool {
         || path.contains(".spec.")
 }
 
+fn late_interaction_embedding_input(token: &str) -> String {
+    format!("code search token: {token}")
+}
+
+fn late_interaction_score(
+    query_vectors: &[Vec<f32>],
+    doc_vectors: &[LateInteractionVector],
+) -> f32 {
+    if query_vectors.is_empty() || doc_vectors.is_empty() {
+        return 0.0;
+    }
+
+    let mut total = 0.0;
+    let mut matched = 0usize;
+    for query_vector in query_vectors {
+        if query_vector.is_empty() {
+            continue;
+        }
+        let best = doc_vectors
+            .iter()
+            .filter(|doc| !doc.embedding.is_empty() && doc.embedding.len() == query_vector.len())
+            .map(|doc| {
+                let weight = doc.weight.max(0.1).sqrt();
+                cosine(query_vector, &doc.embedding) * weight
+            })
+            .max_by(|left, right| left.total_cmp(right))
+            .unwrap_or(0.0);
+        if best > 0.0 {
+            total += best;
+            matched += 1;
+        }
+    }
+
+    if matched == 0 {
+        0.0
+    } else {
+        (total / matched as f32).clamp(0.0, 1.5)
+    }
+}
+
 fn tokens(query: &str) -> Vec<String> {
     const STOPWORDS: &[&str] = &[
         "the", "and", "for", "with", "from", "into", "that", "this", "what", "where", "when",
@@ -927,6 +1403,31 @@ mod tests {
     }
 
     #[test]
+    fn late_interaction_score_uses_maxsim_over_doc_tokens() {
+        let query_vectors = vec![vec![1.0, 0.0], vec![0.0, 1.0]];
+        let doc_vectors = vec![
+            LateInteractionVector {
+                record_id: "a".into(),
+                token: "search".into(),
+                ordinal: 0,
+                weight: 1.0,
+                embedding: vec![1.0, 0.0],
+            },
+            LateInteractionVector {
+                record_id: "a".into(),
+                token: "ranking".into(),
+                ordinal: 1,
+                weight: 1.0,
+                embedding: vec![0.0, 1.0],
+            },
+        ];
+
+        let score = late_interaction_score(&query_vectors, &doc_vectors);
+
+        assert!(score > 0.99);
+    }
+
+    #[test]
     fn behavior_edit_queries_prefer_implementation_files_over_facades() {
         let query_tokens = tokens("debug import resolution behavior");
         let query_embedding = vec![1.0, 0.0];
@@ -987,9 +1488,18 @@ mod tests {
             ]),
         };
 
-        let facade_hit = score_record(&facade, &query_embedding, &query_tokens).unwrap();
-        let implementation_hit =
-            score_record(&implementation, &query_embedding, &query_tokens).unwrap();
+        let plan = plan_query("debug import resolution behavior");
+        let evidence = CandidateEvidence::default();
+        let facade_hit =
+            score_record(&facade, &query_embedding, &query_tokens, &plan, &evidence).unwrap();
+        let implementation_hit = score_record(
+            &implementation,
+            &query_embedding,
+            &query_tokens,
+            &plan,
+            &evidence,
+        )
+        .unwrap();
 
         assert!(implementation_hit.score > facade_hit.score);
         assert!(
@@ -1003,6 +1513,56 @@ mod tests {
                 .why_matched
                 .iter()
                 .any(|item| item.contains("facade result was de-prioritized"))
+        );
+    }
+
+    #[test]
+    fn symbol_queries_prefer_concrete_files_over_matching_repo_cards() {
+        let query = "where is advisor called before implementation";
+        let query_tokens = tokens(query);
+        let query_embedding = vec![1.0, 0.0];
+        let plan = plan_query(query);
+        assert_eq!(plan.mode, SearchMode::FindSymbol);
+
+        let file = SemanticRecord {
+            record_id: "file".into(),
+            entity_id: "src/main.rs".into(),
+            entity_type: SemanticEntityType::File,
+            title: "File src/main.rs".into(),
+            content: "advisor call implementation transcript_for_advisor".into(),
+            path: "src/main.rs".into(),
+            source_hash: "a".into(),
+            embedding: Some(vec![1.0, 0.0]),
+            metadata: BTreeMap::from([("kind".into(), json!("file_card"))]),
+        };
+        let repo = SemanticRecord {
+            record_id: "repo".into(),
+            entity_id: "repo".into(),
+            entity_type: SemanticEntityType::Repo,
+            title: "RepoCard repo".into(),
+            content: "before implementation advisor repository overview".into(),
+            path: "repo".into(),
+            source_hash: "a".into(),
+            embedding: Some(vec![1.0, 0.0]),
+            metadata: BTreeMap::from([("kind".into(), json!("repo_card"))]),
+        };
+        let evidence = CandidateEvidence {
+            fts_rank: Some(0.0),
+            exact_score: 0.2,
+            ..CandidateEvidence::default()
+        };
+
+        let file_hit = score_record(&file, &query_embedding, &query_tokens, &plan, &evidence)
+            .expect("file should score");
+        let repo_hit = score_record(&repo, &query_embedding, &query_tokens, &plan, &evidence)
+            .expect("repo should score");
+
+        assert!(file_hit.score > repo_hit.score);
+        assert!(
+            repo_hit
+                .why_matched
+                .iter()
+                .any(|item| item.contains("file-level symbol query"))
         );
     }
 
@@ -1043,9 +1603,18 @@ mod tests {
             ]),
         };
 
-        let facade_hit = score_record(&facade, &query_embedding, &query_tokens).unwrap();
-        let implementation_hit =
-            score_record(&implementation, &query_embedding, &query_tokens).unwrap();
+        let plan = plan_query("resolver public exports entrypoint");
+        let evidence = CandidateEvidence::default();
+        let facade_hit =
+            score_record(&facade, &query_embedding, &query_tokens, &plan, &evidence).unwrap();
+        let implementation_hit = score_record(
+            &implementation,
+            &query_embedding,
+            &query_tokens,
+            &plan,
+            &evidence,
+        )
+        .unwrap();
 
         assert!(facade_hit.score > implementation_hit.score);
         assert!(

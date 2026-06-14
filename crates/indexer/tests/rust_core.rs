@@ -4,8 +4,8 @@ use matryoshka_embed_client::EndpointEmbedder;
 use matryoshka_enricher::HeuristicEnricher;
 use matryoshka_enricher::MlxChatEnricher;
 use matryoshka_indexer::FullIndexer;
-use matryoshka_read_api::ReadApi;
-use matryoshka_search::SearchEngine;
+use matryoshka_read_api::{ReadApi, ReadPackMode};
+use matryoshka_search::{SearchEngine, default_prewarm_queries};
 use matryoshka_store_sqlite::MatryoshkaStore;
 use std::fs;
 
@@ -45,6 +45,26 @@ fn indexes_searches_and_reads_file_cards() {
             .as_ref()
             .is_some_and(|embedding| !embedding.is_empty())
     }));
+    let fts_hits = MatryoshkaStore::open(&db_path)
+        .unwrap()
+        .search_semantic_fts("get_env_api_key", 8)
+        .unwrap();
+    assert!(
+        fts_hits.iter().any(|hit| hit.record_id.contains("env.py")),
+        "{fts_hits:?}"
+    );
+    let late_record_ids = records
+        .iter()
+        .map(|record| record.record_id.clone())
+        .collect::<Vec<_>>();
+    let late_vectors = MatryoshkaStore::open(&db_path)
+        .unwrap()
+        .load_late_interaction_vectors(&late_record_ids)
+        .unwrap();
+    assert!(
+        late_vectors.values().any(|vectors| !vectors.is_empty()),
+        "expected indexed late-interaction vectors"
+    );
 
     let search = SearchEngine::new(
         MatryoshkaStore::open(&db_path).unwrap(),
@@ -62,29 +82,49 @@ fn indexes_searches_and_reads_file_cards() {
     assert!(!hits.is_empty());
     assert!(hits.iter().any(|hit| hit.path.contains("env.py")));
     assert!(hits.iter().any(|hit| !hit.why_matched.is_empty()));
-    assert!(hits.iter().any(|hit| {
-        hit.path.contains("env.py")
-            && hit
-                .summary
-                .as_deref()
-                .is_some_and(|summary| summary.contains("env.py"))
-            && hit
-                .description
-                .as_deref()
-                .is_some_and(|description| description.contains("Role:"))
+    assert!(hits.iter().any(|hit| { hit.path.contains("env.py") }));
+
+    let symbol_hits = search
+        .search("where is get_env_api_key defined", 5)
+        .unwrap();
+    assert!(
+        symbol_hits.iter().any(|hit| hit.path.contains("env.py")),
+        "{symbol_hits:?}"
+    );
+    assert!(symbol_hits.iter().any(|hit| {
+        hit.why_matched
+            .iter()
+            .any(|why| why.contains("SQLite FTS") || why.contains("Symbol query plan"))
     }));
+    assert!(symbol_hits.iter().any(|hit| {
+        hit.why_matched
+            .iter()
+            .any(|why| why.contains("Late-interaction MaxSim"))
+    }));
+
+    let prewarm = search.prewarm(&default_prewarm_queries(), 3).unwrap();
+    assert!(prewarm.fts_record_count >= records.len());
+    assert_eq!(prewarm.query_count, default_prewarm_queries().len());
+    assert!(prewarm.warmed_hit_count > 0);
 
     let read = ReadApi::new(MatryoshkaStore::open(&db_path).unwrap(), repo_root);
     let card = read.read("src/auth/middleware.py").unwrap();
     assert_eq!(card.file.path, "src/auth/middleware.py");
-    assert!(
-        card.summary
-            .as_deref()
-            .unwrap_or_default()
-            .contains("src/auth/middleware.py")
-    );
     assert!(!card.symbols.is_empty());
     assert!(card.imports.external.is_some() || !card.imports.internal.is_empty());
+
+    let bundle = read
+        .read_bundle(
+            "src/auth/middleware.py",
+            &["src/config/env.py".to_string()],
+            ReadPackMode::Edit,
+            2,
+        )
+        .unwrap();
+    assert_eq!(bundle.primary.file.path, "src/auth/middleware.py");
+    assert_eq!(bundle.related.len(), 1);
+    assert_eq!(bundle.related[0].file.path, "src/config/env.py");
+    assert!(!bundle.primary.symbols.is_empty());
 }
 
 #[test]
@@ -132,6 +172,148 @@ fn incremental_update_refreshes_changed_entities_and_preserves_unaffected_cards(
     let search = SearchEngine::new(store, DeterministicEmbedder::default());
     let hits = search.search("cache_key util cache", 5).unwrap();
     assert!(hits.iter().any(|hit| hit.path == "src/util.rs"));
+    let fts_hits = MatryoshkaStore::open(&db_path)
+        .unwrap()
+        .search_semantic_fts("cache_key", 5)
+        .unwrap();
+    assert!(
+        fts_hits
+            .iter()
+            .any(|hit| hit.record_id.contains("src/util.rs")),
+        "{fts_hits:?}"
+    );
+}
+
+#[test]
+fn incremental_update_removes_deleted_files_from_fts_candidates() {
+    let temp = tempfile::tempdir().unwrap();
+    let repo_root = temp.path();
+    fs::create_dir_all(repo_root.join("src")).unwrap();
+    fs::write(
+        repo_root.join("src/remove_me.rs"),
+        "pub fn obsolete_unique_marker() -> &'static str { \"gone\" }\n",
+    )
+    .unwrap();
+    fs::write(
+        repo_root.join("src/keep.rs"),
+        "pub fn stable_entrypoint() -> &'static str { \"keep\" }\n",
+    )
+    .unwrap();
+
+    let db_path = temp.path().join("index.db");
+    let store = MatryoshkaStore::open(&db_path).unwrap();
+    let indexer = FullIndexer::new(store, HeuristicEnricher, DeterministicEmbedder::default());
+    indexer.index_repo(repo_root).unwrap();
+
+    let before_hits = MatryoshkaStore::open(&db_path)
+        .unwrap()
+        .search_semantic_fts("obsolete_unique_marker", 8)
+        .unwrap();
+    assert!(
+        before_hits
+            .iter()
+            .any(|hit| hit.record_id.contains("remove_me.rs")),
+        "{before_hits:?}"
+    );
+
+    fs::remove_file(repo_root.join("src/remove_me.rs")).unwrap();
+    let summary = indexer.update_repo(repo_root).unwrap();
+    assert_eq!(summary.removed_files, 1);
+
+    let after_store = MatryoshkaStore::open(&db_path).unwrap();
+    let after_hits = after_store
+        .search_semantic_fts("obsolete_unique_marker", 8)
+        .unwrap();
+    assert!(after_hits.is_empty(), "{after_hits:?}");
+
+    let search = SearchEngine::new(after_store, DeterministicEmbedder::default());
+    let hits = search.search("obsolete_unique_marker", 5).unwrap();
+    assert!(
+        hits.iter().all(|hit| !hit.path.contains("remove_me.rs")),
+        "{hits:?}"
+    );
+}
+
+#[test]
+fn heuristic_parent_folder_cards_do_not_invent_rollup_summaries() {
+    let temp = tempfile::tempdir().unwrap();
+    let repo_root = temp.path();
+    fs::create_dir_all(repo_root.join("gateway/crates/service/src")).unwrap();
+    fs::write(
+        repo_root.join("gateway/crates/service/src/lib.rs"),
+        "pub fn route_request() -> &'static str { \"routed\" }\n",
+    )
+    .unwrap();
+
+    let db_path = temp.path().join("index.db");
+    let store = MatryoshkaStore::open(&db_path).unwrap();
+    let indexer = FullIndexer::new(
+        store.clone(),
+        HeuristicEnricher,
+        DeterministicEmbedder::default(),
+    );
+
+    indexer.index_repo(repo_root).unwrap();
+
+    let parent = store
+        .load_folder_card("gateway/crates/service")
+        .unwrap()
+        .unwrap();
+    assert!(parent.summary.is_empty(), "{}", parent.summary);
+    assert!(
+        parent.responsibility.is_empty(),
+        "{}",
+        parent.responsibility
+    );
+    assert!(
+        parent
+            .subareas
+            .iter()
+            .any(|subarea| subarea.id == "gateway/crates/service/src"
+                && subarea.responsibility.is_empty()),
+        "{:?}",
+        parent.subareas
+    );
+}
+
+#[test]
+fn storage_heuristics_do_not_leak_matryoshka_internals() {
+    let temp = tempfile::tempdir().unwrap();
+    let repo_root = temp.path();
+    fs::create_dir_all(repo_root.join("src/oauth")).unwrap();
+    fs::write(
+        repo_root.join("src/oauth/credential_store.rs"),
+        "pub struct CredentialStore;\nimpl CredentialStore {\n    pub fn save_token(&self) {}\n}\n",
+    )
+    .unwrap();
+
+    let db_path = temp.path().join("index.db");
+    let store = MatryoshkaStore::open(&db_path).unwrap();
+    let indexer = FullIndexer::new(
+        store.clone(),
+        HeuristicEnricher,
+        DeterministicEmbedder::default(),
+    );
+
+    indexer.index_repo(repo_root).unwrap();
+
+    let file_card = store
+        .load_file_card("src/oauth/credential_store.rs")
+        .unwrap()
+        .unwrap();
+    let folder_card = store.load_folder_card("src/oauth").unwrap().unwrap();
+    let card_text = format!(
+        "{}\n{}",
+        serde_json::to_string(&file_card).unwrap(),
+        serde_json::to_string(&folder_card).unwrap()
+    );
+
+    assert!(!card_text.contains("semantic records"), "{card_text}");
+    assert!(!card_text.contains("facts, cards"), "{card_text}");
+    assert!(
+        !card_text.contains("persistent storage and retrieval behavior"),
+        "{card_text}"
+    );
 }
 
 #[test]

@@ -287,6 +287,15 @@ pub struct SemanticRecord {
     pub metadata: BTreeMap<String, Value>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct LateInteractionVector {
+    pub record_id: String,
+    pub token: String,
+    pub ordinal: usize,
+    pub weight: f32,
+    pub embedding: Vec<f32>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum SemanticEntityType {

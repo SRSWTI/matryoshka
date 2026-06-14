@@ -23,6 +23,7 @@ pub trait CodeEnricher {
         &self,
         folder: &FolderFact,
         child_files: &[FileCard],
+        child_folders: &[FolderCard],
         context: &FolderEnrichmentContext,
     ) -> Result<FolderCard>;
     fn enrich_repo(&self, repo_root: &str, folders: &[FolderCard]) -> Result<RepoCard>;

@@ -1,8 +1,8 @@
 use anyhow::Result;
 use matryoshka_core_ir::{
     FileCard, FileEnrichmentContext, FileFact, FolderCard, FolderEnrichmentContext, ImportContext,
-    MatryoshkaProgressEvent, RelatedFileContext, RepoCard, RepositorySnapshot, SemanticEntityType,
-    SemanticRecord,
+    LateInteractionVector, MatryoshkaProgressEvent, RelatedFileContext, RepoCard,
+    RepositorySnapshot, SemanticEntityType, SemanticRecord,
 };
 use matryoshka_embed_client::Embedder;
 use matryoshka_enricher::CodeEnricher;
@@ -339,11 +339,27 @@ where
         let repo_card_record_count = usize::from(repo_card.is_some());
 
         raw_records.extend(card_records);
+        let record_ids = raw_records
+            .iter()
+            .map(|record| record.record_id.clone())
+            .collect::<Vec<_>>();
+        let late_vectors = match build_late_interaction_vectors(&self.embedder, &raw_records) {
+            Ok(vectors) => vectors,
+            Err(err) => {
+                return fail_with_progress("embedding_late_interaction", err, &mut progress);
+            }
+        };
         progress(MatryoshkaProgressEvent::WritingDatabase {
             records_written: Some(raw_records.len()),
         });
         if let Err(err) = self.store.replace_semantic_records(&raw_records) {
             return fail_with_progress("writing_database", err, &mut progress);
+        }
+        if let Err(err) = self
+            .store
+            .replace_late_interaction_vectors(&record_ids, &late_vectors)
+        {
+            return fail_with_progress("writing_late_interaction", err, &mut progress);
         }
 
         let summary = SemanticRebuildSummary {
@@ -530,6 +546,151 @@ fn semantic_embedding_input(record: &SemanticRecord) -> String {
         "title: {}\npath: {}\n{}",
         record.title, record.path, record.content
     )
+}
+
+fn late_interaction_enabled() -> bool {
+    std::env::var("MATRYOSHKA_LATE_INTERACTION")
+        .map(|value| !matches!(value.as_str(), "0" | "false" | "off"))
+        .unwrap_or(true)
+}
+
+fn late_interaction_max_tokens() -> usize {
+    std::env::var("MATRYOSHKA_LATE_MAX_TOKENS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(48)
+}
+
+fn late_interaction_embedding_input(token: &str) -> String {
+    format!("code search token: {token}")
+}
+
+fn build_late_interaction_vectors(
+    embedder: &impl Embedder,
+    records: &[SemanticRecord],
+) -> Result<Vec<LateInteractionVector>> {
+    if !late_interaction_enabled() || records.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let max_tokens = late_interaction_max_tokens();
+    let mut token_slots = Vec::<(String, usize, String, f32)>::new();
+    for record in records {
+        for (ordinal, (token, weight)) in late_interaction_tokens(record, max_tokens)
+            .into_iter()
+            .enumerate()
+        {
+            token_slots.push((record.record_id.clone(), ordinal, token, weight));
+        }
+    }
+
+    let mut vectors = Vec::with_capacity(token_slots.len());
+    for batch in token_slots.chunks(embedding_batch_size()) {
+        let inputs = batch
+            .iter()
+            .map(|(_, _, token, _)| late_interaction_embedding_input(token))
+            .collect::<Vec<_>>();
+        let embeddings = embedder.embed(&inputs)?;
+        for ((record_id, ordinal, token, weight), embedding) in batch.iter().zip(embeddings) {
+            vectors.push(LateInteractionVector {
+                record_id: record_id.clone(),
+                token: token.clone(),
+                ordinal: *ordinal,
+                weight: *weight,
+                embedding,
+            });
+        }
+    }
+    Ok(vectors)
+}
+
+fn late_interaction_tokens(record: &SemanticRecord, max_tokens: usize) -> Vec<(String, f32)> {
+    let mut weighted = BTreeMap::<String, f32>::new();
+    add_weighted_tokens(&record.path, 1.25, &mut weighted);
+    add_weighted_tokens(&record.title, 1.35, &mut weighted);
+    add_weighted_tokens(&record.content, 1.0, &mut weighted);
+    if matches!(
+        record.entity_type,
+        SemanticEntityType::Symbol | SemanticEntityType::Snippet
+    ) {
+        add_weighted_tokens(&record.entity_id, 1.4, &mut weighted);
+    }
+
+    let mut tokens = weighted.into_iter().collect::<Vec<_>>();
+    tokens.sort_by(|left, right| {
+        right
+            .1
+            .total_cmp(&left.1)
+            .then_with(|| left.0.cmp(&right.0))
+    });
+    tokens.truncate(max_tokens);
+    tokens
+}
+
+fn add_weighted_tokens(text: &str, weight: f32, out: &mut BTreeMap<String, f32>) {
+    for raw in text.split(|ch: char| !ch.is_alphanumeric() && ch != '_') {
+        for token in code_identifier_terms(raw) {
+            if is_late_stopword(&token) {
+                continue;
+            }
+            let entry = out.entry(token).or_insert(0.0);
+            *entry = (*entry + weight).min(4.0);
+        }
+    }
+}
+
+fn code_identifier_terms(raw: &str) -> Vec<String> {
+    let normalized = raw.trim_matches('_');
+    if normalized.len() < 2 {
+        return Vec::new();
+    }
+
+    let mut terms = Vec::new();
+    let lower = normalized.to_ascii_lowercase();
+    if lower.len() >= 2 {
+        terms.push(lower);
+    }
+    for part in normalized.split('_') {
+        let part = part.trim();
+        if part.len() >= 2 {
+            terms.extend(split_camel_terms(part));
+        }
+    }
+    terms.sort();
+    terms.dedup();
+    terms
+}
+
+fn split_camel_terms(value: &str) -> Vec<String> {
+    let mut terms = Vec::new();
+    let mut current = String::new();
+    let mut previous_lowercase = false;
+    for ch in value.chars() {
+        if ch.is_uppercase() && previous_lowercase && !current.is_empty() {
+            let term = current.to_ascii_lowercase();
+            if term.len() >= 2 {
+                terms.push(term);
+            }
+            current.clear();
+        }
+        previous_lowercase = ch.is_lowercase() || ch.is_ascii_digit();
+        current.push(ch);
+    }
+    let tail = current.to_ascii_lowercase();
+    if tail.len() >= 2 {
+        terms.push(tail);
+    }
+    terms
+}
+
+fn is_late_stopword(token: &str) -> bool {
+    const STOPWORDS: &[&str] = &[
+        "the", "and", "for", "with", "from", "into", "that", "this", "file", "code", "pub", "use",
+        "impl", "self", "let", "mut", "fn", "struct", "enum", "class", "def", "return", "none",
+        "some", "true", "false",
+    ];
+    STOPWORDS.contains(&token)
 }
 
 fn raw_semantic_records(snapshot: &RepositorySnapshot) -> Vec<SemanticRecord> {
@@ -1093,32 +1254,13 @@ where
             }
         }
 
-        let folder_cards = match enrichment_pool.install(|| {
-            let store = self.store.clone();
-            snapshot
-                .folders
-                .par_iter()
-                .filter(|folder| affected_folder_ids.contains(&folder.folder_id))
-                .map(|folder| {
-                    let child_cards = folder
-                        .child_file_ids
-                        .iter()
-                        .filter_map(|file_id| {
-                            file_cards
-                                .iter()
-                                .find(|card| card.file_id == *file_id)
-                                .cloned()
-                                .or_else(|| store.load_file_card(file_id).ok().flatten())
-                        })
-                        .collect::<Vec<_>>();
-                    let context = folder_contexts
-                        .get(&folder.folder_id)
-                        .cloned()
-                        .unwrap_or_else(empty_folder_context);
-                    self.enricher.enrich_folder(folder, &child_cards, &context)
-                })
-                .collect::<Result<Vec<_>>>()
-        }) {
+        let folder_cards = match self.collect_folder_cards_bottom_up(
+            snapshot,
+            affected_folder_ids,
+            &file_cards,
+            &folder_contexts,
+            &enrichment_pool,
+        ) {
             Ok(cards) => cards,
             Err(err) => return fail_with_progress("enriching_folder_cards", err, progress),
         };
@@ -1217,11 +1359,25 @@ where
         ) {
             return fail_with_progress("embedding_raw_records", err, progress);
         }
+        let raw_record_ids = raw_records
+            .iter()
+            .map(|record| record.record_id.clone())
+            .collect::<Vec<_>>();
+        let raw_late_vectors = match build_late_interaction_vectors(&self.embedder, &raw_records) {
+            Ok(vectors) => vectors,
+            Err(err) => return fail_with_progress("embedding_late_interaction", err, progress),
+        };
         progress(MatryoshkaProgressEvent::WritingDatabase {
             records_written: Some(raw_records.len()),
         });
         if let Err(err) = self.store.upsert_semantic_records(&raw_records) {
             return fail_with_progress("writing_database", err, progress);
+        }
+        if let Err(err) = self
+            .store
+            .replace_late_interaction_vectors(&raw_record_ids, &raw_late_vectors)
+        {
+            return fail_with_progress("writing_late_interaction", err, progress);
         }
 
         if let Err(err) = embed_selected_records(
@@ -1233,17 +1389,120 @@ where
         ) {
             return fail_with_progress("embedding_card_records", err, progress);
         }
+        let card_record_ids = card_records
+            .iter()
+            .map(|record| record.record_id.clone())
+            .collect::<Vec<_>>();
+        let card_late_vectors = match build_late_interaction_vectors(&self.embedder, &card_records)
+        {
+            Ok(vectors) => vectors,
+            Err(err) => return fail_with_progress("embedding_late_interaction", err, progress),
+        };
         progress(MatryoshkaProgressEvent::WritingDatabase {
             records_written: Some(card_records.len()),
         });
         if let Err(err) = self.store.upsert_semantic_records(&card_records) {
             return fail_with_progress("writing_database", err, progress);
         }
+        if let Err(err) = self
+            .store
+            .replace_late_interaction_vectors(&card_record_ids, &card_late_vectors)
+        {
+            return fail_with_progress("writing_late_interaction", err, progress);
+        }
 
         match self.store.load_all_semantic_records() {
             Ok(records) => Ok(records.len()),
             Err(err) => fail_with_progress("loading_semantic_records", err, progress),
         }
+    }
+
+    fn collect_folder_cards_bottom_up(
+        &self,
+        snapshot: &RepositorySnapshot,
+        affected_folder_ids: &BTreeSet<String>,
+        refreshed_file_cards: &[FileCard],
+        folder_contexts: &BTreeMap<String, FolderEnrichmentContext>,
+        enrichment_pool: &rayon::ThreadPool,
+    ) -> Result<Vec<FolderCard>> {
+        let existing_file_cards = self
+            .store
+            .load_all_file_cards()?
+            .into_iter()
+            .map(|card| (card.file_id.clone(), card))
+            .collect::<BTreeMap<_, _>>();
+        let refreshed_file_cards = refreshed_file_cards
+            .iter()
+            .map(|card| (card.file_id.clone(), card.clone()))
+            .collect::<BTreeMap<_, _>>();
+        let existing_folder_cards = self
+            .store
+            .load_all_folder_cards()?
+            .into_iter()
+            .map(|card| (card.folder_id.clone(), card))
+            .collect::<BTreeMap<_, _>>();
+        let folders_by_id = snapshot
+            .folders
+            .iter()
+            .map(|folder| (folder.folder_id.clone(), folder))
+            .collect::<BTreeMap<_, _>>();
+        let mut folders_by_depth = BTreeMap::<usize, Vec<&matryoshka_core_ir::FolderFact>>::new();
+
+        for folder_id in affected_folder_ids {
+            if let Some(folder) = folders_by_id.get(folder_id) {
+                folders_by_depth
+                    .entry(folder_depth(&folder.folder_id))
+                    .or_default()
+                    .push(*folder);
+            }
+        }
+
+        let mut refreshed_folder_cards = BTreeMap::<String, FolderCard>::new();
+        for (_, folders) in folders_by_depth.into_iter().rev() {
+            let cards = enrichment_pool.install(|| {
+                folders
+                    .par_iter()
+                    .map(|folder| {
+                        let child_file_cards = folder
+                            .child_file_ids
+                            .iter()
+                            .filter_map(|file_id| {
+                                refreshed_file_cards
+                                    .get(file_id)
+                                    .cloned()
+                                    .or_else(|| existing_file_cards.get(file_id).cloned())
+                            })
+                            .collect::<Vec<_>>();
+                        let child_folder_cards = folder
+                            .child_folder_ids
+                            .iter()
+                            .filter_map(|folder_id| {
+                                refreshed_folder_cards
+                                    .get(folder_id)
+                                    .cloned()
+                                    .or_else(|| existing_folder_cards.get(folder_id).cloned())
+                            })
+                            .collect::<Vec<_>>();
+                        let context = folder_contexts
+                            .get(&folder.folder_id)
+                            .cloned()
+                            .unwrap_or_else(empty_folder_context);
+                        self.enricher.enrich_folder(
+                            folder,
+                            &child_file_cards,
+                            &child_folder_cards,
+                            &context,
+                        )
+                    })
+                    .collect::<Result<Vec<_>>>()
+            })?;
+
+            for card in cards {
+                refreshed_folder_cards.insert(card.folder_id.clone(), card);
+            }
+        }
+
+        Ok(refreshed_folder_cards.into_values().collect())
     }
 
     fn collect_file_cards_with_progress(
@@ -1673,6 +1932,14 @@ fn empty_file_context(parent_folder_id: &str) -> FileEnrichmentContext {
         internal_imports: Vec::new(),
         external_imports: Vec::new(),
         imported_by_files: Vec::new(),
+    }
+}
+
+fn folder_depth(folder_id: &str) -> usize {
+    if folder_id == "repo" {
+        0
+    } else {
+        folder_id.split('/').count()
     }
 }
 

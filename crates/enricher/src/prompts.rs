@@ -186,14 +186,19 @@ pub fn folder_core_enrichment_prompt(
 pub fn folder_single_pass_enrichment_prompt(
     folder: &FolderFact,
     child_file_cards: &[Value],
+    child_folder_cards: &[Value],
     context: &FolderEnrichmentContext,
 ) -> Value {
     json!({
-        "task": "Create one production-quality FolderCard enrichment pass. Explain what responsibility this folder owns, what child files collaborate on, behavior intents, common behaviors, meaningful subareas, key entrypoints, edit intents, retrieval tags, when an agent should start here, and search phrases. Cross-folder dependency meanings are provided by deterministic graph analysis outside this LLM call, so do not return incoming_dependencies_meaning or outgoing_dependencies_meaning.",
+        "task": "Create one production-quality FolderCard enrichment pass. Explain what responsibility this folder owns, how direct child files and direct child folders collaborate, behavior intents, common behaviors, meaningful subareas, key entrypoints, edit intents, retrieval tags, when an agent should start here, and search phrases. Cross-folder dependency meanings are provided by deterministic graph analysis outside this LLM call, so do not return incoming_dependencies_meaning or outgoing_dependencies_meaning.",
         "output_rules": [
             "Return strict JSON only.",
             "Prefer quality over exhaustiveness.",
-            "Ground claims in folder context, graph context, and child file cards.",
+            "Ground every claim in folder context, graph context, child file cards, or child folder cards.",
+            "If this folder has no direct child files, summarize it from the child folder cards instead of guessing.",
+            "Do not invent files, configs, services, databases, or behaviors that are not present in the supplied child cards.",
+            "Do not use generic placeholder language such as central hub, repository operations, source behavior, or dependency coordination unless the supplied child cards prove it.",
+            "Do not mention Matryoshka, semantic records, facts, cards, or indexing internals unless the target repository itself contains that behavior.",
             "Keep the summary to 120-220 words.",
             "Keep responsibility to 2-4 sentences.",
             "Use 4-10 behavior_intents.",
@@ -222,6 +227,7 @@ pub fn folder_single_pass_enrichment_prompt(
         "folder_context": compact_folder_context(folder),
         "graph_context": compact_folder_graph_context(context),
         "child_file_cards": compact_child_file_cards(child_file_cards),
+        "child_folder_cards": compact_child_folder_cards(child_folder_cards),
     })
 }
 
@@ -384,6 +390,26 @@ fn compact_child_file_cards(child_file_cards: &[Value]) -> Vec<Value> {
                 "blast_radius": truncate_value_string_array(card.get("blast_radius"), 3, 140),
                 "agent_read_hints": truncate_value_string_array(card.get("agent_read_hints"), 3, 140),
                 "search_phrases": truncate_value_string_array(card.get("search_phrases"), 4, 80),
+            })
+        })
+        .collect()
+}
+
+fn compact_child_folder_cards(child_folder_cards: &[Value]) -> Vec<Value> {
+    child_folder_cards
+        .iter()
+        .take(12)
+        .map(|card| {
+            json!({
+                "folder_id": card.get("folder_id").cloned().unwrap_or(Value::Null),
+                "summary": truncate_value_str(card.get("summary"), 360),
+                "responsibility": truncate_value_str(card.get("responsibility"), 260),
+                "behavior_intents": truncate_value_string_array(card.get("behavior_intents"), 5, 100),
+                "common_behaviors": truncate_value_string_array(card.get("common_behaviors"), 5, 100),
+                "key_entrypoints": truncate_value_string_array(card.get("key_entrypoints"), 5, 120),
+                "retrieval_tags": truncate_value_string_array(card.get("retrieval_tags"), 8, 80),
+                "agent_guidance": truncate_value_string_array(card.get("agent_guidance"), 3, 140),
+                "search_phrases": truncate_value_string_array(card.get("search_phrases"), 4, 90),
             })
         })
         .collect()

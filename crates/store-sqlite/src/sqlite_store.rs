@@ -1,16 +1,24 @@
 use anyhow::{Context, Result};
 use matryoshka_core_ir::{
-    EdgeFact, FileCard, FileFact, FolderCard, FolderFact, RepoCard, RepositorySnapshot,
-    SemanticRecord, SymbolFact,
+    EdgeFact, FileCard, FileFact, FolderCard, FolderFact, LateInteractionVector, RepoCard,
+    RepositorySnapshot, SemanticRecord, SymbolFact,
 };
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
+use serde_json::Value;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone)]
 pub struct MatryoshkaStore {
     db_path: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SemanticFtsHit {
+    pub record_id: String,
+    pub rank: f32,
 }
 
 impl MatryoshkaStore {
@@ -84,6 +92,22 @@ impl MatryoshkaStore {
                 source_hash TEXT NOT NULL,
                 payload_json TEXT NOT NULL
             );
+            CREATE VIRTUAL TABLE IF NOT EXISTS semantic_records_fts USING fts5(
+                record_id UNINDEXED,
+                title,
+                path,
+                content,
+                metadata_text,
+                tokenize = "unicode61 tokenchars '_./-'"
+            );
+            CREATE TABLE IF NOT EXISTS semantic_late_vectors (
+                record_id TEXT NOT NULL,
+                token TEXT NOT NULL,
+                ordinal INTEGER NOT NULL,
+                weight REAL NOT NULL,
+                embedding_json TEXT NOT NULL,
+                PRIMARY KEY(record_id, ordinal)
+            );
             CREATE TABLE IF NOT EXISTS invalidation_queue (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 entity_id TEXT NOT NULL,
@@ -95,6 +119,7 @@ impl MatryoshkaStore {
             CREATE INDEX IF NOT EXISTS idx_edges_source ON edges(source_id);
             CREATE INDEX IF NOT EXISTS idx_edges_target ON edges(target_id);
             CREATE INDEX IF NOT EXISTS idx_semantic_entity ON semantic_records(entity_id);
+            CREATE INDEX IF NOT EXISTS idx_late_vectors_record ON semantic_late_vectors(record_id);
             "#,
         )?;
         Ok(())
@@ -104,7 +129,7 @@ impl MatryoshkaStore {
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
         tx.execute_batch(
-            "DELETE FROM files; DELETE FROM folders; DELETE FROM symbols; DELETE FROM edges; DELETE FROM semantic_records;",
+            "DELETE FROM files; DELETE FROM folders; DELETE FROM symbols; DELETE FROM edges; DELETE FROM semantic_records; DELETE FROM semantic_records_fts; DELETE FROM semantic_late_vectors;",
         )?;
         tx.execute(
             "INSERT OR REPLACE INTO meta(key, value) VALUES('repo_root', ?1)",
@@ -140,10 +165,7 @@ impl MatryoshkaStore {
             )?;
         }
         for record in &snapshot.semantic_records {
-            tx.execute(
-                "INSERT OR REPLACE INTO semantic_records(record_id, entity_id, entity_type, path, source_hash, payload_json) VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
-                params![record.record_id, record.entity_id, format!("{:?}", record.entity_type), record.path, record.source_hash, to_json(record)?],
-            )?;
+            upsert_semantic_record_tx(&tx, record)?;
         }
         tx.commit()?;
         Ok(())
@@ -180,10 +202,7 @@ impl MatryoshkaStore {
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
         for record in records {
-            tx.execute(
-                "INSERT OR REPLACE INTO semantic_records(record_id, entity_id, entity_type, path, source_hash, payload_json) VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
-                params![record.record_id, record.entity_id, format!("{:?}", record.entity_type), record.path, record.source_hash, to_json(record)?],
-            )?;
+            upsert_semantic_record_tx(&tx, record)?;
         }
         tx.commit()?;
         Ok(())
@@ -193,11 +212,10 @@ impl MatryoshkaStore {
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
         tx.execute("DELETE FROM semantic_records", [])?;
+        tx.execute("DELETE FROM semantic_records_fts", [])?;
+        tx.execute("DELETE FROM semantic_late_vectors", [])?;
         for record in records {
-            tx.execute(
-                "INSERT OR REPLACE INTO semantic_records(record_id, entity_id, entity_type, path, source_hash, payload_json) VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
-                params![record.record_id, record.entity_id, format!("{:?}", record.entity_type), record.path, record.source_hash, to_json(record)?],
-            )?;
+            upsert_semantic_record_tx(&tx, record)?;
         }
         tx.commit()?;
         Ok(())
@@ -268,6 +286,157 @@ impl MatryoshkaStore {
 
     pub fn load_all_semantic_records(&self) -> Result<Vec<SemanticRecord>> {
         self.load_all("SELECT payload_json FROM semantic_records ORDER BY record_id")
+    }
+
+    pub fn load_semantic_records_by_ids(
+        &self,
+        record_ids: &[String],
+    ) -> Result<Vec<SemanticRecord>> {
+        let conn = self.connect()?;
+        let mut records = Vec::new();
+        let mut stmt =
+            conn.prepare("SELECT payload_json FROM semantic_records WHERE record_id = ?1")?;
+        for record_id in record_ids {
+            let payload = stmt
+                .query_row([record_id], |row| row.get::<_, String>(0))
+                .optional()
+                .with_context(|| format!("failed to load semantic record {record_id}"))?;
+            if let Some(payload) = payload {
+                records.push(from_json(&payload)?);
+            }
+        }
+        Ok(records)
+    }
+
+    pub fn search_semantic_fts(&self, query: &str, limit: usize) -> Result<Vec<SemanticFtsHit>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let Some(match_query) = semantic_fts_query(query) else {
+            return Ok(Vec::new());
+        };
+        let conn = self.connect()?;
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT record_id, bm25(semantic_records_fts) AS rank
+            FROM semantic_records_fts
+            WHERE semantic_records_fts MATCH ?1
+            ORDER BY rank
+            LIMIT ?2
+            "#,
+        )?;
+        let rows = stmt.query_map(params![match_query, limit as i64], |row| {
+            Ok(SemanticFtsHit {
+                record_id: row.get(0)?,
+                rank: row.get::<_, f64>(1)? as f32,
+            })
+        })?;
+        let mut hits = Vec::new();
+        for row in rows {
+            hits.push(row?);
+        }
+        Ok(hits)
+    }
+
+    pub fn rebuild_semantic_fts(&self) -> Result<usize> {
+        let mut conn = self.connect()?;
+        let tx = conn.transaction()?;
+        tx.execute("DELETE FROM semantic_records_fts", [])?;
+        let mut count = 0usize;
+        {
+            let mut stmt =
+                tx.prepare("SELECT payload_json FROM semantic_records ORDER BY record_id")?;
+            let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+            for row in rows {
+                let record: SemanticRecord = from_json(&row?)?;
+                upsert_semantic_fts_tx(&tx, &record)?;
+                count += 1;
+            }
+        }
+        tx.commit()?;
+        Ok(count)
+    }
+
+    pub fn replace_late_interaction_vectors(
+        &self,
+        record_ids: &[String],
+        vectors: &[LateInteractionVector],
+    ) -> Result<()> {
+        if record_ids.is_empty() && vectors.is_empty() {
+            return Ok(());
+        }
+        let mut conn = self.connect()?;
+        let tx = conn.transaction()?;
+        {
+            let mut delete_stmt =
+                tx.prepare("DELETE FROM semantic_late_vectors WHERE record_id = ?1")?;
+            for record_id in record_ids {
+                delete_stmt.execute([record_id])?;
+            }
+        }
+        {
+            let mut insert_stmt = tx.prepare(
+                r#"
+                INSERT OR REPLACE INTO semantic_late_vectors(record_id, token, ordinal, weight, embedding_json)
+                VALUES(?1, ?2, ?3, ?4, ?5)
+                "#,
+            )?;
+            for vector in vectors {
+                insert_stmt.execute(params![
+                    vector.record_id,
+                    vector.token,
+                    vector.ordinal as i64,
+                    vector.weight,
+                    to_json(&vector.embedding)?,
+                ])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn load_late_interaction_vectors(
+        &self,
+        record_ids: &[String],
+    ) -> Result<BTreeMap<String, Vec<LateInteractionVector>>> {
+        if record_ids.is_empty() {
+            return Ok(BTreeMap::new());
+        }
+        let conn = self.connect()?;
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT token, ordinal, weight, embedding_json
+            FROM semantic_late_vectors
+            WHERE record_id = ?1
+            ORDER BY ordinal
+            "#,
+        )?;
+        let mut by_record = BTreeMap::<String, Vec<LateInteractionVector>>::new();
+        for record_id in record_ids {
+            let rows = stmt.query_map([record_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, f32>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })?;
+            for row in rows {
+                let (token, ordinal, weight, embedding_json) = row?;
+                let embedding = from_json::<Vec<f32>>(&embedding_json)?;
+                by_record
+                    .entry(record_id.clone())
+                    .or_default()
+                    .push(LateInteractionVector {
+                        record_id: record_id.clone(),
+                        token,
+                        ordinal: ordinal as usize,
+                        weight,
+                        embedding,
+                    });
+            }
+        }
+        Ok(by_record)
     }
 
     pub fn load_all_file_cards(&self) -> Result<Vec<FileCard>> {
@@ -359,11 +528,22 @@ impl MatryoshkaStore {
     }
 
     pub fn delete_semantic_records_for_paths(&self, paths: &[String]) -> Result<()> {
-        delete_many(
-            &self.connect()?,
-            "DELETE FROM semantic_records WHERE path = ?1",
-            paths,
-        )
+        let mut conn = self.connect()?;
+        let tx = conn.transaction()?;
+        {
+            let mut late_stmt = tx.prepare(
+                "DELETE FROM semantic_late_vectors WHERE record_id IN (SELECT record_id FROM semantic_records WHERE path = ?1)",
+            )?;
+            let mut record_stmt = tx.prepare("DELETE FROM semantic_records WHERE path = ?1")?;
+            let mut fts_stmt = tx.prepare("DELETE FROM semantic_records_fts WHERE path = ?1")?;
+            for path in paths {
+                late_stmt.execute([path])?;
+                record_stmt.execute([path])?;
+                fts_stmt.execute([path])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     pub fn upsert_files(&self, files: &[FileFact]) -> Result<()> {
@@ -497,4 +677,82 @@ fn delete_many(conn: &Connection, sql: &str, values: &[String]) -> Result<()> {
         stmt.execute([value])?;
     }
     Ok(())
+}
+
+fn upsert_semantic_record_tx(
+    tx: &rusqlite::Transaction<'_>,
+    record: &SemanticRecord,
+) -> Result<()> {
+    tx.execute(
+        "INSERT OR REPLACE INTO semantic_records(record_id, entity_id, entity_type, path, source_hash, payload_json) VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
+        params![record.record_id, record.entity_id, format!("{:?}", record.entity_type), record.path, record.source_hash, to_json(record)?],
+    )?;
+    upsert_semantic_fts_tx(tx, record)?;
+    Ok(())
+}
+
+fn upsert_semantic_fts_tx(tx: &rusqlite::Transaction<'_>, record: &SemanticRecord) -> Result<()> {
+    tx.execute(
+        "DELETE FROM semantic_records_fts WHERE record_id = ?1",
+        params![record.record_id],
+    )?;
+    tx.execute(
+        "INSERT INTO semantic_records_fts(record_id, title, path, content, metadata_text) VALUES(?1, ?2, ?3, ?4, ?5)",
+        params![
+            record.record_id,
+            record.title,
+            record.path,
+            record.content,
+            semantic_metadata_text(&record.metadata),
+        ],
+    )?;
+    Ok(())
+}
+
+fn semantic_metadata_text(metadata: &std::collections::BTreeMap<String, Value>) -> String {
+    fn collect(value: &Value, out: &mut Vec<String>) {
+        match value {
+            Value::String(text) => out.push(text.clone()),
+            Value::Array(items) => {
+                for item in items {
+                    collect(item, out);
+                }
+            }
+            Value::Object(map) => {
+                for (key, value) in map {
+                    out.push(key.clone());
+                    collect(value, out);
+                }
+            }
+            Value::Number(number) => out.push(number.to_string()),
+            Value::Bool(value) => out.push(value.to_string()),
+            Value::Null => {}
+        }
+    }
+
+    let mut parts = Vec::new();
+    for (key, value) in metadata {
+        parts.push(key.clone());
+        collect(value, &mut parts);
+    }
+    parts.join(" ")
+}
+
+fn semantic_fts_query(query: &str) -> Option<String> {
+    let mut terms = Vec::new();
+    for token in query.split(|ch: char| {
+        !(ch.is_alphanumeric() || ch == '_' || ch == '/' || ch == '.' || ch == '-')
+    }) {
+        let token = token.trim_matches(|ch: char| {
+            !(ch.is_alphanumeric() || ch == '_' || ch == '/' || ch == '.' || ch == '-')
+        });
+        if token.len() < 2 {
+            continue;
+        }
+        let escaped = token.replace('"', "\"\"");
+        terms.push(format!("\"{escaped}\""));
+    }
+    terms.sort();
+    terms.dedup();
+    (!terms.is_empty()).then(|| terms.join(" OR "))
 }

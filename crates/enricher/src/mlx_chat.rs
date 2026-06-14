@@ -19,6 +19,8 @@ use sha2::{Digest, Sha256};
 use std::io::{BufRead, BufReader};
 use std::time::Duration;
 
+const CHAT_COMPLETION_ATTEMPTS: usize = 3;
+
 #[derive(Debug, Clone)]
 pub struct MlxChatEnricher {
     client: Client,
@@ -121,12 +123,37 @@ impl MlxChatEnricher {
     where
         T: JsonSchema + DeserializeOwned,
     {
-        let value = self.complete_json_with_schema(
-            prompt,
-            json_schema_payload::<T>(name, description),
-            max_tokens,
-        )?;
-        serde_json::from_value(value).context("structured response did not match target type")
+        let response_format = json_schema_payload::<T>(name, description);
+        let mut attempt = 1;
+        let mut previous_errors = Vec::new();
+        loop {
+            let result = self
+                .complete_json_with_schema(prompt.clone(), response_format.clone(), max_tokens)
+                .and_then(|value| {
+                    serde_json::from_value(value)
+                        .context("structured response did not match target type")
+                });
+            match result {
+                Ok(value) => return Ok(value),
+                Err(error) if attempt < CHAT_COMPLETION_ATTEMPTS => {
+                    previous_errors.push(format!("attempt {attempt}: {error:#}"));
+                    std::thread::sleep(chat_retry_delay(attempt));
+                    attempt += 1;
+                }
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        let previous = if previous_errors.is_empty() {
+                            String::new()
+                        } else {
+                            format!("; previous errors: {}", previous_errors.join(" | "))
+                        };
+                        format!(
+                            "MLX structured chat failed after {attempt} attempts for schema {name}{previous}"
+                        )
+                    });
+                }
+            }
+        }
     }
 }
 
@@ -140,30 +167,37 @@ impl CodeEnricher for MlxChatEnricher {
         let mut card = HeuristicEnricher.enrich_file(file, symbols, context)?;
         let heuristic_risk_notes = card.risk_notes.clone();
         let mut prompt_hashes = Vec::new();
-        let is_facade = is_thin_facade(file, symbols, context);
 
-        if !is_facade {
-            let prompt = file_single_pass_enrichment_prompt(file, symbols, context);
-            prompt_hashes.push(hash_json(&prompt)?);
-            let draft = self.complete_typed::<FileCardSinglePassDraft>(
+        let prompt = file_single_pass_enrichment_prompt(file, symbols, context);
+        prompt_hashes.push(hash_json(&prompt)?);
+        let input_hash = hash_json(&json!(prompt_hashes))?;
+        let draft = match self
+            .complete_typed::<FileCardSinglePassDraft>(
                 prompt,
                 "file_card_single_pass_draft",
                 "Single-pass behavioral, retrieval, and editing-risk enrichment for a code-intelligence file card",
                 2600,
-            );
-            match draft {
-                Ok(draft) => apply_file_single_pass_draft(&mut card, draft, file, symbols, context),
-                Err(error) => card.risk_notes.push(format!(
-                    "MLX file enrichment degraded to heuristic synthesis: {error:#}"
-                )),
+            )
+            .with_context(|| format!("MLX file enrichment failed for {}", file.path))
+        {
+            Ok(draft) => draft,
+            Err(error) => {
+                return empty_file_card_after_enrichment_failure(
+                    card,
+                    file,
+                    input_hash,
+                    &self.model,
+                    error,
+                );
             }
-        }
+        };
+        apply_file_single_pass_draft(&mut card, draft, file, symbols, context);
 
         card.risk_notes =
             remove_heuristic_placeholder_notes(card.risk_notes, &heuristic_risk_notes);
         card.provenance = Provenance {
             source_hash: file.source_hash.clone(),
-            input_hash: Some(hash_json(&json!(prompt_hashes))?),
+            input_hash: Some(input_hash),
             model: Some(self.model.clone()),
             schema_version: matryoshka_core_ir::CARD_SCHEMA_VERSION,
             generated_at: Utc::now(),
@@ -180,107 +214,142 @@ impl CodeEnricher for MlxChatEnricher {
         &self,
         folder: &FolderFact,
         child_files: &[FileCard],
+        child_folders: &[FolderCard],
         context: &FolderEnrichmentContext,
     ) -> Result<FolderCard> {
-        let mut card = HeuristicEnricher.enrich_folder(folder, child_files, context)?;
+        if child_files.is_empty() && child_folders.is_empty() {
+            return empty_folder_card_after_enrichment_failure(
+                folder,
+                child_files,
+                child_folders,
+                context,
+                None,
+                &self.model,
+                format!(
+                    "folder {} has no child file cards or child folder cards to ground MLX enrichment",
+                    folder.folder_id
+                ),
+            );
+        }
+
+        if child_files.is_empty() {
+            return roll_up_folder_card_from_child_folders(
+                folder,
+                child_folders,
+                context,
+                &self.model,
+            );
+        }
+
         let child_values = child_files
+            .iter()
+            .map(serde_json::to_value)
+            .collect::<Result<Vec<_>, _>>()?;
+        let child_folder_values = child_folders
             .iter()
             .map(serde_json::to_value)
             .collect::<Result<Vec<_>, _>>()?;
         let mut prompt_hashes = Vec::new();
 
-        let prompt = folder_single_pass_enrichment_prompt(folder, &child_values, context);
-        prompt_hashes.push(hash_json(&prompt)?);
-        let draft = self.complete_typed::<FolderCardSinglePassDraft>(
-            prompt,
-            "folder_card_single_pass_draft",
-            "Single-pass responsibility, retrieval, and editing-risk enrichment for a code-intelligence folder card",
-            2200,
+        let prompt = folder_single_pass_enrichment_prompt(
+            folder,
+            &child_values,
+            &child_folder_values,
+            context,
         );
-        match draft {
-            Ok(draft) => {
-                let anchors = folder_anchor_strings(folder, child_files, context, &card);
-                card.summary = draft.summary;
-                card.responsibility = draft.responsibility;
-                let behavior_intents =
-                    sanitize_grounded_strings(draft.behavior_intents, &anchors, 12);
-                if !behavior_intents.is_empty() {
-                    card.behavior_intents =
-                        merge_preferred_strings(behavior_intents, card.behavior_intents, 12);
-                }
-                let common_behaviors =
-                    sanitize_grounded_strings(draft.common_behaviors, &anchors, 12);
-                if !common_behaviors.is_empty() {
-                    card.common_behaviors =
-                        merge_preferred_strings(common_behaviors, card.common_behaviors, 12);
-                }
-                let key_entrypoints =
-                    sanitize_key_entrypoints(draft.key_entrypoints, folder, child_files, 8);
-                if !key_entrypoints.is_empty() {
-                    card.key_entrypoints = key_entrypoints;
-                }
-                let edit_intents = sanitize_grounded_strings(draft.edit_intents, &anchors, 12);
-                if !edit_intents.is_empty() {
-                    card.edit_intents =
-                        merge_preferred_strings(edit_intents, card.edit_intents, 12);
-                }
-                let retrieval_tags = sanitize_grounded_tags(
-                    sanitize_retrieval_tags(draft.retrieval_tags, 24),
-                    &anchors,
-                    &FileFact {
-                        file_id: folder.folder_id.clone(),
-                        path: folder.path.clone(),
-                        name: folder.name.clone(),
-                        language: "folder".into(),
-                        parent_folder_id: folder
-                            .parent_folder_id
-                            .clone()
-                            .unwrap_or_else(|| "repo".into()),
-                        source_hash: String::new(),
-                        line_count: 0,
-                        imports: Vec::new(),
-                        snippets: Vec::new(),
-                    },
-                    folder.folder_id.as_str(),
-                );
-                if !retrieval_tags.is_empty() {
-                    card.retrieval_tags =
-                        merge_retrieval_tags(retrieval_tags, card.retrieval_tags, 24);
-                }
-                let contains_kinds_of_files =
-                    sanitize_string_items(draft.contains_kinds_of_files, 8);
-                if !contains_kinds_of_files.is_empty() {
-                    card.contains_kinds_of_files = contains_kinds_of_files;
-                }
-                let subareas = sanitize_subareas(draft.subareas, folder);
-                if !subareas.is_empty() {
-                    card.subareas = subareas;
-                }
-                let agent_guidance = sanitize_grounded_strings(draft.agent_guidance, &anchors, 6);
-                if !agent_guidance.is_empty() {
-                    card.agent_guidance =
-                        merge_preferred_strings(agent_guidance, card.agent_guidance, 6);
-                }
-                let search_phrases = sanitize_search_phrases(draft.search_phrases, &anchors, 12);
-                if !search_phrases.is_empty() {
-                    card.search_phrases =
-                        merge_preferred_strings(search_phrases, card.search_phrases, 12);
-                }
-            }
+        prompt_hashes.push(hash_json(&prompt)?);
+        let input_hash = hash_json(&json!(prompt_hashes))?;
+        let draft = match self
+            .complete_typed::<FolderCardSinglePassDraft>(
+                prompt,
+                "folder_card_single_pass_draft",
+                "Single-pass responsibility, retrieval, and editing-risk enrichment for a code-intelligence folder card",
+                2200,
+            )
+            .with_context(|| format!("MLX folder enrichment failed for {}", folder.folder_id))
+        {
+            Ok(draft) => draft,
             Err(error) => {
-                card.agent_guidance.push(format!(
-                    "MLX folder enrichment degraded to heuristic synthesis: {error:#}"
-                ));
+                return empty_folder_card_after_enrichment_failure(
+                    folder,
+                    child_files,
+                    child_folders,
+                    context,
+                    Some(input_hash),
+                    &self.model,
+                    format!("{error:#}"),
+                );
             }
-        }
+        };
+
+        let mut card = FolderCard {
+            folder_id: folder.folder_id.clone(),
+            summary: draft.summary.trim().to_string(),
+            responsibility: draft.responsibility.trim().to_string(),
+            behavior_intents: Vec::new(),
+            edit_intents: Vec::new(),
+            retrieval_tags: Vec::new(),
+            contains_kinds_of_files: sanitize_string_items(draft.contains_kinds_of_files, 8),
+            incoming_dependencies_meaning: context
+                .incoming_dependencies
+                .iter()
+                .take(12)
+                .map(|item| item.detail.clone())
+                .collect(),
+            outgoing_dependencies_meaning: context
+                .outgoing_dependencies
+                .iter()
+                .take(12)
+                .map(|item| item.detail.clone())
+                .collect(),
+            key_entrypoints: Vec::new(),
+            common_behaviors: Vec::new(),
+            subareas: sanitize_subareas(draft.subareas, folder),
+            agent_guidance: Vec::new(),
+            search_phrases: Vec::new(),
+            provenance: Provenance::source_only(""),
+        };
+
+        let anchors = folder_anchor_strings(folder, child_files, child_folders, context, &card);
+        card.behavior_intents = sanitize_grounded_strings(draft.behavior_intents, &anchors, 12);
+        card.common_behaviors = sanitize_grounded_strings(draft.common_behaviors, &anchors, 12);
+        card.key_entrypoints =
+            sanitize_key_entrypoints(draft.key_entrypoints, folder, child_files, child_folders, 8);
+        card.edit_intents = sanitize_grounded_strings(draft.edit_intents, &anchors, 12);
+        card.retrieval_tags = sanitize_grounded_tags(
+            sanitize_retrieval_tags(draft.retrieval_tags, 24),
+            &anchors,
+            &FileFact {
+                file_id: folder.folder_id.clone(),
+                path: folder.path.clone(),
+                name: folder.name.clone(),
+                language: "folder".into(),
+                parent_folder_id: folder
+                    .parent_folder_id
+                    .clone()
+                    .unwrap_or_else(|| "repo".into()),
+                source_hash: String::new(),
+                line_count: 0,
+                imports: Vec::new(),
+                snippets: Vec::new(),
+            },
+            folder.folder_id.as_str(),
+        );
+        card.agent_guidance = sanitize_grounded_strings(draft.agent_guidance, &anchors, 6);
+        card.search_phrases = sanitize_search_phrases(draft.search_phrases, &anchors, 12);
 
         card.provenance = Provenance {
             source_hash: child_files
                 .iter()
                 .map(|card| card.provenance.source_hash.as_str())
+                .chain(
+                    child_folders
+                        .iter()
+                        .map(|card| card.provenance.source_hash.as_str()),
+                )
                 .collect::<Vec<_>>()
                 .join(":"),
-            input_hash: Some(hash_json(&json!(prompt_hashes))?),
+            input_hash: Some(input_hash),
             model: Some(self.model.clone()),
             schema_version: matryoshka_core_ir::CARD_SCHEMA_VERSION,
             generated_at: Utc::now(),
@@ -293,6 +362,284 @@ impl CodeEnricher for MlxChatEnricher {
         card.provenance.model = Some(self.model.clone());
         Ok(card)
     }
+}
+
+fn chat_retry_delay(attempt: usize) -> Duration {
+    Duration::from_millis(500 * attempt as u64)
+}
+
+fn empty_file_card_after_enrichment_failure(
+    mut card: FileCard,
+    file: &FileFact,
+    input_hash: String,
+    model: &str,
+    error: anyhow::Error,
+) -> Result<FileCard> {
+    card.summary.clear();
+    card.role.clear();
+    card.primary_behaviors.clear();
+    card.behavior_intents.clear();
+    card.edit_intents.clear();
+    card.owns_behaviors.clear();
+    card.side_effects.clear();
+    card.agent_read_hints.clear();
+    card.search_phrases.clear();
+    card.risk_notes = vec![format!(
+        "MLX file enrichment failed after retries; summary intentionally left empty: {error:#}"
+    )];
+    card.provenance = Provenance {
+        source_hash: file.source_hash.clone(),
+        input_hash: Some(input_hash),
+        model: Some(model.to_string()),
+        schema_version: matryoshka_core_ir::CARD_SCHEMA_VERSION,
+        generated_at: Utc::now(),
+    };
+    Ok(card)
+}
+
+fn empty_folder_card_after_enrichment_failure(
+    folder: &FolderFact,
+    child_files: &[FileCard],
+    child_folders: &[FolderCard],
+    context: &FolderEnrichmentContext,
+    input_hash: Option<String>,
+    model: &str,
+    message: impl Into<String>,
+) -> Result<FolderCard> {
+    Ok(FolderCard {
+        folder_id: folder.folder_id.clone(),
+        summary: String::new(),
+        responsibility: String::new(),
+        behavior_intents: Vec::new(),
+        edit_intents: Vec::new(),
+        retrieval_tags: structural_folder_tags(folder, child_files, child_folders),
+        contains_kinds_of_files: child_files
+            .iter()
+            .map(|card| card.file_id.clone())
+            .take(12)
+            .collect(),
+        incoming_dependencies_meaning: context
+            .incoming_dependencies
+            .iter()
+            .take(12)
+            .map(|item| item.detail.clone())
+            .collect(),
+        outgoing_dependencies_meaning: context
+            .outgoing_dependencies
+            .iter()
+            .take(12)
+            .map(|item| item.detail.clone())
+            .collect(),
+        key_entrypoints: context
+            .representative_child_files
+            .iter()
+            .map(|item| item.path.clone())
+            .chain(child_folders.iter().map(|card| card.folder_id.clone()))
+            .take(8)
+            .collect(),
+        common_behaviors: Vec::new(),
+        subareas: subareas_from_child_folders(folder, child_folders),
+        agent_guidance: vec![message.into()],
+        search_phrases: Vec::new(),
+        provenance: Provenance {
+            source_hash: folder_source_hash(child_files, child_folders),
+            input_hash,
+            model: Some(model.to_string()),
+            schema_version: matryoshka_core_ir::CARD_SCHEMA_VERSION,
+            generated_at: Utc::now(),
+        },
+    })
+}
+
+fn roll_up_folder_card_from_child_folders(
+    folder: &FolderFact,
+    child_folders: &[FolderCard],
+    context: &FolderEnrichmentContext,
+    model: &str,
+) -> Result<FolderCard> {
+    let child_summaries = child_folders
+        .iter()
+        .filter_map(|card| child_folder_rollup_line(card))
+        .take(12)
+        .collect::<Vec<_>>();
+    let child_responsibilities = child_folders
+        .iter()
+        .filter_map(|card| {
+            first_non_empty([card.responsibility.as_str(), card.summary.as_str()])
+                .map(|text| format!("{}: {text}", card.folder_id))
+        })
+        .take(12)
+        .collect::<Vec<_>>();
+    let input_hash = hash_json(&json!({
+        "folder_id": folder.folder_id,
+        "child_folders": child_folders
+            .iter()
+            .map(|card| json!({
+                "folder_id": &card.folder_id,
+                "summary": &card.summary,
+                "responsibility": &card.responsibility,
+                "common_behaviors": &card.common_behaviors,
+                "provenance": &card.provenance,
+            }))
+            .collect::<Vec<_>>(),
+    }))?;
+
+    Ok(FolderCard {
+        folder_id: folder.folder_id.clone(),
+        summary: child_summaries.join("\n"),
+        responsibility: child_responsibilities.join("\n"),
+        behavior_intents: sanitize_string_items(
+            child_folders
+                .iter()
+                .flat_map(|card| card.behavior_intents.clone())
+                .collect(),
+            16,
+        ),
+        edit_intents: sanitize_string_items(
+            child_folders
+                .iter()
+                .flat_map(|card| card.edit_intents.clone())
+                .collect(),
+            16,
+        ),
+        retrieval_tags: structural_folder_tags(folder, &[], child_folders),
+        contains_kinds_of_files: sanitize_string_items(
+            child_folders
+                .iter()
+                .flat_map(|card| card.contains_kinds_of_files.clone())
+                .collect(),
+            16,
+        ),
+        incoming_dependencies_meaning: context
+            .incoming_dependencies
+            .iter()
+            .take(12)
+            .map(|item| item.detail.clone())
+            .collect(),
+        outgoing_dependencies_meaning: context
+            .outgoing_dependencies
+            .iter()
+            .take(12)
+            .map(|item| item.detail.clone())
+            .collect(),
+        key_entrypoints: sanitize_string_items(
+            child_folders
+                .iter()
+                .flat_map(|card| card.key_entrypoints.clone())
+                .chain(child_folders.iter().map(|card| card.folder_id.clone()))
+                .collect(),
+            12,
+        ),
+        common_behaviors: sanitize_string_items(
+            child_folders
+                .iter()
+                .flat_map(|card| card.common_behaviors.clone())
+                .collect(),
+            16,
+        ),
+        subareas: subareas_from_child_folders(folder, child_folders),
+        agent_guidance: sanitize_string_items(
+            child_folders
+                .iter()
+                .flat_map(|card| card.agent_guidance.clone())
+                .collect(),
+            8,
+        ),
+        search_phrases: sanitize_string_items(
+            child_folders
+                .iter()
+                .flat_map(|card| card.search_phrases.clone())
+                .collect(),
+            16,
+        ),
+        provenance: Provenance {
+            source_hash: folder_source_hash(&[], child_folders),
+            input_hash: Some(input_hash),
+            model: Some(model.to_string()),
+            schema_version: matryoshka_core_ir::CARD_SCHEMA_VERSION,
+            generated_at: Utc::now(),
+        },
+    })
+}
+
+fn child_folder_rollup_line(card: &FolderCard) -> Option<String> {
+    first_non_empty([card.summary.as_str(), card.responsibility.as_str()])
+        .map(|text| format!("{}: {text}", card.folder_id))
+}
+
+fn first_non_empty<'a>(items: impl IntoIterator<Item = &'a str>) -> Option<&'a str> {
+    items
+        .into_iter()
+        .map(str::trim)
+        .find(|item| !item.is_empty())
+}
+
+fn folder_source_hash(child_files: &[FileCard], child_folders: &[FolderCard]) -> String {
+    child_files
+        .iter()
+        .map(|card| card.provenance.source_hash.as_str())
+        .chain(
+            child_folders
+                .iter()
+                .map(|card| card.provenance.source_hash.as_str()),
+        )
+        .collect::<Vec<_>>()
+        .join(":")
+}
+
+fn structural_folder_tags(
+    folder: &FolderFact,
+    child_files: &[FileCard],
+    child_folders: &[FolderCard],
+) -> Vec<String> {
+    sanitize_retrieval_tags(
+        std::iter::once("entity:folder".to_string())
+            .chain(std::iter::once(format!(
+                "path:{}",
+                folder.path.replace('/', "-")
+            )))
+            .chain(std::iter::once(format!(
+                "folder:{}",
+                folder.folder_id.replace('/', "-")
+            )))
+            .chain(
+                child_files
+                    .iter()
+                    .flat_map(|card| card.retrieval_tags.clone()),
+            )
+            .chain(
+                child_folders
+                    .iter()
+                    .flat_map(|card| card.retrieval_tags.clone()),
+            )
+            .collect(),
+        24,
+    )
+}
+
+fn subareas_from_child_folders(
+    folder: &FolderFact,
+    child_folders: &[FolderCard],
+) -> Vec<SubareaSummary> {
+    folder
+        .child_folder_ids
+        .iter()
+        .map(|id| {
+            let responsibility = child_folders
+                .iter()
+                .find(|card| card.folder_id == *id)
+                .and_then(|card| {
+                    first_non_empty([card.responsibility.as_str(), card.summary.as_str()])
+                        .map(str::to_string)
+                })
+                .unwrap_or_default();
+            SubareaSummary {
+                id: id.clone(),
+                name: id.clone(),
+                responsibility,
+            }
+        })
+        .collect()
 }
 
 #[derive(Debug, Serialize)]
@@ -390,19 +737,6 @@ struct FolderCardSinglePassDraft {
     search_phrases: Vec<String>,
 }
 
-fn is_thin_facade(
-    file: &FileFact,
-    symbols: &[SymbolFact],
-    context: &FileEnrichmentContext,
-) -> bool {
-    (file.name == "lib.rs" || file.name == "mod.rs")
-        && file.line_count <= 20
-        && symbols.is_empty()
-        && context.internal_imports.is_empty()
-        && context.external_imports.is_empty()
-        && !context.sibling_file_ids.is_empty()
-}
-
 fn apply_file_single_pass_draft(
     card: &mut FileCard,
     draft: FileCardSinglePassDraft,
@@ -416,6 +750,7 @@ fn apply_file_single_pass_draft(
     if !primary_behaviors.is_empty() {
         card.primary_behaviors = primary_behaviors;
     }
+    card.owns_behaviors = card.primary_behaviors.iter().take(6).cloned().collect();
 
     let anchors = file_anchor_strings(file, symbols, context, card);
     let behavior_intents = sanitize_grounded_strings(draft.behavior_intents, &anchors, 12);
@@ -520,6 +855,7 @@ fn file_anchor_strings(
 fn folder_anchor_strings(
     folder: &FolderFact,
     child_files: &[FileCard],
+    child_folders: &[FolderCard],
     context: &FolderEnrichmentContext,
     card: &FolderCard,
 ) -> Vec<String> {
@@ -539,6 +875,17 @@ fn folder_anchor_strings(
         child_files
             .iter()
             .flat_map(|file| file.primary_behaviors.clone()),
+    );
+    anchors.extend(child_folders.iter().map(|folder| folder.folder_id.clone()));
+    anchors.extend(
+        child_folders
+            .iter()
+            .flat_map(|folder| [folder.summary.clone(), folder.responsibility.clone()]),
+    );
+    anchors.extend(
+        child_folders
+            .iter()
+            .flat_map(|folder| folder.common_behaviors.clone()),
     );
     anchors.extend(
         context
@@ -787,12 +1134,15 @@ fn sanitize_key_entrypoints(
     items: Vec<String>,
     folder: &FolderFact,
     child_files: &[FileCard],
+    child_folders: &[FolderCard],
     limit: usize,
 ) -> Vec<String> {
     let allowed = child_files
         .iter()
         .map(|card| card.file_id.as_str())
         .chain(folder.child_file_ids.iter().map(|id| id.as_str()))
+        .chain(child_folders.iter().map(|card| card.folder_id.as_str()))
+        .chain(folder.child_folder_ids.iter().map(|id| id.as_str()))
         .collect::<std::collections::BTreeSet<_>>();
     sanitize_string_items(items, limit * 2)
         .into_iter()
@@ -1076,6 +1426,74 @@ mod tests {
         let message = format!("{error:#}");
         assert!(message.contains("cache exploded"));
         assert!(message.contains("server_error"));
+    }
+
+    #[test]
+    fn parent_folder_rollup_uses_child_folder_cards_without_placeholder_prose() {
+        let folder = FolderFact {
+            folder_id: "gateway".into(),
+            path: "gateway".into(),
+            name: "gateway".into(),
+            parent_folder_id: None,
+            child_file_ids: Vec::new(),
+            child_folder_ids: vec!["gateway/apps".into(), "gateway/crates".into()],
+        };
+        let context = FolderEnrichmentContext {
+            parent_folder_id: None,
+            incoming_dependencies: Vec::new(),
+            outgoing_dependencies: Vec::new(),
+            representative_child_files: Vec::new(),
+        };
+        let child_folders = vec![
+            test_folder_card(
+                "gateway/apps",
+                "Runs the gateway daemon entrypoint and process wiring.",
+                "Owns daemon startup.",
+            ),
+            test_folder_card(
+                "gateway/crates",
+                "Contains reusable gateway provider crates.",
+                "Owns reusable provider code.",
+            ),
+        ];
+
+        let card =
+            roll_up_folder_card_from_child_folders(&folder, &child_folders, &context, "mlx-test")
+                .unwrap();
+
+        assert!(card.summary.contains("gateway/apps"));
+        assert!(card.summary.contains("gateway/crates"));
+        assert!(card.summary.contains("Runs the gateway daemon"));
+        assert!(
+            card.summary
+                .contains("Contains reusable gateway provider crates")
+        );
+        assert!(!card.summary.contains("central hub"));
+        assert!(
+            card.subareas
+                .iter()
+                .all(|subarea| !subarea.responsibility.contains("awaiting"))
+        );
+    }
+
+    fn test_folder_card(id: &str, summary: &str, responsibility: &str) -> FolderCard {
+        FolderCard {
+            folder_id: id.into(),
+            summary: summary.into(),
+            responsibility: responsibility.into(),
+            behavior_intents: Vec::new(),
+            edit_intents: Vec::new(),
+            retrieval_tags: vec![format!("folder:{}", id.replace('/', "-"))],
+            contains_kinds_of_files: Vec::new(),
+            incoming_dependencies_meaning: Vec::new(),
+            outgoing_dependencies_meaning: Vec::new(),
+            key_entrypoints: Vec::new(),
+            common_behaviors: Vec::new(),
+            subareas: Vec::new(),
+            agent_guidance: Vec::new(),
+            search_phrases: Vec::new(),
+            provenance: Provenance::source_only(id),
+        }
     }
 
     fn contains_key(value: &Value, needle: &str) -> bool {

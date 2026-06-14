@@ -5,6 +5,7 @@ use matryoshka_core_ir::{
     ReadInternalImport, ReadSymbol, SymbolBehavior, SymbolFact,
 };
 use matryoshka_store_sqlite::MatryoshkaStore;
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -14,6 +15,41 @@ const MAX_READ_DEPENDENCIES: usize = 20;
 pub struct ReadApi {
     store: MatryoshkaStore,
     repo_root: PathBuf,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ReadPackMode {
+    Brief,
+    Edit,
+    Flow,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PackedReadCard {
+    pub file: ReadFileOverview,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub symbols: Vec<ReadSymbol>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub internal_imports: Vec<ReadInternalImport>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dependents: Vec<ReadDependency>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub depends_on: Vec<ReadDependency>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub omitted: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ReadBundle {
+    pub mode: ReadPackMode,
+    pub primary: PackedReadCard,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub related: Vec<PackedReadCard>,
 }
 
 impl ReadApi {
@@ -67,6 +103,91 @@ impl ReadApi {
             total_depends_on: collapsed_dependency_count(&outgoing_edges, DependencySide::Outgoing),
             depends_on: read_dependencies(&outgoing_edges, DependencySide::Outgoing),
         })
+    }
+
+    pub fn read_packed(&self, file_id: &str, mode: ReadPackMode) -> Result<PackedReadCard> {
+        self.read(file_id).map(|card| pack_read_card(card, mode))
+    }
+
+    pub fn read_bundle(
+        &self,
+        primary_file_id: &str,
+        related_file_ids: &[String],
+        mode: ReadPackMode,
+        max_related: usize,
+    ) -> Result<ReadBundle> {
+        let primary = self.read_packed(primary_file_id, mode)?;
+        let mut related = Vec::new();
+        for file_id in related_file_ids {
+            if file_id == primary_file_id
+                || related
+                    .iter()
+                    .any(|card: &PackedReadCard| &card.file.file_id == file_id)
+            {
+                continue;
+            }
+            if related.len() >= max_related {
+                break;
+            }
+            if let Ok(card) = self.read_packed(file_id, mode) {
+                related.push(card);
+            }
+        }
+        Ok(ReadBundle {
+            mode,
+            primary,
+            related,
+        })
+    }
+}
+
+fn pack_read_card(card: ReadCard, mode: ReadPackMode) -> PackedReadCard {
+    let mut omitted = Vec::new();
+    let (symbol_limit, dep_limit, include_description) = match mode {
+        ReadPackMode::Brief => (8, 3, false),
+        ReadPackMode::Edit => (16, 8, true),
+        ReadPackMode::Flow => (10, 12, true),
+    };
+
+    let symbol_count = card.symbols.len();
+    let dependent_count = card.dependents.len();
+    let depends_on_count = card.depends_on.len();
+    let import_count = card.imports.internal.len();
+
+    if symbol_count > symbol_limit {
+        omitted.push(format!(
+            "omitted {} symbols",
+            symbol_count.saturating_sub(symbol_limit)
+        ));
+    }
+    if import_count > dep_limit {
+        omitted.push(format!(
+            "omitted {} internal imports",
+            import_count.saturating_sub(dep_limit)
+        ));
+    }
+    if dependent_count > dep_limit {
+        omitted.push(format!(
+            "omitted {} dependents",
+            dependent_count.saturating_sub(dep_limit)
+        ));
+    }
+    if depends_on_count > dep_limit {
+        omitted.push(format!(
+            "omitted {} dependencies",
+            depends_on_count.saturating_sub(dep_limit)
+        ));
+    }
+
+    PackedReadCard {
+        file: card.file,
+        summary: card.summary,
+        description: include_description.then_some(card.description).flatten(),
+        symbols: card.symbols.into_iter().take(symbol_limit).collect(),
+        internal_imports: card.imports.internal.into_iter().take(dep_limit).collect(),
+        dependents: card.dependents.into_iter().take(dep_limit).collect(),
+        depends_on: card.depends_on.into_iter().take(dep_limit).collect(),
+        omitted,
     }
 }
 

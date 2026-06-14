@@ -5,6 +5,7 @@ use matryoshka_core_ir::{
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::{Path, PathBuf};
+use tree_sitter::{Node, Parser as TreeSitterParser};
 use walkdir::WalkDir;
 
 #[derive(Debug, Clone)]
@@ -165,7 +166,7 @@ impl SourceParser {
         let lines: Vec<&str> = source.lines().collect();
         let parent_folder_id = parent_folder_id(&relative);
         let imports = parse_imports(&relative, &language, &lines);
-        let symbols = parse_symbols(&relative, &language, &lines);
+        let symbols = parse_symbols(&relative, &language, &source, &lines);
         let snippets = select_snippets(
             &relative,
             &source,
@@ -358,6 +359,42 @@ mod tests {
     }
 
     #[test]
+    fn tree_sitter_parser_extracts_python_methods() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(
+            temp.path().join("service.py"),
+            "class TokenService:\n    def refresh(self):\n        return True\n",
+        )
+        .unwrap();
+        let parser = SourceParser::new(ParserConfig::default());
+        let parsed = parser.parse_repo(temp.path()).unwrap();
+        assert!(parsed.symbols.iter().any(|symbol| {
+            symbol.qualified_name == "TokenService::refresh"
+                && symbol.kind == SymbolKind::Method
+                && symbol.start_line == 2
+                && symbol.end_line == 3
+        }));
+    }
+
+    #[test]
+    fn tree_sitter_parser_extracts_typescript_class_methods() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(
+            temp.path().join("client.ts"),
+            "export class ApiClient {\n  async fetchToken(): Promise<string> {\n    return 'token';\n  }\n}\n",
+        )
+        .unwrap();
+        let parser = SourceParser::new(ParserConfig::default());
+        let parsed = parser.parse_repo(temp.path()).unwrap();
+        assert!(parsed.symbols.iter().any(|symbol| {
+            symbol.qualified_name == "ApiClient::fetchToken"
+                && symbol.kind == SymbolKind::Method
+                && symbol.start_line == 2
+                && symbol.end_line == 4
+        }));
+    }
+
+    #[test]
     fn parser_config_ignores_path_components_and_subtrees() {
         let temp = tempfile::tempdir().unwrap();
         fs::create_dir_all(temp.path().join("src")).unwrap();
@@ -452,7 +489,10 @@ fn looks_internal(module: &str, file_id: &str) -> bool {
             .is_some_and(|root| module.starts_with(root))
 }
 
-fn parse_symbols(file_id: &str, language: &str, lines: &[&str]) -> Vec<SymbolFact> {
+fn parse_symbols(file_id: &str, language: &str, source: &str, lines: &[&str]) -> Vec<SymbolFact> {
+    if let Some(symbols) = parse_tree_sitter_symbols(file_id, language, source) {
+        return symbols;
+    }
     if language == "rust" {
         return parse_rust_symbols(file_id, lines);
     }
@@ -483,6 +523,217 @@ fn parse_symbols(file_id: &str, language: &str, lines: &[&str]) -> Vec<SymbolFac
         }
     }
     symbols
+}
+
+fn parse_tree_sitter_symbols(
+    file_id: &str,
+    language: &str,
+    source: &str,
+) -> Option<Vec<SymbolFact>> {
+    let mut parser = TreeSitterParser::new();
+    let tree_sitter_language = match language {
+        "rust" => tree_sitter_rust::LANGUAGE.into(),
+        "python" => tree_sitter_python::LANGUAGE.into(),
+        "typescript" if file_id.ends_with(".tsx") => tree_sitter_typescript::LANGUAGE_TSX.into(),
+        "typescript" => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+        _ => return None,
+    };
+    parser.set_language(&tree_sitter_language).ok()?;
+    let tree = parser.parse(source, None)?;
+    let mut symbols = Vec::new();
+    visit_tree_sitter_symbols(
+        file_id,
+        language,
+        source,
+        tree.root_node(),
+        None,
+        &mut symbols,
+    );
+    (!symbols.is_empty()).then_some(symbols)
+}
+
+fn visit_tree_sitter_symbols(
+    file_id: &str,
+    language: &str,
+    source: &str,
+    node: Node<'_>,
+    owner: Option<String>,
+    symbols: &mut Vec<SymbolFact>,
+) {
+    let mut next_owner = owner.clone();
+
+    if let Some((kind, name, owner_for_children)) =
+        tree_sitter_symbol_kind_and_name(language, source, node, owner.as_deref())
+    {
+        let start_line = node.start_position().row + 1;
+        let end_line = node.end_position().row + 1;
+        let qualified_name = owner
+            .as_ref()
+            .filter(|_| kind == SymbolKind::Method)
+            .map(|owner| format!("{owner}::{name}"))
+            .unwrap_or_else(|| name.clone());
+        let symbol_id = format!("{file_id}::{qualified_name}:{start_line}");
+        symbols.push(SymbolFact {
+            symbol_id,
+            file_id: file_id.to_string(),
+            path: file_id.to_string(),
+            name: name.clone(),
+            qualified_name,
+            kind,
+            signature: tree_sitter_signature(source, node),
+            start_line,
+            end_line,
+        });
+        next_owner = owner_for_children.or(Some(name));
+    } else if language == "rust" && node.kind() == "impl_item" {
+        next_owner = rust_impl_target(source, node).or(owner);
+    }
+
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        visit_tree_sitter_symbols(
+            file_id,
+            language,
+            source,
+            child,
+            next_owner.clone(),
+            symbols,
+        );
+    }
+}
+
+fn tree_sitter_symbol_kind_and_name(
+    language: &str,
+    source: &str,
+    node: Node<'_>,
+    owner: Option<&str>,
+) -> Option<(SymbolKind, String, Option<String>)> {
+    let kind = node.kind();
+    let name = tree_sitter_node_name(source, node)?;
+    match language {
+        "rust" => match kind {
+            "function_item" => {
+                let symbol_kind = if owner.is_some() {
+                    SymbolKind::Method
+                } else {
+                    SymbolKind::Function
+                };
+                Some((symbol_kind, name, None))
+            }
+            "struct_item" => Some((SymbolKind::Struct, name.clone(), Some(name))),
+            "enum_item" => Some((SymbolKind::Enum, name.clone(), Some(name))),
+            "trait_item" => Some((SymbolKind::Interface, name.clone(), Some(name))),
+            "type_item" => Some((SymbolKind::TypeAlias, name, None)),
+            _ => None,
+        },
+        "python" => match kind {
+            "function_definition" => {
+                let symbol_kind = if owner.is_some() {
+                    SymbolKind::Method
+                } else {
+                    SymbolKind::Function
+                };
+                Some((symbol_kind, name, None))
+            }
+            "class_definition" => Some((SymbolKind::Class, name.clone(), Some(name))),
+            _ => None,
+        },
+        "typescript" => match kind {
+            "function_declaration" | "generator_function_declaration" => {
+                Some((SymbolKind::Function, name, None))
+            }
+            "class_declaration" => Some((SymbolKind::Class, name.clone(), Some(name))),
+            "method_definition" | "public_field_definition" => {
+                Some((SymbolKind::Method, name, None))
+            }
+            "interface_declaration" => Some((SymbolKind::Interface, name.clone(), Some(name))),
+            "type_alias_declaration" => Some((SymbolKind::TypeAlias, name, None)),
+            "lexical_declaration" | "variable_declaration" => {
+                if node_text(source, node).contains("=>")
+                    || node_text(source, node).contains("function")
+                {
+                    Some((SymbolKind::Function, name, None))
+                } else {
+                    Some((SymbolKind::Constant, name, None))
+                }
+            }
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn tree_sitter_node_name(source: &str, node: Node<'_>) -> Option<String> {
+    for field in ["name", "property", "identifier"] {
+        if let Some(child) = node.child_by_field_name(field) {
+            let text = node_text(source, child).trim().to_string();
+            if !text.is_empty() {
+                return Some(text);
+            }
+        }
+    }
+
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if matches!(
+            child.kind(),
+            "identifier" | "type_identifier" | "property_identifier" | "field_identifier"
+        ) {
+            let text = node_text(source, child).trim().to_string();
+            if !text.is_empty() {
+                return Some(text);
+            }
+        }
+        if child.kind() == "variable_declarator" {
+            if let Some(name) = tree_sitter_node_name(source, child) {
+                return Some(name);
+            }
+        }
+    }
+    None
+}
+
+fn rust_impl_target(source: &str, node: Node<'_>) -> Option<String> {
+    if let Some(type_node) = node.child_by_field_name("type") {
+        return Some(clean_type_name(node_text(source, type_node)));
+    }
+    let text = node_text(source, node);
+    let header = text.split('{').next()?.trim();
+    let rest = header.strip_prefix("impl")?.trim();
+    let target = rest
+        .split(" for ")
+        .last()
+        .unwrap_or(rest)
+        .split_whitespace()
+        .last()
+        .unwrap_or(rest);
+    let target = clean_type_name(target);
+    (!target.is_empty()).then_some(target)
+}
+
+fn clean_type_name(text: &str) -> String {
+    text.trim()
+        .trim_matches('{')
+        .split('<')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_string()
+}
+
+fn tree_sitter_signature(source: &str, node: Node<'_>) -> String {
+    node_text(source, node)
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .trim_end_matches('{')
+        .trim_end_matches(':')
+        .trim()
+        .to_string()
+}
+
+fn node_text<'a>(source: &'a str, node: Node<'a>) -> &'a str {
+    node.utf8_text(source.as_bytes()).unwrap_or_default()
 }
 
 fn parse_rust_symbols(file_id: &str, lines: &[&str]) -> Vec<SymbolFact> {
