@@ -1,7 +1,6 @@
 # Matryoshka Usage
 
-This document describes the `matryoshka-rs` CLI on the `matryoshka-boost`
-branch.
+This document describes the `matryoshka-rs` CLI.
 
 Matryoshka is designed for coding agents: index once, keep the repo warm, then
 use search/read operations to get precise context in fewer steps and fewer
@@ -70,6 +69,9 @@ Aliases:
 Use `--offline` for deterministic local embeddings and heuristic enrichment.
 That is good for tests and smoke checks, but production-quality cards and
 semantic matching should use MLX embeddings/enrichment.
+
+The watcher daemon, FTS refresh, embedding refresh, late-vector refresh, and
+deleted-file cleanup paths have been validated with the MLX defaults below.
 
 ## Recommended Production Flow
 
