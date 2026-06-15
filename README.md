@@ -10,6 +10,7 @@ It prewarms a repository into a SQLite-backed map of:
 - import and dependency edges
 - rich file, folder, and repo cards
 - semantic search records for files, snippets, symbols, folders, and the repo
+- SQLite FTS records and late-interaction token vectors for hybrid retrieval
 
 The goal is simple: let an agent search for behavior and read rich summaries
 before it falls back to full-file reads.
@@ -27,20 +28,31 @@ Matryoshka currently ships these core workflows:
    affected facts, cards, and semantic records.
 
 3. `watch`
-   Poll a repository, debounce changes, and trigger `update` automatically.
+   Poll a repository, run a startup freshness update, debounce changes, and
+   trigger `update` automatically. It can run in the foreground or as a daemon.
 
-4. `search`
+4. `prewarm`
+   Rebuild FTS, warm retrieval paths, optionally ensure freshness, and optionally
+   start the watcher.
+
+5. `search`
    Run hybrid retrieval over persisted semantic records using embeddings plus
-   lexical, ownership, intent, and structural boosts.
+   FTS, lexical, symbol/path, late-interaction, ownership, intent, graph, and
+   structural boosts.
 
-5. `read`
+6. `op`
+   Run task-shaped search for agent operations such as `find-symbol`,
+   `edit-target`, `trace-dependency`, `architecture`, and `tests-for`.
+
+7. `read`
    Return a rich file card with folder context, interpreted imports,
    dependents, blast radius, and selected snippets.
 
-6. `read-more`
-   Extend `read` with symbol blocks, import lines, and larger source excerpts.
+8. `read-bundle`
+   Search, pick a primary file, select related files, and return packed read
+   context in `brief`, `edit`, or `flow` mode.
 
-7. `rebuild-semantic`
+9. `rebuild-semantic`
    Rebuild the semantic search layer from already-persisted facts and cards
    without reparsing or re-enriching the whole repository.
 
@@ -73,7 +85,7 @@ The workspace is organized around focused Rust crates:
   Hybrid semantic search and reranking.
 
 - `read-api`
-  `read` and `read-more` assembly.
+  `read` and `read-bundle` assembly.
 
 - `watcher`
   Polling and debounce-based repo change detection.
@@ -100,6 +112,28 @@ Persisted tables include:
 
 - retrieval layer
   - semantic records
+  - FTS records
+  - late-interaction vectors
+
+By default, Matryoshka stores operational state under:
+
+```text
+<repo>/.matryoshka/
+```
+
+The default SQLite DB is:
+
+```text
+<repo>/.matryoshka/matryoshka.db
+```
+
+Watcher daemon files live next to it:
+
+```text
+<repo>/.matryoshka/watch.pid
+<repo>/.matryoshka/logs/watch.jsonl
+<repo>/.matryoshka/logs/watch.stdout.jsonl
+```
 
 This means semantic search can be rebuilt independently when embeddings or late
 pipeline stages fail.
@@ -112,6 +146,7 @@ The non-offline path expects a local OpenAI-compatible MLX server:
 - API key: `2508`
 - embeddings model: `mlx-community--embeddinggemma-300m-bf16`
 - chat model: `MercuriusDream--Qwen3.5-4B-MLX-mxfp8`
+- oMLX reranker model: `mlx-community--Qwen3-Reranker-0.6B-mxfp8`
 
 Chat enrichment disables thinking by default.
 
@@ -122,33 +157,58 @@ You can override them per command with:
 
 ## Quick Start
 
+Examples below assume `matryoshka-rs` is on your `PATH` or exported from
+`target/debug`. From this repo, prefix commands with:
+
+```bash
+cargo run -p matryoshka-cli --
+```
+
 Index a repo:
 
 ```bash
-cargo run -p matryoshka-cli -- index /path/to/repo --db /path/to/repo/.matryoshka/index.db
+matryoshka-rs index /path/to/repo --watch-daemon
+```
+
+Prewarm retrieval:
+
+```bash
+matryoshka-rs prewarm \
+  --repo-root /path/to/repo \
+  --ensure-fresh \
+  --query "auth flow token refresh" \
+  --query "where policy enforcement happens"
 ```
 
 Search it:
 
 ```bash
-cargo run -p matryoshka-cli -- search "authentication flow" --db /path/to/repo/.matryoshka/index.db
+cd /path/to/repo
+matryoshka-rs search "authentication flow" --omlx-rerank
 ```
 
 Read a file card:
 
 ```bash
-cargo run -p matryoshka-cli -- read \
-  --db /path/to/repo/.matryoshka/index.db \
+matryoshka-rs read \
   --repo-root /path/to/repo \
   path/to/file.py
+```
+
+Read a packed context bundle:
+
+```bash
+matryoshka-rs read-bundle \
+  --repo-root /path/to/repo \
+  --mode edit \
+  "where should I edit retry behavior"
 ```
 
 Repair only the semantic layer:
 
 ```bash
-cargo run -p matryoshka-cli -- rebuild-semantic \
-  /path/to/repo \
-  --db /path/to/repo/.matryoshka/index.db
+matryoshka-rs rebuild-semantic \
+  /path/to/repo
 ```
 
 ## Docs
