@@ -13,6 +13,8 @@ use matryoshka_watcher::RepoWatcher;
 use serde_json::json;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
 use std::thread;
@@ -876,6 +878,8 @@ fn spawn_watch_daemon(options: &WatchLoopOptions) -> Result<()> {
         .stdin(Stdio::null())
         .stdout(Stdio::from(log_file))
         .stderr(Stdio::from(err_file));
+    #[cfg(unix)]
+    command.process_group(0);
     if options.offline {
         command.arg("--offline");
     }
@@ -938,7 +942,18 @@ fn run_watch_loop(options: WatchLoopOptions) -> Result<()> {
     );
     println!("watch_log: {}", log.path.display());
 
+    let mut poll_count = 0usize;
     loop {
+        poll_count = poll_count.saturating_add(1);
+        if poll_count % 25 == 0 {
+            log.event(
+                "watch_heartbeat",
+                json!({
+                    "poll_count": poll_count,
+                    "interval_ms": options.interval_ms,
+                }),
+            )?;
+        }
         if let Some(batch) = watcher.poll()? {
             println!(
                 "change batch detected: changed={} added={} removed={}",

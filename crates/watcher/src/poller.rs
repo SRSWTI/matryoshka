@@ -89,11 +89,13 @@ impl RepoWatcher {
 
         match self.pending.take() {
             Some(mut pending) => {
-                if pending.next_state == current
-                    && now.duration_since(pending.last_change_at) >= self.debounce_window
-                {
-                    self.baseline = current;
-                    return Ok(Some(pending.batch));
+                if pending.next_state == current {
+                    if now.duration_since(pending.last_change_at) >= self.debounce_window {
+                        self.baseline = current;
+                        return Ok(Some(pending.batch));
+                    }
+                    self.pending = Some(pending);
+                    return Ok(None);
                 }
                 merge_batches(&mut pending.batch, diff);
                 pending.last_change_at = now;
@@ -206,6 +208,7 @@ fn should_track(path: &Path, parser_config: &ParserConfig) -> bool {
 #[cfg(test)]
 mod tests {
     use super::RepoWatcher;
+    use matryoshka_parser::ParserConfig;
     use std::fs;
     use std::time::Duration;
 
@@ -217,6 +220,56 @@ mod tests {
         fs::write(&source, "pub fn a() {}\n").unwrap();
 
         let mut watcher = RepoWatcher::new(repo_root)
+            .unwrap()
+            .with_poll_interval(Duration::from_millis(5))
+            .with_debounce_window(Duration::from_millis(10));
+
+        fs::write(&source, "pub fn b() {}\n").unwrap();
+        assert!(watcher.poll().unwrap().is_none());
+        std::thread::sleep(Duration::from_millis(15));
+        let batch = watcher.poll().unwrap().unwrap();
+        assert_eq!(batch.changed_paths, vec!["lib.rs"]);
+    }
+
+    #[test]
+    fn poll_emits_added_changed_and_removed_paths() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo_root = temp.path();
+        let src = repo_root.join("src");
+        fs::create_dir_all(&src).unwrap();
+        fs::write(src.join("keep.rs"), "pub fn keep() {}\n").unwrap();
+        fs::write(src.join("edit.rs"), "pub fn old_name() {}\n").unwrap();
+        fs::write(src.join("remove.rs"), "pub fn remove_me() {}\n").unwrap();
+
+        let mut watcher = RepoWatcher::new(repo_root)
+            .unwrap()
+            .with_poll_interval(Duration::from_millis(5))
+            .with_debounce_window(Duration::from_millis(10));
+
+        fs::write(src.join("add.rs"), "pub fn add_me() {}\n").unwrap();
+        fs::write(src.join("edit.rs"), "pub fn new_name() {}\n").unwrap();
+        fs::remove_file(src.join("remove.rs")).unwrap();
+
+        assert!(watcher.poll().unwrap().is_none());
+        std::thread::sleep(Duration::from_millis(15));
+        let batch = watcher.poll().unwrap().unwrap();
+        assert_eq!(batch.added_paths, vec!["src/add.rs"]);
+        assert_eq!(batch.changed_paths, vec!["src/edit.rs"]);
+        assert_eq!(batch.removed_paths, vec!["src/remove.rs"]);
+    }
+
+    #[test]
+    fn poll_still_tracks_source_when_matryoshka_dir_is_ignored() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo_root = temp.path();
+        let source = repo_root.join("lib.rs");
+        fs::create_dir_all(repo_root.join(".matryoshka")).unwrap();
+        fs::write(repo_root.join(".matryoshka/index.db"), "ignored").unwrap();
+        fs::write(&source, "pub fn a() {}\n").unwrap();
+
+        let mut watcher = RepoWatcher::new(repo_root)
+            .unwrap()
+            .with_parser_config(ParserConfig::default().with_ignored_paths([".matryoshka".into()]))
             .unwrap()
             .with_poll_interval(Duration::from_millis(5))
             .with_debounce_window(Duration::from_millis(10));
