@@ -168,7 +168,11 @@ cargo check
 for crate in "${CRATES[@]}"; do
   echo
   echo "Publishing $crate $new_version"
-  cargo publish -p "$crate" "${publish_flags[@]}"
+  if ((${#publish_flags[@]})); then
+    cargo publish -p "$crate" "${publish_flags[@]}"
+  else
+    cargo publish -p "$crate"
+  fi
 done
 
 echo
