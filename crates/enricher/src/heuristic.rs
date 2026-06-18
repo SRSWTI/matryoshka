@@ -34,8 +34,8 @@ impl CodeEnricher for HeuristicEnricher {
 
         Ok(FileCard {
             file_id: file.file_id.clone(),
-            summary: String::new(),
-            role: String::new(),
+            summary: heuristic_file_summary(file, &symbol_names, context),
+            role: heuristic_file_role(file, &symbol_names, context),
             primary_behaviors: Vec::new(),
             behavior_intents,
             edit_intents,
@@ -106,8 +106,8 @@ impl CodeEnricher for HeuristicEnricher {
         );
         Ok(FolderCard {
             folder_id: folder.folder_id.clone(),
-            summary: String::new(),
-            responsibility: String::new(),
+            summary: heuristic_folder_summary(folder, child_files, child_folders),
+            responsibility: heuristic_folder_responsibility(folder, child_files, child_folders),
             behavior_intents,
             edit_intents,
             retrieval_tags,
@@ -264,6 +264,133 @@ impl CodeEnricher for HeuristicEnricher {
             },
         })
     }
+}
+
+fn heuristic_file_summary(
+    file: &FileFact,
+    symbol_names: &[String],
+    context: &FileEnrichmentContext,
+) -> String {
+    let mut parts = Vec::new();
+    parts.push(format!(
+        "{} is a {} file with {} lines.",
+        file.path, file.language, file.line_count
+    ));
+    if !symbol_names.is_empty() {
+        parts.push(format!(
+            "It defines {}.",
+            symbol_names
+                .iter()
+                .take(5)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    if !context.internal_imports.is_empty() {
+        parts.push(format!(
+            "It uses internal code from {}.",
+            context
+                .internal_imports
+                .iter()
+                .take(3)
+                .map(|item| item.module.clone())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    } else if !context.external_imports.is_empty() {
+        parts.push(format!(
+            "It uses external crates or modules such as {}.",
+            context
+                .external_imports
+                .iter()
+                .take(3)
+                .map(|item| item.module.clone())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    parts.join(" ")
+}
+
+fn heuristic_file_role(
+    file: &FileFact,
+    symbol_names: &[String],
+    context: &FileEnrichmentContext,
+) -> String {
+    let family = file_role_family(file);
+    let symbol_text = if symbol_names.is_empty() {
+        "its module-level code".to_string()
+    } else {
+        symbol_names
+            .iter()
+            .take(3)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    format!(
+        "Acts as a {family} file for {}. It has {} internal imports and {} known dependents.",
+        symbol_text,
+        context.internal_imports.len(),
+        context.imported_by_files.len()
+    )
+}
+
+fn heuristic_folder_summary(
+    folder: &FolderFact,
+    child_files: &[FileCard],
+    child_folders: &[FolderCard],
+) -> String {
+    let file_examples = folder_owner_files(child_files)
+        .into_iter()
+        .chain(folder_surface_files(child_files))
+        .take(5)
+        .collect::<Vec<_>>();
+    let child_folder_examples = child_folders
+        .iter()
+        .map(|card| card.folder_id.clone())
+        .take(5)
+        .collect::<Vec<_>>();
+    let mut parts = vec![format!(
+        "{} groups {} direct files and {} child folders.",
+        folder.path,
+        folder.child_file_ids.len(),
+        folder.child_folder_ids.len()
+    )];
+    if !file_examples.is_empty() {
+        parts.push(format!(
+            "Important child files include {}.",
+            file_examples.join(", ")
+        ));
+    }
+    if !child_folder_examples.is_empty() {
+        parts.push(format!(
+            "Important child folders include {}.",
+            child_folder_examples.join(", ")
+        ));
+    }
+    parts.join(" ")
+}
+
+fn heuristic_folder_responsibility(
+    folder: &FolderFact,
+    child_files: &[FileCard],
+    child_folders: &[FolderCard],
+) -> String {
+    let kinds = folder_file_kinds(child_files);
+    let kind_text = if kinds.is_empty() {
+        "code organization".to_string()
+    } else {
+        kinds.into_iter().take(4).collect::<Vec<_>>().join("; ")
+    };
+    format!(
+        "{} owns {} across {} files and {} child folders.",
+        folder.path,
+        kind_text,
+        child_files.len(),
+        child_folders.len()
+    )
 }
 
 fn folder_owner_files(child_files: &[FileCard]) -> Vec<String> {

@@ -864,19 +864,15 @@ fn has_useful_summary(summary: &str) -> bool {
 }
 
 fn file_card_needs_quality_repair(card: &FileCard) -> bool {
-    !is_heuristic_card_model(card.provenance.model.as_deref()) && !has_useful_summary(&card.summary)
+    !has_useful_summary(&card.summary)
 }
 
 fn folder_card_needs_quality_repair(card: &FolderCard) -> bool {
-    !is_heuristic_card_model(card.provenance.model.as_deref()) && !has_useful_summary(&card.summary)
+    !has_useful_summary(&card.summary)
 }
 
 fn repo_card_needs_quality_repair(card: &RepoCard) -> bool {
-    !is_heuristic_card_model(card.provenance.model.as_deref()) && !has_useful_summary(&card.summary)
-}
-
-fn is_heuristic_card_model(model: Option<&str>) -> bool {
-    matches!(model, Some("heuristic"))
+    !has_useful_summary(&card.summary)
 }
 
 #[derive(Debug)]

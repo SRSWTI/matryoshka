@@ -1,6 +1,7 @@
 [workspace]
 resolver = "3"
 members = [
+  "crates/api",
   "crates/core-ir",
   "crates/parser",
   "crates/resolver",
@@ -38,6 +39,7 @@ thiserror = "2"
 walkdir = "2"
 
 matryoshka-core-ir = { version = "0.1.1", path = "crates/core-ir" }
+matryoshka = { version = "0.1.1", path = "crates/api" }
 matryoshka-parser = { version = "0.1.1", path = "crates/parser" }
 matryoshka-resolver = { version = "0.1.1", path = "crates/resolver" }
 matryoshka-store-sqlite = { version = "0.1.1", path = "crates/store-sqlite" }

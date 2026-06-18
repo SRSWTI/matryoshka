@@ -1,32 +1,390 @@
 # Matryoshka Usage
 
-Matryoshka prepares a repository so Jesco can work with it in fewer steps: find the right code, read the right files, and avoid wasting tokens on raw browsing.
+Matryoshka prepares a repository so Jesco can find, read, and change code with fewer steps.
 
-The normal lifecycle has one command:
+The simple rule is:
 
-```bash
-matryoshka-rs prepare <repo-root>
+```text
+Call prepare.
 ```
 
-`prepare` is safe to run again and again. The IDE does not need to decide whether to index, update, repair, rebuild retrieval, or pre-warm. It calls `prepare`; Matryoshka checks the repository and does the right work.
+`prepare` decides whether the repo needs a full build, a refresh, a repair, a search rebuild, or just a quick warm-up. The IDE should not try to choose those operations itself.
 
-## The IDE Rule
+## Preferred Integration
 
-For setup, startup, file changes, or a user pressing "Prepare", run the same command:
+Use the Rust API from the `matryoshka` crate.
 
-```bash
-matryoshka-rs prepare "$REPO" \
-  --db "$DB" \
-  --base-url "$MLX_URL" \
-  --api-key "$MLX_KEY" \
-  --model "$CHAT_MODEL" \
-  --embedding-model "$EMBED_MODEL" \
-  --ignore .matryoshka \
-  --ignore target \
-  --json
+This avoids:
+
+- spawning a CLI process
+- passing binary paths through settings
+- parsing command output as the only progress source
+- losing typed cancellation and progress hooks
+
+The CLI still exists and is useful for terminal/debug work, but IDE integrations should prefer the Rust API.
+
+## Cargo Dependency
+
+Inside this workspace:
+
+```toml
+matryoshka = { path = "crates/api" }
 ```
 
-Recommended environment:
+After publishing:
+
+```toml
+matryoshka = "0.1.1"
+```
+
+The `matryoshka` crate pulls in the internal parser, resolver, store, indexer, search, read, and enrichment crates it needs.
+
+## Model Profile
+
+Recommended local oMLX profile:
+
+```text
+base_url: http://127.0.0.1:44447
+api_key: 2508
+chat_model: srswti--bodega-raptor-90m
+embedding_model: mlx-community--embeddinggemma-300m-bf16
+omlx_reranker: mlx-community--Qwen3-Reranker-0.6B-mxfp8
+```
+
+Start oMLX:
+
+```bash
+cd /Users/rohit/cradle-mlx/helpers/omlx
+source .venv/bin/activate
+
+jesco-apple serve \
+  --host 127.0.0.1 \
+  --port 44447 \
+  --api-key 2508 \
+  --max-concurrent-requests 6
+```
+
+## Rust API: Prepare
+
+Use one API call for setup, startup, file changes, and manual refresh.
+
+```rust
+use matryoshka::{
+    Matryoshka, MatryoshkaConfig, MatryoshkaEvent, PrepareOptions,
+};
+
+let api = Matryoshka::new(
+    MatryoshkaConfig::new("/path/to/repo")
+        .with_db("/path/to/repo/.matryoshka/matryoshka.db")
+        .with_endpoint("http://127.0.0.1:44447", "2508")
+        .with_models(
+            "srswti--bodega-raptor-90m",
+            "mlx-community--embeddinggemma-300m-bf16",
+        )
+        .with_ignored_paths([".matryoshka", "target"]),
+);
+
+let summary = api.prepare_with_progress(
+    PrepareOptions {
+        limit: 8,
+        queries: vec![
+            "main routing flow".into(),
+            "request response conversion".into(),
+            "tests for provider behavior".into(),
+        ],
+        write_progress_state: true,
+    },
+    |event: MatryoshkaEvent| {
+        // Update the IDE UI from typed events.
+    },
+)?;
+
+if summary.is_ready() {
+    // Jesco is ready to work with this project.
+}
+```
+
+### Minimal Prepare
+
+```rust
+let summary = api.prepare(PrepareOptions::default())?;
+```
+
+Use `prepare_with_progress` for UI integration. Use `prepare` for tests or background jobs where progress does not matter.
+
+## What Prepare Does
+
+`prepare` checks the current state and runs the smallest useful operation.
+
+| State | Internal action | Result |
+|---|---|---|
+| No database | `index` | Builds files, folders, symbols, cards, retrieval data, FTS, late vectors, then warms results. |
+| Database exists, ready marker missing | `update` | Treats the repo as partial, checks freshness, fills missing pieces, writes the ready marker. |
+| Files added | `update` | Adds facts, cards, semantic records, FTS rows, and late vectors for new files. |
+| Files changed | `update` | Refreshes affected facts, cards, semantic records, FTS rows, and late vectors. |
+| Files deleted | `update` | Removes stale file rows, cards, semantic records, FTS rows, and late vectors. |
+| Card text has gaps | `repair` | Rebuilds missing card text and refreshes affected retrieval data. |
+| Search data missing | `rebuild_search` | Rebuilds semantic records, FTS, embeddings, and late vectors from existing project data. |
+| Everything healthy | `update` | Performs a quick freshness pass and warms results. |
+
+Every successful run ends with:
+
+```text
+prepare_results
+```
+
+That step warms first searches so Jesco starts fast.
+
+## Ready Marker
+
+When the repo is ready, Matryoshka writes:
+
+```text
+<repo>/.matryoshka/.jesco-prewarm-complete
+```
+
+The marker means:
+
+```text
+Jesco is ready to work with you on this project.
+```
+
+If the marker is missing but the database exists, call `prepare` again. Do not show a complicated repair choice to the user.
+
+## Prepare Summary
+
+`prepare` returns `PrepareSummary`.
+
+Important fields:
+
+```rust
+summary.status
+summary.actions_taken
+summary.file_count
+summary.folder_count
+summary.symbol_count
+summary.semantic_record_count
+summary.changed_files
+summary.removed_files
+summary.changed_folders
+summary.artifact_quality
+summary.retrieval_index
+summary.prewarm
+summary.ready_marker
+summary.logs_dir
+```
+
+Use these for UI:
+
+| Field | Meaning |
+|---|---|
+| `status` | `Ready` means Jesco can use the repo. `NeedsAttention` means show logs. |
+| `actions_taken` | The internal path Matryoshka chose, such as `index`, `update`, `repair`, `rebuild_search`, `prepare_results`. |
+| `changed_files` | Added or changed files handled by this run. |
+| `removed_files` | Deleted files cleaned from the database and retrieval data. |
+| `artifact_quality` | Health report for card text and project-map artifacts. |
+| `retrieval_index` | Health report for semantic records, FTS, embeddings, and late vectors. |
+| `prewarm.warmed_hit_count` | Number of hits touched while warming first results. |
+| `logs_dir` | Folder to open when the user wants details. |
+| `ready_marker` | Marker file written after a ready run. |
+
+## Progress Events
+
+Use `prepare_with_progress` to receive typed events.
+
+Current event variants:
+
+```rust
+MatryoshkaEvent::PrepareStarted { .. }
+MatryoshkaEvent::PrepareDecision { action, reason }
+MatryoshkaEvent::IndexerProgress { operation, progress }
+MatryoshkaEvent::PrewarmStarted { query_count, limit }
+MatryoshkaEvent::PrewarmCompleted { summary }
+MatryoshkaEvent::PrepareCompleted { summary }
+```
+
+`IndexerProgress` wraps lower-level progress such as:
+
+```text
+ParsingFile
+ParsedFile
+EnrichingFile
+EnrichedFile
+EmbeddingBatch
+EmbeddedBatch
+WritingDatabase
+ArtifactQuality
+RetrievalIndex
+Completed
+Failed
+```
+
+The API can also write a UI-friendly progress file:
+
+```text
+<repo>/.matryoshka/state/progress.json
+```
+
+Shape:
+
+```json
+{
+  "operation": "prepare",
+  "status": "running",
+  "phase": "enriching",
+  "message": "Enriching src/lib.rs",
+  "percent": 0.42,
+  "current_file": "src/lib.rs",
+  "files_done": 14,
+  "files_total": 30,
+  "updated_at_unix_ms": 1781800000000
+}
+```
+
+For native IDE UI, prefer typed events. Use `progress.json` as a fallback or for cross-process status.
+
+## Logs
+
+Prepare writes:
+
+```text
+<repo>/.matryoshka/logs/prepare.jsonl
+```
+
+Useful events:
+
+```json
+{"event":"prepare_started","fields":{"existing_file_count":30,"existing_missing_text":0,"existing_search_missing":false,"ready_marker_exists":true}}
+{"event":"prepare_decision","fields":{"action":"update","reason":"refresh current project map"}}
+{"event":"update_started","fields":{}}
+{"event":"update_completed","fields":{}}
+{"event":"prewarm_started","fields":{}}
+{"event":"prewarm_completed","fields":{}}
+{"event":"prepare_completed","fields":{"status":"ready"}}
+```
+
+Open logs only when the user asks, or when `status` is `NeedsAttention`.
+
+## Search API
+
+Search returns ranked `SearchHit` values from Matryoshka's hybrid retrieval stack:
+
+- exact symbol/path candidates
+- SQLite FTS candidates
+- embedding similarity
+- late-interaction MaxSim
+- graph/card signals
+- optional reranker
+
+No reranker:
+
+```rust
+use matryoshka::SearchOptions;
+
+let hits = api.search(
+    "where is debounce handled",
+    SearchOptions::default(),
+)?;
+```
+
+With oMLX reranker:
+
+```rust
+use matryoshka::{RerankerOptions, SearchOptions};
+
+let hits = api.search(
+    "where is debounce handled",
+    SearchOptions {
+        limit: 8,
+        reranker: RerankerOptions::Omlx {
+            model: "mlx-community--Qwen3-Reranker-0.6B-mxfp8".into(),
+            candidates: 20,
+        },
+    },
+)?;
+```
+
+Use reranking for ambiguous natural-language queries. Skip it for obvious exact symbol/path lookups.
+
+## Read API
+
+Read one known file:
+
+```rust
+let card = api.read("src/watcher.rs")?;
+```
+
+`read` returns a `ReadCard` with:
+
+- file identity and path
+- file summary
+- folder context
+- symbols with ranges and signatures where available
+- imports
+- dependencies
+- dependents
+- snippets and card details
+
+This is the cheap focused read after search has found the right file.
+
+## Read Bundle API
+
+Read bundle starts from a query, searches, chooses a primary file, then adds nearby/related files.
+
+```rust
+use matryoshka::ReadBundleOptions;
+
+let bundle = api.read_bundle(
+    ReadBundleOptions::new("how does watcher debounce flow work")
+)?;
+```
+
+Use `read_bundle` when Jesco asks:
+
+- what should I read next?
+- what files explain this flow?
+- what files should I inspect before editing this?
+
+With reranker:
+
+```rust
+use matryoshka::{ReadBundleOptions, RerankerOptions};
+
+let mut options = ReadBundleOptions::new("what should I read before editing debounce behavior");
+options.search.reranker = RerankerOptions::Omlx {
+    model: "mlx-community--Qwen3-Reranker-0.6B-mxfp8".into(),
+    candidates: 20,
+};
+
+let bundle = api.read_bundle(options)?;
+```
+
+## Cards API
+
+Cards expose the file/folder/repo summaries Matryoshka built.
+
+All cards:
+
+```rust
+let cards = api.cards(matryoshka::CardsOptions { empty_only: false })?;
+```
+
+Only cards that still need repair:
+
+```rust
+let gaps = api.cards(matryoshka::CardsOptions { empty_only: true })?;
+if !gaps.is_empty() {
+    let summary = api.prepare(PrepareOptions::default())?;
+}
+```
+
+The IDE should not show "repair summaries" as a normal user action. If gaps exist, call `prepare`.
+
+## CLI Fallback
+
+The CLI remains useful for shell usage and debugging.
+
+Environment:
 
 ```bash
 export MATRYOSHKA=/Users/rohit/cradle-embed/target/debug/matryoshka-rs
@@ -36,9 +394,10 @@ export MLX_URL=http://127.0.0.1:44447
 export MLX_KEY=2508
 export CHAT_MODEL=srswti--bodega-raptor-90m
 export EMBED_MODEL=mlx-community--embeddinggemma-300m-bf16
+export RERANK_MODEL=mlx-community--Qwen3-Reranker-0.6B-mxfp8
 ```
 
-Then:
+Prepare:
 
 ```bash
 $MATRYOSHKA prepare "$REPO" \
@@ -52,496 +411,169 @@ $MATRYOSHKA prepare "$REPO" \
   --json
 ```
 
-## What Prepare Does
-
-`prepare` checks the current state, chooses the needed work, writes logs, and emits JSON for the IDE.
-
-It handles:
-
-- first setup
-- partial database state
-- missing ready marker
-- added files
-- changed files
-- deleted files
-- missing card text
-- missing search artifacts
-- retrieval pre-warming
-
-When it finishes cleanly, it writes:
-
-```text
-<repo>/.matryoshka/.jesco-prewarm-complete
-```
-
-That marker means Jesco is ready to work with this project.
-
-## Scenario Behavior
-
-The IDE should not branch into different commands for these scenarios. It should always call `prepare`.
-
-| Scenario | What prepare detects | JSON `actions_taken` | Result |
-|---|---|---|---|
-| No DB | No indexed files | `["index", "prepare_results"]` | Builds the project map, writes cards, builds retrieval data, pre-warms, writes the ready marker. |
-| DB exists, marker missing | Database exists but ready marker is absent | `["update", "prepare_results"]` | Treats the state as partial, checks freshness, fills gaps, pre-warms, writes the ready marker. |
-| Added file | Filesystem has a new indexed file | `["update", "prepare_results"]` | Adds facts, symbols, cards, retrieval records, FTS rows, and late vectors for the new file. |
-| Changed file | File hash changed | `["update", "prepare_results"]` | Refreshes affected facts, cards, retrieval records, FTS rows, and late vectors. |
-| Deleted file | Indexed path no longer exists | `["update", "prepare_results"]` | Removes stale file records, cards, retrieval records, FTS rows, and late vectors. |
-| Cards have gaps | Existing card text is empty | `["repair", "prepare_results"]` | Re-runs enrichment for gaps, refreshes related retrieval data, pre-warms. |
-| Search data missing | Semantic records, FTS, or late vectors are missing/incomplete | `["rebuild_search", "prepare_results"]` | Rebuilds retrieval data from existing cards and facts, then pre-warms. |
-| Everything healthy | No gaps and no file changes | `["update", "prepare_results"]` | Performs a quick freshness pass, pre-warms, returns ready. |
-
-## JSON Output Contract
-
-Use `--json` for IDE integration. The important fields are:
-
-```json
-{
-  "status": "ready",
-  "repo_root": "/path/to/repo",
-  "db": "/path/to/repo/.matryoshka/matryoshka.db",
-  "ready_marker": "/path/to/repo/.matryoshka/.jesco-prewarm-complete",
-  "logs": "/path/to/repo/.matryoshka/logs",
-  "actions_taken": ["update", "prepare_results"],
-  "project_map": {
-    "status": "ready",
-    "files": 30,
-    "folders": 29,
-    "symbols": 552,
-    "cards": {
-      "file": 30,
-      "folder": 29,
-      "repo": 1,
-      "missing_text": 0,
-      "empty_file_samples": [],
-      "empty_folder_samples": []
-    }
-  },
-  "search": {
-    "status": "ready",
-    "semantic_records": 749,
-    "embedded_records": 719,
-    "fts_records": 749,
-    "late_vector_rows": 15538,
-    "records_with_late_vectors": 719,
-    "late_interaction_enabled": true
-  },
-  "changes": {
-    "changed_files": 0,
-    "removed_files": 0,
-    "changed_folders": 0,
-    "repo_card_updated": false
-  },
-  "prepare_results": {
-    "fts_records": 749,
-    "query_count": 6,
-    "warmed_hits": 24
-  },
-  "embedding_model": "mlx-community--embeddinggemma-300m-bf16"
-}
-```
-
-### Fields The IDE Should Read
-
-| Field | Meaning |
-|---|---|
-| `status` | Overall result. `ready` means Jesco can use the repo. `needs_attention` means show attention state and open logs. |
-| `actions_taken` | What Matryoshka decided to do internally. Good for progress text and diagnostics. |
-| `project_map.status` | Whether file/folder/repo cards are healthy. |
-| `project_map.cards.missing_text` | Number of cards that still need repair. Healthy is `0`. |
-| `search.status` | Whether search/read retrieval data is ready. Healthy is `ready`. |
-| `changes.changed_files` | Files added or changed in this run. |
-| `changes.removed_files` | Files deleted and cleaned up in this run. |
-| `changes.changed_folders` | Folder cards refreshed in this run. |
-| `prepare_results.warmed_hits` | Number of results touched by pre-warming. Nonzero means first searches should be faster. |
-| `logs` | Directory containing `prepare.jsonl` and other command logs. |
-| `ready_marker` | File written when the repo is fully ready. |
-
-## IDE State Mapping
-
-Recommended UI language:
-
-| JSON state | IDE state | Suggested copy |
-|---|---|---|
-| Command running | Getting Ready | Jesco is getting this project ready. |
-| `actions_taken` contains `index` | Preparing Project | Reading the project and building Jesco's map. |
-| `actions_taken` contains `repair` | Repairing | Filling in missing project details. |
-| `actions_taken` contains `rebuild_search` | Refreshing Results | Rebuilding the fast lookup layer. |
-| `actions_taken` contains `prepare_results` | Warming Results | Making first searches faster. |
-| `status == "ready"` | Ready | Jesco is ready to work with you on this project. |
-| `status == "needs_attention"` | Needs Attention | Jesco needs a quick check before it can use this project. |
-
-Keep the primary button simple:
-
-```text
-Prepare
-```
-
-Advanced/debug buttons can exist elsewhere, but normal setup and freshness should use `prepare`.
-
-## Logs
-
-`prepare` writes JSONL logs here:
-
-```text
-<repo>/.matryoshka/logs/prepare.jsonl
-```
-
-Useful events:
-
-```json
-{"event":"prepare_started","fields":{"existing_file_count":30,"existing_missing_text":0,"existing_search_missing":true,"ready_marker_exists":true}}
-{"event":"prepare_decision","fields":{"action":"rebuild_search","reason":"search data is missing or incomplete"}}
-{"event":"update_started","fields":{}}
-{"event":"update_completed","fields":{}}
-{"event":"prewarm_started","fields":{}}
-{"event":"prewarm_completed","fields":{}}
-{"event":"prepare_completed","fields":{"status":"ready"}}
-```
-
-For the IDE:
-
-- stream the command output for progress
-- read final JSON for state
-- open the `logs` directory when the user asks for details
-- use `prepare.jsonl` to explain what happened when a run needs attention
-
-## Tested Prepare Flow
-
-Implemented and tested against:
-
-```text
-/Users/rohit/cradle-embed/test_repo
-```
-
-Using online oMLX on port `44447`. No offline index was used for the real simulations.
-
-Command shape tested:
+Search:
 
 ```bash
-/Users/rohit/cradle-embed/target/debug/matryoshka-rs prepare /Users/rohit/cradle-embed/test_repo \
-  --db <scenario-db> \
-  --base-url http://127.0.0.1:44447 \
-  --api-key 2508 \
-  --model srswti--bodega-raptor-90m \
-  --embedding-model mlx-community--embeddinggemma-300m-bf16 \
-  --ignore .matryoshka \
-  --ignore target \
-  --limit 4 \
-  --json
-```
-
-Results:
-
-| Scenario | JSON `actions_taken` | Result |
-|---|---|---|
-| No DB | `["index", "prepare_results"]` | Passed. Full index, cards healthy, search ready. |
-| DB exists, marker missing | `["update", "prepare_results"]` | Passed. Detected missing marker in logs, wrote marker, ready. |
-| Added file | `["update", "prepare_results"]` | Passed. `changed_files: 1`, file count rose to 31, ready. |
-| Changed file | `["update", "prepare_results"]` | Passed. `changed_files: 1`, ready. |
-| Deleted file | `["update", "prepare_results"]` | Passed. `removed_files: 1`, file count returned to 30, stale records removed. |
-| Cards have gaps | `["repair", "prepare_results"]` | Passed. Two blanked cards were repaired; `missing_text: 0`. |
-| Search data missing | `["rebuild_search", "prepare_results"]` | Passed. Deleted retrieval rows were rebuilt; status ready. |
-| Everything healthy | `["update", "prepare_results"]` | Passed. No changed files, no gaps, search ready. |
-
-Key exact outputs:
-
-```json
-{
-  "status": "ready",
-  "actions_taken": ["index", "prepare_results"],
-  "changes": {
-    "changed_files": 30,
-    "changed_folders": 29,
-    "removed_files": 0
-  },
-  "project_map": {
-    "status": "ready"
-  },
-  "search": {
-    "status": "ready"
-  },
-  "prepare_results": {
-    "warmed_hits": 24
-  }
-}
-```
-
-```json
-{
-  "status": "ready",
-  "actions_taken": ["repair", "prepare_results"],
-  "project_map": {
-    "cards": {
-      "missing_text": 0
-    }
-  },
-  "search": {
-    "status": "ready"
-  }
-}
-```
-
-```json
-{
-  "status": "ready",
-  "actions_taken": ["rebuild_search", "prepare_results"],
-  "search": {
-    "semantic_records": 719,
-    "fts_records": 719,
-    "late_vector_rows": 15538,
-    "records_with_late_vectors": 719,
-    "status": "ready"
-  }
-}
-```
-
-Deleted file cleanup was verified directly:
-
-```text
-file_cards|0
-semantic_records|0
-```
-
-for the deleted probe path.
-
-Verification:
-
-```bash
-cargo build -p matryoshka-cli
-cargo test -p matryoshka-cli
-```
-
-Both passed.
-
-## Starting oMLX
-
-Start the local server before production `prepare` runs:
-
-```bash
-cd /Users/rohit/cradle-mlx/helpers/omlx
-source .venv/bin/activate
-
-jesco-apple serve \
-  --host 127.0.0.1 \
-  --port 44447 \
-  --api-key 2508 \
-  --max-concurrent-requests 6
-```
-
-Then run `prepare` with:
-
-```bash
---base-url http://127.0.0.1:44447
---api-key 2508
---model srswti--bodega-raptor-90m
---embedding-model mlx-community--embeddinggemma-300m-bf16
-```
-
-## Cards Health Command
-
-`prepare` already checks card health internally. Use `cards` only for inspection or debugging.
-
-Show only cards with missing text:
-
-```bash
-matryoshka-rs cards --db "$DB" --json --empty
-```
-
-Healthy output:
-
-```json
-[]
-```
-
-Non-empty output:
-
-```json
-[
-  {
-    "card_type": "file",
-    "id": "watcher/src/poller.rs",
-    "summary": "",
-    "is_empty": true
-  }
-]
-```
-
-Show all card summaries:
-
-```bash
-matryoshka-rs cards --db "$DB" --json --summaries
-```
-
-Markdown output for humans or LLM tools:
-
-```bash
-matryoshka-rs cards --db "$DB" --summaries
-matryoshka-rs cards --db "$DB" --empty
-```
-
-## Search
-
-After `prepare` returns `ready`, search is available.
-
-Basic search:
-
-```bash
-matryoshka-rs search \
+$MATRYOSHKA search \
   --db "$DB" \
   --base-url "$MLX_URL" \
   --api-key "$MLX_KEY" \
   --embedding-model "$EMBED_MODEL" \
-  "where is watcher debounce handled"
+  "where is debounce handled"
 ```
 
 Search with oMLX reranker:
 
 ```bash
-matryoshka-rs search \
+$MATRYOSHKA search \
   --db "$DB" \
   --base-url "$MLX_URL" \
   --api-key "$MLX_KEY" \
   --embedding-model "$EMBED_MODEL" \
   --omlx-rerank \
-  --omlx-rerank-model mlx-community--Qwen3-Reranker-0.6B-mxfp8 \
-  "where is watcher debounce handled"
+  --omlx-rerank-model "$RERANK_MODEL" \
+  "where is debounce handled"
 ```
 
-Use reranking when the first page needs to be sharper. Skip it when speed matters more.
-
-## Read
-
-Read one file from the prepared project map:
+Read:
 
 ```bash
-matryoshka-rs read \
+$MATRYOSHKA read \
   --db "$DB" \
   --repo-root "$REPO" \
-  watcher/src/poller.rs
+  src/watcher.rs
 ```
 
-Read a focused bundle for an edit or investigation:
+Read bundle:
 
 ```bash
-matryoshka-rs read-bundle \
+$MATRYOSHKA read-bundle \
   --db "$DB" \
   --repo-root "$REPO" \
-  --mode edit \
   --base-url "$MLX_URL" \
   --api-key "$MLX_KEY" \
   --embedding-model "$EMBED_MODEL" \
-  "change watcher debounce behavior"
+  "what should I read before editing debounce behavior"
 ```
 
-With oMLX reranking:
+Cards:
 
 ```bash
-matryoshka-rs read-bundle \
-  --db "$DB" \
-  --repo-root "$REPO" \
-  --mode edit \
-  --base-url "$MLX_URL" \
-  --api-key "$MLX_KEY" \
-  --embedding-model "$EMBED_MODEL" \
-  --omlx-rerank \
-  --omlx-rerank-model mlx-community--Qwen3-Reranker-0.6B-mxfp8 \
-  "change watcher debounce behavior"
+$MATRYOSHKA cards --db "$DB" --summaries
+$MATRYOSHKA cards --db "$DB" --empty
+$MATRYOSHKA cards --db "$DB" --json
 ```
 
-## Op Commands
+## IDE Wording
 
-`op` commands are task-shaped search/read helpers. Use them after `prepare`.
+Keep the user-facing surface small.
 
-Examples:
+Primary button:
 
-```bash
-matryoshka-rs op find-symbol \
-  --db "$DB" \
-  --base-url "$MLX_URL" \
-  --api-key "$MLX_KEY" \
-  --embedding-model "$EMBED_MODEL" \
-  "RepoWatcher"
+```text
+Prepare
 ```
 
-```bash
-matryoshka-rs op edit-target \
-  --db "$DB" \
-  --base-url "$MLX_URL" \
-  --api-key "$MLX_KEY" \
-  --embedding-model "$EMBED_MODEL" \
-  "add a new search ranking boost"
-```
+Good states:
 
-```bash
-matryoshka-rs op read-next \
-  --db "$DB" \
-  --base-url "$MLX_URL" \
-  --api-key "$MLX_KEY" \
-  --embedding-model "$EMBED_MODEL" \
-  "after reading watcher/src/poller.rs, what should I read next"
-```
-
-Use `--omlx-rerank` on these when top-result precision matters.
-
-## Advanced Commands
-
-These commands still exist, but normal IDE lifecycle should not call them directly.
-
-| Command | Use |
+| State | Copy |
 |---|---|
-| `index` | Force a clean full build. Mostly debugging now. |
-| `update` | Force incremental refresh. `prepare` calls this when needed. |
-| `prewarm` | Warm retrieval only. `prepare` calls this automatically. |
-| `rebuild-semantic` | Rebuild retrieval data. `prepare` calls this when search data is missing. |
-| `watch` | Long-running watcher mode. IDEs can instead call `prepare` after file changes. |
-| `cards` | Inspect card health and text. |
+| Not ready | Jesco needs a moment to get this project ready. |
+| Running | Jesco is preparing this project. |
+| Ready | Jesco is ready to work with you on this project. |
+| Needs attention | Jesco needs a quick check before using this project. |
 
-For the product path, prefer:
+Avoid exposing internal terms in the main UI:
 
-```text
-Prepare -> Search / Read / Op
-```
+- semantic index
+- late vectors
+- FTS
+- repair summaries
+- rebuild retrieval
 
-## Offline Mode
+Those are log/details concepts, not first-run UI concepts.
 
-`--offline` is for deterministic smoke tests. It avoids the LLM and can produce thinner or missing card text.
+## Verified Tests
 
-Do not use offline mode for production setup.
-
-Production setup should use:
+Default test lane:
 
 ```bash
---base-url "$MLX_URL"
---api-key "$MLX_KEY"
---model "$CHAT_MODEL"
---embedding-model "$EMBED_MODEL"
+cargo test -p matryoshka
+cargo test
 ```
 
-## Practical IDE Flow
+Live oMLX lifecycle test:
 
-On project open:
+```bash
+MATRYOSHKA_REAL_OMLX=1 \
+MATRYOSHKA_MLX_BASE_URL=http://127.0.0.1:44447 \
+MATRYOSHKA_MLX_API_KEY=2508 \
+MATRYOSHKA_MLX_CHAT_MODEL=srswti--bodega-raptor-90m \
+MATRYOSHKA_MLX_EMBED_MODEL=mlx-community--embeddinggemma-300m-bf16 \
+MATRYOSHKA_OMLX_RERANK_MODEL=mlx-community--Qwen3-Reranker-0.6B-mxfp8 \
+cargo test -p matryoshka --test real_omlx -- --ignored --nocapture
+```
+
+This live test covers:
+
+- no DB
+- ready marker missing
+- file added
+- file changed
+- file deleted
+- card gaps
+- search data missing
+- healthy repo
+- search
+- search with oMLX reranker
+- read
+- read bundle
+- cards
+- typed progress events
+
+Last verified live result:
 
 ```text
-run prepare
-read final JSON
-if status == ready: show "Jesco is ready to work with you on this project."
-else: show attention state and offer Open Logs
+test real_omlx_prepare_search_read_lifecycle_work_through_rust_api ... ok
+finished in 37.70s
 ```
 
-On file save, add, delete, branch change, or dependency changes:
+Live test against the copied-crates repo:
+
+```bash
+MATRYOSHKA_TEST_REPO=/Users/rohit/cradle-embed/test_repo \
+MATRYOSHKA_MLX_BASE_URL=http://127.0.0.1:44447 \
+MATRYOSHKA_MLX_API_KEY=2508 \
+MATRYOSHKA_MLX_CHAT_MODEL=srswti--bodega-raptor-90m \
+MATRYOSHKA_MLX_EMBED_MODEL=mlx-community--embeddinggemma-300m-bf16 \
+MATRYOSHKA_OMLX_RERANK_MODEL=mlx-community--Qwen3-Reranker-0.6B-mxfp8 \
+cargo test -p matryoshka --test test_repo_omlx -- --ignored --nocapture
+```
+
+This test uses:
 
 ```text
-run prepare again
-use changes.* to show what changed
-use project_map and search status to decide ready vs attention
+/Users/rohit/cradle-embed/test_repo/.matryoshka/api-test-repo-live/matryoshka.db
 ```
 
-Before search/read:
+It verifies the same prepare lifecycle on the real copied-crates repo, then checks search, oMLX-reranked search, read, read-bundle, cards, logs, and progress events.
+
+Last verified result:
 
 ```text
-if ready marker exists and latest prepare status is ready: run search/read/op
-else: run prepare first
+no_db actions=["index", "prepare_results"] files=30 symbols=552 records=749 warmed=12
+search top=[("watcher/src/poller.rs", ...), ("watcher/src/matryoshka_update_probe.rs", ...)]
+reranked search top=[("watcher/src/poller.rs", ...), ("watcher/src/invalidation.rs", ...)]
+read file=watcher/src/poller.rs symbols=18 deps=1 dependents=0
+read_bundle primary=watcher/src/matryoshka_update_probe.rs related=3
+cards total=60 empty=0
+marker_missing actions=["update", "prepare_results"]
+file_added actions=["update", "prepare_results"] changed_files=1
+file_changed actions=["update", "prepare_results"] changed_files=1
+file_deleted actions=["update", "prepare_results"] removed_files=1
+card_gaps actions=["repair", "prepare_results"]
+search_missing actions=["rebuild_search", "prepare_results"] records=719 fts=719 late_records=719
+healthy actions=["update", "prepare_results"] changed_files=0 removed_files=0
+test test_repo_live_prepare_search_read_and_progress_work_through_rust_api ... ok
+finished in 422.76s
 ```
-
-That is the simple contract: the IDE asks Matryoshka to prepare; Matryoshka decides the rest.

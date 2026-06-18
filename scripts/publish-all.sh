@@ -12,6 +12,7 @@ CRATES=(
   matryoshka-search
   matryoshka-watcher
   matryoshka-indexer
+  matryoshka
   matryoshka-cli
 )
 
@@ -26,6 +27,7 @@ MATRYOSHKA_DEPS=(
   matryoshka-search
   matryoshka-read-api
   matryoshka-watcher
+  matryoshka
 )
 
 usage() {

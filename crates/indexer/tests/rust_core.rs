@@ -235,7 +235,7 @@ fn incremental_update_removes_deleted_files_from_fts_candidates() {
 }
 
 #[test]
-fn heuristic_parent_folder_cards_do_not_invent_rollup_summaries() {
+fn heuristic_parent_folder_cards_use_grounded_rollup_summaries() {
     let temp = tempfile::tempdir().unwrap();
     let repo_root = temp.path();
     fs::create_dir_all(repo_root.join("gateway/crates/service/src")).unwrap();
@@ -259,9 +259,23 @@ fn heuristic_parent_folder_cards_do_not_invent_rollup_summaries() {
         .load_folder_card("gateway/crates/service")
         .unwrap()
         .unwrap();
-    assert!(parent.summary.is_empty(), "{}", parent.summary);
     assert!(
-        parent.responsibility.is_empty(),
+        parent.summary.contains("gateway/crates/service"),
+        "{}",
+        parent.summary
+    );
+    assert!(
+        parent.summary.contains("gateway/crates/service/src"),
+        "{}",
+        parent.summary
+    );
+    assert!(
+        !parent.summary.contains("central hub") && !parent.summary.contains("semantic"),
+        "{}",
+        parent.summary
+    );
+    assert!(
+        parent.responsibility.contains("gateway/crates/service"),
         "{}",
         parent.responsibility
     );
@@ -270,7 +284,9 @@ fn heuristic_parent_folder_cards_do_not_invent_rollup_summaries() {
             .subareas
             .iter()
             .any(|subarea| subarea.id == "gateway/crates/service/src"
-                && subarea.responsibility.is_empty()),
+                && subarea
+                    .responsibility
+                    .contains("gateway/crates/service/src/lib.rs")),
         "{:?}",
         parent.subareas
     );
