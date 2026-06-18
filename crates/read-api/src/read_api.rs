@@ -88,12 +88,7 @@ impl ReadApi {
                 .as_ref()
                 .filter(|_| !folder_card_is_heuristic)
                 .map(folder_overview),
-            symbols: read_symbols(
-                &symbols,
-                file_card.as_ref(),
-                &source_lines,
-                card_is_heuristic,
-            ),
+            symbols: read_symbols(&symbols, file_card.as_ref(), &source_lines),
             imports: read_imports(
                 &file.imports,
                 file_card.as_ref().filter(|_| !card_is_heuristic),
@@ -262,7 +257,6 @@ fn read_symbols(
     symbols: &[SymbolFact],
     card: Option<&FileCard>,
     source_lines: &[String],
-    card_is_heuristic: bool,
 ) -> Vec<ReadSymbol> {
     symbols
         .iter()
@@ -270,11 +264,7 @@ fn read_symbols(
             let symbol_behavior = card
                 .and_then(|card| matching_symbol_behavior(symbol, &card.important_symbols))
                 .and_then(|behavior| {
-                    meaningful_symbol_behavior(
-                        &behavior.behavior,
-                        &symbol.signature,
-                        card_is_heuristic,
-                    )
+                    meaningful_symbol_behavior(&behavior.behavior, &symbol.signature)
                 });
             ReadSymbol {
                 name: symbol.name.clone(),
@@ -300,21 +290,16 @@ fn matching_symbol_behavior<'a>(
     })
 }
 
-fn meaningful_symbol_behavior(
-    behavior: &str,
-    signature: &str,
-    card_is_heuristic: bool,
-) -> Option<String> {
+fn meaningful_symbol_behavior(behavior: &str, signature: &str) -> Option<String> {
     let trimmed = behavior.trim();
     if trimmed.is_empty() {
         return None;
     }
-    if card_is_heuristic
-        && (trimmed == signature.trim()
-            || trimmed.starts_with("fn ")
-            || trimmed.starts_with("struct ")
-            || trimmed.starts_with("enum ")
-            || trimmed.starts_with("impl "))
+    if trimmed == signature.trim()
+        || trimmed.starts_with("fn ")
+        || trimmed.starts_with("struct ")
+        || trimmed.starts_with("enum ")
+        || trimmed.starts_with("impl ")
     {
         return None;
     }
