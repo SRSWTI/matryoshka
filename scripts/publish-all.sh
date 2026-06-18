@@ -149,8 +149,9 @@ if [[ "$mode" == "dry-run" ]]; then
   exit 0
 fi
 
-perl -0pi -e '
+NEW_VERSION="$new_version" perl -0pi -e '
   my $new = $ENV{"NEW_VERSION"};
+  die "NEW_VERSION is empty\n" unless defined($new) && length($new);
   s/(\[workspace\.package\][^\[]*?version\s*=\s*")[^"]+(")/$1$new$2/s;
 ' Cargo.toml
 
