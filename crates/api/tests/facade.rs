@@ -1,6 +1,7 @@
 use matryoshka::{
-    CardsOptions, Matryoshka, MatryoshkaConfig, MatryoshkaEvent, PrepareOptions, PrepareStatus,
-    ReadBundleOptions, SearchOptions, artifact_gap_count, progress_state_path, ready_marker_path,
+    CardsOptions, Matryoshka, MatryoshkaCancelToken, MatryoshkaConfig, MatryoshkaEvent,
+    PrepareOptions, PrepareStatus, ReadBundleOptions, SearchOptions, artifact_gap_count,
+    is_cancelled_error, progress_state_path, ready_marker_path,
 };
 use matryoshka_core_ir::MatryoshkaProgressEvent;
 use rusqlite::Connection;
@@ -121,6 +122,72 @@ fn prepare_search_read_and_repair_lifecycle_work_through_rust_api() {
     assert_eq!(healthy.changed_files, 0);
     assert_eq!(healthy.removed_files, 0);
     assert_progress_events_are_consistent(&healthy_events);
+}
+
+#[test]
+fn prepare_cancellation_before_start_emits_cancelled_state() {
+    let fixture = Fixture::new();
+    let repo = fixture.repo();
+    let db = repo.join(".matryoshka/matryoshka-api-cancel-before.db");
+    let api = test_api(&repo, &db);
+    let cancel_token = MatryoshkaCancelToken::new();
+    cancel_token.cancel();
+
+    let mut events = Vec::new();
+    let err = api
+        .prepare_with_progress_and_cancel(PrepareOptions::default(), cancel_token, |event| {
+            events.push(event)
+        })
+        .unwrap_err();
+
+    assert!(is_cancelled_error(err.as_ref()));
+    assert_cancelling_then_cancelled(&events);
+    assert_cancelled_progress_state(&db);
+    assert!(!ready_marker_path(&db).exists());
+}
+
+#[test]
+fn prepare_cancellation_during_enrichment_stops_before_ready() {
+    let fixture = Fixture::new();
+    let repo = fixture.repo();
+    let db = repo.join(".matryoshka/matryoshka-api-cancel-during.db");
+    let api = test_api(&repo, &db);
+    let cancel_token = MatryoshkaCancelToken::new();
+    let cancel_from_callback = cancel_token.clone();
+
+    let mut events = Vec::new();
+    let err = api
+        .prepare_with_progress_and_cancel(
+            PrepareOptions {
+                limit: 3,
+                queries: vec!["watcher debounce changed removed paths".into()],
+                write_progress_state: true,
+            },
+            cancel_token,
+            |event| {
+                if matches!(
+                    &event,
+                    MatryoshkaEvent::IndexerProgress {
+                        progress: MatryoshkaProgressEvent::EnrichingFile { .. },
+                        ..
+                    }
+                ) {
+                    cancel_from_callback.cancel();
+                }
+                events.push(event);
+            },
+        )
+        .unwrap_err();
+
+    assert!(is_cancelled_error(err.as_ref()));
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, MatryoshkaEvent::IndexerProgress { .. }))
+    );
+    assert_cancelling_then_cancelled(&events);
+    assert_cancelled_progress_state(&db);
+    assert!(!ready_marker_path(&db).exists());
 }
 
 struct Fixture {
@@ -304,6 +371,30 @@ fn assert_ready_progress_state(db: &Path) {
         serde_json::from_str(&fs::read_to_string(state_path).unwrap()).unwrap();
     assert_eq!(value["status"], "ready");
     assert_eq!(value["percent"], 1.0);
+}
+
+fn assert_cancelled_progress_state(db: &Path) {
+    let state_path = progress_state_path(db);
+    assert!(state_path.exists());
+    let value: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(state_path).unwrap()).unwrap();
+    assert_eq!(value["status"], "cancelled");
+    assert_eq!(value["phase"], "cancelled");
+}
+
+fn assert_cancelling_then_cancelled(events: &[MatryoshkaEvent]) {
+    let cancelling = events
+        .iter()
+        .position(|event| matches!(event, MatryoshkaEvent::PrepareCancelling { .. }))
+        .expect("prepare should emit cancelling event");
+    let cancelled = events
+        .iter()
+        .position(|event| matches!(event, MatryoshkaEvent::PrepareCancelled { .. }))
+        .expect("prepare should emit cancelled event");
+    assert!(
+        cancelling < cancelled,
+        "cancelling event should be emitted before cancelled event"
+    );
 }
 
 fn conn(db: &Path) -> Connection {

@@ -1,9 +1,12 @@
 use anyhow::{Result, anyhow};
 use matryoshka_core_ir::{
-    ArtifactQualityReport, MatryoshkaProgressEvent, ReadCard, RetrievalIndexReport, SearchHit,
+    ArtifactQualityReport, FileCard, FileEnrichmentContext, FileFact, FolderCard,
+    FolderEnrichmentContext, FolderFact, MatryoshkaProgressEvent, ReadCard, RepoCard,
+    RetrievalIndexReport, SearchHit, SymbolFact,
 };
+use matryoshka_embed_client::Embedder;
 use matryoshka_embed_client::{DeterministicEmbedder, EndpointEmbedder};
-use matryoshka_enricher::{HeuristicEnricher, MlxChatEnricher};
+use matryoshka_enricher::{CodeEnricher, HeuristicEnricher, MlxChatEnricher};
 use matryoshka_indexer::{FullIndexer, SemanticRebuildSummary, UpdateSummary};
 use matryoshka_parser::ParserConfig;
 use matryoshka_read_api::{ReadApi, ReadBundle, ReadPackMode};
@@ -16,6 +19,10 @@ use serde_json::json;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const DEFAULT_BASE_URL: &str = "http://127.0.0.1:44445";
@@ -30,6 +37,33 @@ pub const READY_MARKER_FILE: &str = ".jesco-prewarm-complete";
 #[derive(Debug, Clone)]
 pub struct Matryoshka {
     config: MatryoshkaConfig,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct MatryoshkaCancelToken {
+    cancelled: Arc<AtomicBool>,
+}
+
+impl MatryoshkaCancelToken {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn cancel(&self) {
+        self.cancelled.store(true, Ordering::SeqCst);
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::SeqCst)
+    }
+
+    fn check(&self) -> Result<()> {
+        if self.is_cancelled() {
+            Err(cancelled_error())
+        } else {
+            Ok(())
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -259,6 +293,12 @@ pub enum MatryoshkaEvent {
     PrewarmCompleted {
         summary: SearchPrewarmSummaryJson,
     },
+    PrepareCancelling {
+        reason: String,
+    },
+    PrepareCancelled {
+        reason: String,
+    },
     PrepareCompleted {
         summary: PrepareSummary,
     },
@@ -275,6 +315,89 @@ pub struct ProgressState {
     pub files_done: Option<usize>,
     pub files_total: Option<usize>,
     pub updated_at_unix_ms: u128,
+}
+
+struct CancellableEnricher<E> {
+    inner: E,
+    cancel_token: MatryoshkaCancelToken,
+}
+
+impl<E> CancellableEnricher<E> {
+    fn new(inner: E, cancel_token: MatryoshkaCancelToken) -> Self {
+        Self {
+            inner,
+            cancel_token,
+        }
+    }
+}
+
+impl<E> CodeEnricher for CancellableEnricher<E>
+where
+    E: CodeEnricher,
+{
+    fn enrich_file(
+        &self,
+        file: &FileFact,
+        symbols: &[SymbolFact],
+        context: &FileEnrichmentContext,
+    ) -> Result<FileCard> {
+        self.cancel_token.check()?;
+        let card = self.inner.enrich_file(file, symbols, context)?;
+        self.cancel_token.check()?;
+        Ok(card)
+    }
+
+    fn enrich_folder(
+        &self,
+        folder: &FolderFact,
+        child_files: &[FileCard],
+        child_folders: &[FolderCard],
+        context: &FolderEnrichmentContext,
+    ) -> Result<FolderCard> {
+        self.cancel_token.check()?;
+        let card = self
+            .inner
+            .enrich_folder(folder, child_files, child_folders, context)?;
+        self.cancel_token.check()?;
+        Ok(card)
+    }
+
+    fn enrich_repo(&self, repo_root: &str, folders: &[FolderCard]) -> Result<RepoCard> {
+        self.cancel_token.check()?;
+        let card = self.inner.enrich_repo(repo_root, folders)?;
+        self.cancel_token.check()?;
+        Ok(card)
+    }
+}
+
+struct CancellableEmbedder<M> {
+    inner: M,
+    cancel_token: MatryoshkaCancelToken,
+}
+
+impl<M> CancellableEmbedder<M> {
+    fn new(inner: M, cancel_token: MatryoshkaCancelToken) -> Self {
+        Self {
+            inner,
+            cancel_token,
+        }
+    }
+}
+
+impl<M> Embedder for CancellableEmbedder<M>
+where
+    M: Embedder,
+{
+    fn model(&self) -> &str {
+        self.inner.model()
+    }
+
+    fn embed(&self, inputs: &[String]) -> Result<Vec<Vec<f32>>> {
+        self.cancel_token.check()?;
+        let embeddings = self.inner.embed(inputs)?;
+        self.cancel_token.check()?;
+        Ok(embeddings)
+    }
 }
 
 impl Matryoshka {
@@ -295,6 +418,17 @@ impl Matryoshka {
         options: PrepareOptions,
         mut on_event: impl FnMut(MatryoshkaEvent),
     ) -> Result<PrepareSummary> {
+        self.prepare_with_progress_and_cancel(options, MatryoshkaCancelToken::new(), |event| {
+            on_event(event)
+        })
+    }
+
+    pub fn prepare_with_progress_and_cancel(
+        &self,
+        options: PrepareOptions,
+        cancel_token: MatryoshkaCancelToken,
+        mut on_event: impl FnMut(MatryoshkaEvent),
+    ) -> Result<PrepareSummary> {
         ensure_matryoshka_layout(&self.config.db)?;
         let mut progress_writer =
             ProgressStateWriter::new(&self.config.db, options.write_progress_state);
@@ -309,6 +443,15 @@ impl Matryoshka {
                 .unwrap_or(false);
         let ready_marker_exists = ready_marker.exists();
         let mut actions_taken = Vec::new();
+
+        if cancel_token.is_cancelled() {
+            return cancel_prepare(
+                &mut on_event,
+                &mut progress_writer,
+                &mut log,
+                "prepare was cancelled before it started",
+            );
+        }
 
         let started = MatryoshkaEvent::PrepareStarted {
             repo_root: self.config.repo_root.clone(),
@@ -361,10 +504,19 @@ impl Matryoshka {
             first_action,
             first_reason,
         )?;
+        if cancel_token.is_cancelled() {
+            return cancel_prepare(
+                &mut on_event,
+                &mut progress_writer,
+                &mut log,
+                "prepare was cancelled before indexing started",
+            );
+        }
 
-        let mut update = self.run_update_once_with_progress(
+        let mut update = match self.run_update_once_with_progress(
             parser_config.clone(),
             Some(&mut log),
+            &cancel_token,
             |progress| {
                 emit_event(
                     &mut on_event,
@@ -375,10 +527,29 @@ impl Matryoshka {
                     },
                 );
             },
-        )?;
+        ) {
+            Ok(summary) => summary,
+            Err(_err) if cancel_token.is_cancelled() => {
+                return cancel_prepare(
+                    &mut on_event,
+                    &mut progress_writer,
+                    &mut log,
+                    "prepare was cancelled while updating the project",
+                );
+            }
+            Err(err) => return Err(err),
+        };
         actions_taken.push(first_action.to_string());
 
         if artifact_gap_count(&update.artifact_quality) > 0 && first_action != "repair" {
+            if cancel_token.is_cancelled() {
+                return cancel_prepare(
+                    &mut on_event,
+                    &mut progress_writer,
+                    &mut log,
+                    "prepare was cancelled before repair",
+                );
+            }
             prepare_decision(
                 &mut on_event,
                 &mut progress_writer,
@@ -386,8 +557,11 @@ impl Matryoshka {
                 "repair",
                 "project map has gaps",
             )?;
-            update =
-                self.run_update_once_with_progress(parser_config, Some(&mut log), |progress| {
+            update = match self.run_update_once_with_progress(
+                parser_config,
+                Some(&mut log),
+                &cancel_token,
+                |progress| {
                     emit_event(
                         &mut on_event,
                         &mut progress_writer,
@@ -396,13 +570,33 @@ impl Matryoshka {
                             progress,
                         },
                     );
-                })?;
+                },
+            ) {
+                Ok(summary) => summary,
+                Err(_err) if cancel_token.is_cancelled() => {
+                    return cancel_prepare(
+                        &mut on_event,
+                        &mut progress_writer,
+                        &mut log,
+                        "prepare was cancelled while repairing the project",
+                    );
+                }
+                Err(err) => return Err(err),
+            };
             actions_taken.push("repair".into());
         }
 
         let mut artifact_quality = update.artifact_quality.clone();
         let mut retrieval_index = update.retrieval_index.clone();
         if retrieval_needs_rebuild(&retrieval_index, self.config.late_interaction) {
+            if cancel_token.is_cancelled() {
+                return cancel_prepare(
+                    &mut on_event,
+                    &mut progress_writer,
+                    &mut log,
+                    "prepare was cancelled before rebuilding search",
+                );
+            }
             prepare_decision(
                 &mut on_event,
                 &mut progress_writer,
@@ -410,8 +604,10 @@ impl Matryoshka {
                 "rebuild_search",
                 "search data is missing or incomplete",
             )?;
-            let rebuild =
-                self.run_rebuild_semantic_once_with_progress(Some(&mut log), |progress| {
+            let rebuild = match self.run_rebuild_semantic_once_with_progress(
+                Some(&mut log),
+                &cancel_token,
+                |progress| {
                     emit_event(
                         &mut on_event,
                         &mut progress_writer,
@@ -420,7 +616,19 @@ impl Matryoshka {
                             progress,
                         },
                     );
-                })?;
+                },
+            ) {
+                Ok(summary) => summary,
+                Err(_err) if cancel_token.is_cancelled() => {
+                    return cancel_prepare(
+                        &mut on_event,
+                        &mut progress_writer,
+                        &mut log,
+                        "prepare was cancelled while rebuilding search",
+                    );
+                }
+                Err(err) => return Err(err),
+            };
             artifact_quality = rebuild.artifact_quality;
             if !actions_taken
                 .iter()
@@ -435,6 +643,14 @@ impl Matryoshka {
         } else {
             options.queries.clone()
         };
+        if cancel_token.is_cancelled() {
+            return cancel_prepare(
+                &mut on_event,
+                &mut progress_writer,
+                &mut log,
+                "prepare was cancelled before warming results",
+            );
+        }
         prepare_decision(
             &mut on_event,
             &mut progress_writer,
@@ -450,7 +666,19 @@ impl Matryoshka {
                 limit: options.limit,
             },
         );
-        let prewarm = self.run_prewarm_once(&queries, options.limit, Some(&mut log))?;
+        let prewarm =
+            match self.run_prewarm_once(&queries, options.limit, Some(&mut log), &cancel_token) {
+                Ok(summary) => summary,
+                Err(_err) if cancel_token.is_cancelled() => {
+                    return cancel_prepare(
+                        &mut on_event,
+                        &mut progress_writer,
+                        &mut log,
+                        "prepare was cancelled while warming results",
+                    );
+                }
+                Err(err) => return Err(err),
+            };
         let prewarm_json = SearchPrewarmSummaryJson::from(prewarm);
         emit_event(
             &mut on_event,
@@ -586,8 +814,10 @@ impl Matryoshka {
         &self,
         parser_config: ParserConfig,
         mut log: Option<&mut CommandLog>,
+        cancel_token: &MatryoshkaCancelToken,
         mut progress: impl FnMut(MatryoshkaProgressEvent),
     ) -> Result<UpdateSummary> {
+        cancel_token.check()?;
         if let Some(log) = log.as_deref_mut() {
             log.event(
                 "update_started",
@@ -601,9 +831,13 @@ impl Matryoshka {
         }
         let store = MatryoshkaStore::open(&self.config.db)?;
         let summary = if self.config.offline {
-            FullIndexer::new(store, HeuristicEnricher, DeterministicEmbedder::default())
-                .with_parser_config(parser_config)
-                .update_repo_with_progress(&self.config.repo_root, &mut progress)?
+            FullIndexer::new(
+                store,
+                CancellableEnricher::new(HeuristicEnricher, cancel_token.clone()),
+                CancellableEmbedder::new(DeterministicEmbedder::default(), cancel_token.clone()),
+            )
+            .with_parser_config(parser_config)
+            .update_repo_with_progress(&self.config.repo_root, &mut progress)?
         } else {
             let enricher = MlxChatEnricher::new(&self.config.base_url, &self.config.api_key)
                 .with_model(self.config.chat_model.clone());
@@ -612,10 +846,15 @@ impl Matryoshka {
                 &self.config.api_key,
                 self.config.embedding_model.clone(),
             );
-            FullIndexer::new(store, enricher, embedder)
-                .with_parser_config(parser_config)
-                .update_repo_with_progress(&self.config.repo_root, &mut progress)?
+            FullIndexer::new(
+                store,
+                CancellableEnricher::new(enricher, cancel_token.clone()),
+                CancellableEmbedder::new(embedder, cancel_token.clone()),
+            )
+            .with_parser_config(parser_config)
+            .update_repo_with_progress(&self.config.repo_root, &mut progress)?
         };
+        cancel_token.check()?;
         if let Some(log) = log.as_deref_mut() {
             log.event("update_completed", update_summary_json(&summary))?;
         }
@@ -625,8 +864,10 @@ impl Matryoshka {
     fn run_rebuild_semantic_once_with_progress(
         &self,
         mut log: Option<&mut CommandLog>,
+        cancel_token: &MatryoshkaCancelToken,
         mut progress: impl FnMut(MatryoshkaProgressEvent),
     ) -> Result<SemanticRebuildSummary> {
+        cancel_token.check()?;
         if let Some(log) = log.as_deref_mut() {
             log.event(
                 "semantic_rebuild_started",
@@ -640,20 +881,28 @@ impl Matryoshka {
         }
         let store = MatryoshkaStore::open(&self.config.db)?;
         let summary = if self.config.offline {
-            FullIndexer::new(store, HeuristicEnricher, DeterministicEmbedder::default())
-                .rebuild_semantic_index_with_progress(&self.config.repo_root, &mut progress)?
+            FullIndexer::new(
+                store,
+                CancellableEnricher::new(HeuristicEnricher, cancel_token.clone()),
+                CancellableEmbedder::new(DeterministicEmbedder::default(), cancel_token.clone()),
+            )
+            .rebuild_semantic_index_with_progress(&self.config.repo_root, &mut progress)?
         } else {
             FullIndexer::new(
                 store,
-                HeuristicEnricher,
-                EndpointEmbedder::new(
-                    &self.config.base_url,
-                    &self.config.api_key,
-                    self.config.embedding_model.clone(),
+                CancellableEnricher::new(HeuristicEnricher, cancel_token.clone()),
+                CancellableEmbedder::new(
+                    EndpointEmbedder::new(
+                        &self.config.base_url,
+                        &self.config.api_key,
+                        self.config.embedding_model.clone(),
+                    ),
+                    cancel_token.clone(),
                 ),
             )
             .rebuild_semantic_index_with_progress(&self.config.repo_root, &mut progress)?
         };
+        cancel_token.check()?;
         if let Some(log) = log.as_deref_mut() {
             log.event(
                 "semantic_rebuild_completed",
@@ -668,7 +917,9 @@ impl Matryoshka {
         queries: &[String],
         limit: usize,
         mut log: Option<&mut CommandLog>,
+        cancel_token: &MatryoshkaCancelToken,
     ) -> Result<SearchPrewarmSummary> {
+        cancel_token.check()?;
         if let Some(log) = log.as_deref_mut() {
             log.event(
                 "prewarm_started",
@@ -684,21 +935,28 @@ impl Matryoshka {
         }
         let store = MatryoshkaStore::open(&self.config.db)?;
         let summary = if self.config.offline {
-            SearchEngine::new(store, DeterministicEmbedder::default())
-                .with_late_interaction(self.config.late_interaction)
-                .prewarm(queries, limit)?
+            SearchEngine::new(
+                store,
+                CancellableEmbedder::new(DeterministicEmbedder::default(), cancel_token.clone()),
+            )
+            .with_late_interaction(self.config.late_interaction)
+            .prewarm(queries, limit)?
         } else {
             SearchEngine::new(
                 store,
-                EndpointEmbedder::new(
-                    &self.config.base_url,
-                    &self.config.api_key,
-                    self.config.embedding_model.clone(),
+                CancellableEmbedder::new(
+                    EndpointEmbedder::new(
+                        &self.config.base_url,
+                        &self.config.api_key,
+                        self.config.embedding_model.clone(),
+                    ),
+                    cancel_token.clone(),
                 ),
             )
             .with_late_interaction(self.config.late_interaction)
             .prewarm(queries, limit)?
         };
+        cancel_token.check()?;
         if let Some(log) = log.as_deref_mut() {
             let retrieval_stats =
                 MatryoshkaStore::open(&self.config.db)?.retrieval_index_stats()?;
@@ -883,6 +1141,26 @@ fn progress_state_from_event(event: &MatryoshkaEvent) -> ProgressState {
             None,
             None,
         ),
+        MatryoshkaEvent::PrepareCancelling { reason } => progress_state(
+            "prepare",
+            "cancelling",
+            "cancelling",
+            reason,
+            0.99,
+            None,
+            None,
+            None,
+        ),
+        MatryoshkaEvent::PrepareCancelled { reason } => progress_state(
+            "prepare",
+            "cancelled",
+            "cancelled",
+            reason,
+            1.0,
+            None,
+            None,
+            None,
+        ),
         MatryoshkaEvent::PrepareCompleted { summary } => progress_state(
             "prepare",
             summary.status.as_str(),
@@ -898,6 +1176,49 @@ fn progress_state_from_event(event: &MatryoshkaEvent) -> ProgressState {
             Some(summary.file_count),
         ),
     }
+}
+
+fn cancel_prepare(
+    on_event: &mut impl FnMut(MatryoshkaEvent),
+    progress_writer: &mut ProgressStateWriter,
+    log: &mut CommandLog,
+    reason: &str,
+) -> Result<PrepareSummary> {
+    log.event(
+        "prepare_cancelling",
+        json!({
+            "reason": reason,
+        }),
+    )?;
+    emit_event(
+        on_event,
+        progress_writer,
+        MatryoshkaEvent::PrepareCancelling {
+            reason: reason.into(),
+        },
+    );
+    log.event(
+        "prepare_cancelled",
+        json!({
+            "reason": reason,
+        }),
+    )?;
+    emit_event(
+        on_event,
+        progress_writer,
+        MatryoshkaEvent::PrepareCancelled {
+            reason: reason.into(),
+        },
+    );
+    Err(cancelled_error())
+}
+
+fn cancelled_error() -> anyhow::Error {
+    anyhow!("matryoshka prepare cancelled")
+}
+
+pub fn is_cancelled_error(error: &(dyn std::error::Error + 'static)) -> bool {
+    error.to_string().contains("matryoshka prepare cancelled")
 }
 
 fn indexer_progress_state(operation: &str, event: &MatryoshkaProgressEvent) -> ProgressState {

@@ -112,6 +112,98 @@ let summary = api.prepare(PrepareOptions::default())?;
 
 Use `prepare_with_progress` for UI integration. Use `prepare` for tests or background jobs where progress does not matter.
 
+## Rust API: Cancellation
+
+For IDEs, use `prepare_with_progress_and_cancel`.
+
+```rust
+use matryoshka::{
+    MatryoshkaCancelToken, MatryoshkaEvent, PrepareOptions, is_cancelled_error,
+};
+
+let cancel = MatryoshkaCancelToken::new();
+let cancel_for_button = cancel.clone();
+
+// Keep this handle somewhere the Cancel button can reach.
+// cancel_for_button.cancel();
+
+let result = api.prepare_with_progress_and_cancel(
+    PrepareOptions::default(),
+    cancel,
+    |event: MatryoshkaEvent| {
+        // Update progress UI.
+    },
+);
+
+match result {
+    Ok(summary) if summary.is_ready() => {
+        // Jesco is ready.
+    }
+    Err(err) if is_cancelled_error(err.as_ref()) => {
+        // User cancelled. Keep UI calm; this is not a failure.
+    }
+    Err(err) => {
+        // Show needs-attention state and open logs.
+    }
+    _ => {}
+}
+```
+
+Cancellation is cooperative. Matryoshka stops before the next safe unit of work:
+
+- before indexing starts
+- before repair
+- before search rebuild
+- before pre-warm
+- before each file enrichment call
+- before and after each embedding batch
+
+It does not forcibly kill a single in-flight oMLX HTTP request. That is intentional: killing work mid-write or mid-request can leave worse state.
+
+When cancellation is observed, prepare emits two events in order:
+
+```rust
+MatryoshkaEvent::PrepareCancelling { reason }
+MatryoshkaEvent::PrepareCancelled { reason }
+```
+
+Use them like this:
+
+| Event | UI state |
+|---|---|
+| `PrepareCancelling` | `Cancelling...` |
+| `PrepareCancelled` | `Cancelled` |
+
+While cancelling, `progress.json` is updated with:
+
+```json
+{
+  "operation": "prepare",
+  "status": "cancelling",
+  "phase": "cancelling",
+  "message": "prepare was cancelled while updating the project"
+}
+```
+
+When fully stopped, `progress.json` becomes:
+
+```json
+{
+  "operation": "prepare",
+  "status": "cancelled",
+  "phase": "cancelled",
+  "message": "prepare was cancelled while updating the project"
+}
+```
+
+to:
+
+```text
+<repo>/.matryoshka/state/progress.json
+```
+
+After cancellation, the IDE can safely call `prepare` again. Matryoshka will inspect the DB and continue from the actual current state.
+
 ## What Prepare Does
 
 `prepare` checks the current state and runs the smallest useful operation.
