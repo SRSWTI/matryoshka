@@ -421,6 +421,29 @@ pub struct InvalidationSet {
     pub reason: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct ArtifactQualityReport {
+    pub file_cards: usize,
+    pub file_cards_with_summary: usize,
+    pub file_cards_empty_summary: usize,
+    pub folder_cards: usize,
+    pub folder_cards_with_summary: usize,
+    pub folder_cards_empty_summary: usize,
+    pub repo_card_has_summary: bool,
+    pub empty_file_summary_samples: Vec<String>,
+    pub empty_folder_summary_samples: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct RetrievalIndexReport {
+    pub semantic_records: usize,
+    pub embedded_records: usize,
+    pub fts_records: usize,
+    pub late_vector_rows: usize,
+    pub records_with_late_vectors: usize,
+    pub late_interaction_enabled: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum MatryoshkaProgressEvent {
@@ -463,6 +486,12 @@ pub enum MatryoshkaProgressEvent {
     },
     WritingDatabase {
         records_written: Option<usize>,
+    },
+    ArtifactQuality {
+        report: ArtifactQualityReport,
+    },
+    RetrievalIndexHealth {
+        report: RetrievalIndexReport,
     },
     Completed {
         file_count: usize,

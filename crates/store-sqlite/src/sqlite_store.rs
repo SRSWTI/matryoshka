@@ -21,6 +21,23 @@ pub struct SemanticFtsHit {
     pub rank: f32,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetrievalIndexStats {
+    pub semantic_records: usize,
+    pub embedded_records: usize,
+    pub fts_records: usize,
+    pub late_vector_rows: usize,
+    pub records_with_late_vectors: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CardSummaryRow {
+    pub card_type: String,
+    pub id: String,
+    pub summary: String,
+    pub is_empty: bool,
+}
+
 impl MatryoshkaStore {
     pub fn open(db_path: impl AsRef<Path>) -> Result<Self> {
         let db_path = db_path.as_ref().to_path_buf();
@@ -357,6 +374,29 @@ impl MatryoshkaStore {
         Ok(count)
     }
 
+    pub fn retrieval_index_stats(&self) -> Result<RetrievalIndexStats> {
+        let conn = self.connect()?;
+        let semantic_records = count_rows(&conn, "SELECT COUNT(*) FROM semantic_records")?;
+        let fts_records = count_rows(&conn, "SELECT COUNT(*) FROM semantic_records_fts")?;
+        let late_vector_rows = count_rows(&conn, "SELECT COUNT(*) FROM semantic_late_vectors")?;
+        let records_with_late_vectors = count_rows(
+            &conn,
+            "SELECT COUNT(DISTINCT record_id) FROM semantic_late_vectors",
+        )?;
+        let embedded_records = self
+            .load_all_semantic_records()?
+            .iter()
+            .filter(|record| record.embedding.is_some())
+            .count();
+        Ok(RetrievalIndexStats {
+            semantic_records,
+            embedded_records,
+            fts_records,
+            late_vector_rows,
+            records_with_late_vectors,
+        })
+    }
+
     pub fn replace_late_interaction_vectors(
         &self,
         record_ids: &[String],
@@ -445,6 +485,15 @@ impl MatryoshkaStore {
 
     pub fn load_all_folder_cards(&self) -> Result<Vec<FolderCard>> {
         self.load_all("SELECT payload_json FROM folder_cards ORDER BY folder_id")
+    }
+
+    pub fn load_card_summaries(&self) -> Result<Vec<CardSummaryRow>> {
+        let conn = self.connect()?;
+        let mut rows = Vec::new();
+        load_card_summary_rows(&conn, &mut rows, "file_cards", "file_id", "file")?;
+        load_card_summary_rows(&conn, &mut rows, "folder_cards", "folder_id", "folder")?;
+        load_card_summary_rows(&conn, &mut rows, "repo_cards", "repo_root", "repo")?;
+        Ok(rows)
     }
 
     pub fn load_repo_root(&self) -> Result<Option<String>> {
@@ -663,6 +712,51 @@ fn query_json_many<T: DeserializeOwned>(
     Ok(values)
 }
 
+fn load_card_summary_rows(
+    conn: &Connection,
+    rows: &mut Vec<CardSummaryRow>,
+    table: &str,
+    id_column: &str,
+    card_type: &str,
+) -> Result<()> {
+    if !table_exists(conn, table)? {
+        return Ok(());
+    }
+    let sql = format!(
+        r#"
+        SELECT {id_column}, COALESCE(json_extract(payload_json, '$.summary'), '')
+        FROM {table}
+        ORDER BY {id_column}
+        "#
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let mapped = stmt.query_map([], |row| {
+        let id = row.get::<_, String>(0)?;
+        let summary = row.get::<_, String>(1)?;
+        Ok(CardSummaryRow {
+            card_type: card_type.to_string(),
+            id,
+            is_empty: summary.trim().is_empty(),
+            summary,
+        })
+    })?;
+    for row in mapped {
+        rows.push(row?);
+    }
+    Ok(())
+}
+
+fn table_exists(conn: &Connection, table: &str) -> Result<bool> {
+    conn.query_row(
+        "SELECT 1 FROM sqlite_master WHERE type IN ('table', 'view') AND name = ?1 LIMIT 1",
+        [table],
+        |_| Ok(()),
+    )
+    .optional()
+    .map(|value| value.is_some())
+    .context("failed to inspect sqlite schema")
+}
+
 fn to_json<T: Serialize>(value: &T) -> Result<String> {
     serde_json::to_string(value).context("failed to serialize sqlite payload")
 }
@@ -677,6 +771,11 @@ fn delete_many(conn: &Connection, sql: &str, values: &[String]) -> Result<()> {
         stmt.execute([value])?;
     }
     Ok(())
+}
+
+fn count_rows(conn: &Connection, sql: &str) -> Result<usize> {
+    let count = conn.query_row(sql, [], |row| row.get::<_, i64>(0))?;
+    Ok(count.max(0) as usize)
 }
 
 fn upsert_semantic_record_tx(

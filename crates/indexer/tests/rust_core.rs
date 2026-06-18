@@ -593,6 +593,48 @@ fn update_repairs_missing_enriched_artifacts_after_interrupted_prewarm() {
 }
 
 #[test]
+fn update_repairs_empty_non_heuristic_file_summaries() {
+    let repo_root = std::path::PathBuf::from("tests/fixtures/mini_repo");
+    let temp = tempfile::tempdir().unwrap();
+    let db_path = temp.path().join("index.db");
+    let store = MatryoshkaStore::open(&db_path).unwrap();
+    let indexer = FullIndexer::new(
+        store.clone(),
+        HeuristicEnricher,
+        DeterministicEmbedder::default(),
+    );
+
+    indexer.index_repo(&repo_root).unwrap();
+
+    let mut card = store
+        .load_file_card("src/config/env.py")
+        .unwrap()
+        .expect("expected fixture file card");
+    card.summary.clear();
+    card.role = "stale broken role".into();
+    card.provenance.model = Some("mlx-empty-test".into());
+    store.upsert_file_card(&card).unwrap();
+
+    let mut events = Vec::new();
+    let summary = indexer
+        .update_repo_with_progress(&repo_root, |event| events.push(event))
+        .unwrap();
+
+    let repaired = store
+        .load_file_card("src/config/env.py")
+        .unwrap()
+        .expect("expected repaired file card");
+    assert_eq!(summary.changed_files, 0);
+    assert_ne!(repaired.role, "stale broken role");
+    assert_eq!(repaired.provenance.model.as_deref(), Some("heuristic"));
+    assert!(
+        events
+            .iter()
+            .any(|event| { matches!(event, MatryoshkaProgressEvent::ArtifactQuality { .. }) })
+    );
+}
+
+#[test]
 #[ignore = "requires a reachable local MLX endpoint and explicit env vars"]
 fn real_mlx_progress_integration() {
     let base_url = std::env::var("MATRYOSHKA_MLX_BASE_URL")

@@ -757,7 +757,7 @@ fn score_record(
     match record_kind {
         "file_card" => {
             score += 0.12 * plan.card_weight;
-            why.push("Matched the enriched file summary".into());
+            why.push("Matched enriched file-card text".into());
             if facade && owner_query {
                 score -= 0.55;
                 why.push(
@@ -774,7 +774,7 @@ fn score_record(
         }
         "folder_card" => {
             score += 0.08 * plan.card_weight;
-            why.push("Matched the enriched folder responsibility".into());
+            why.push("Matched enriched folder-card text".into());
             if matches!(plan.mode, SearchMode::FindSymbol) && !folder_query {
                 score -= 0.38;
                 why.push("Folder result was de-prioritized for a file-level symbol query".into());
@@ -1355,7 +1355,7 @@ mod tests {
                 matched_symbols: Vec::new(),
                 total_matched_symbols: 0,
                 score: 0.4,
-                why_matched: vec!["Matched the enriched file summary".into()],
+                why_matched: vec!["Matched enriched file-card text".into()],
             },
             SearchHit {
                 entity_id: "octane/cli/mesh.py::resolve_peer:448".into(),

@@ -1,8 +1,9 @@
 use anyhow::Result;
 use matryoshka_core_ir::{
-    FileCard, FileEnrichmentContext, FileFact, FolderCard, FolderEnrichmentContext, ImportContext,
-    LateInteractionVector, MatryoshkaProgressEvent, RelatedFileContext, RepoCard,
-    RepositorySnapshot, SemanticEntityType, SemanticRecord,
+    ArtifactQualityReport, FileCard, FileEnrichmentContext, FileFact, FolderCard,
+    FolderEnrichmentContext, ImportContext, LateInteractionVector, MatryoshkaProgressEvent,
+    RelatedFileContext, RepoCard, RepositorySnapshot, RetrievalIndexReport, SemanticEntityType,
+    SemanticRecord,
 };
 use matryoshka_embed_client::Embedder;
 use matryoshka_enricher::CodeEnricher;
@@ -81,7 +82,7 @@ where
             .iter()
             .map(|folder| folder.folder_id.clone())
             .collect::<BTreeSet<_>>();
-        let records = self.refresh_artifacts(
+        let artifacts = self.refresh_artifacts(
             &snapshot,
             &file_ids,
             &folder_ids,
@@ -96,7 +97,9 @@ where
             file_count: snapshot.files.len(),
             folder_count: snapshot.folders.len(),
             symbol_count: snapshot.symbols.len(),
-            semantic_record_count: records,
+            semantic_record_count: artifacts.semantic_record_count,
+            artifact_quality: artifacts.artifact_quality,
+            retrieval_index: artifacts.retrieval_index,
             embedding_model: self.embedder.model().into(),
         };
         progress(MatryoshkaProgressEvent::Completed {
@@ -131,6 +134,8 @@ where
                 folder_count: summary.folder_count,
                 symbol_count: summary.symbol_count,
                 semantic_record_count: summary.semantic_record_count,
+                artifact_quality: summary.artifact_quality,
+                retrieval_index: summary.retrieval_index,
                 changed_files: summary.file_count,
                 removed_files: 0,
                 changed_folders: summary.folder_count,
@@ -153,7 +158,7 @@ where
                 Err(err) => return fail_with_progress("checking_artifacts", err, &mut progress),
             };
             if !repair.is_empty() {
-                let semantic_record_count = self.refresh_artifacts(
+                let artifacts = self.refresh_artifacts(
                     &new_snapshot,
                     &repair.affected_file_ids,
                     &repair.affected_folder_ids,
@@ -169,7 +174,9 @@ where
                     file_count: new_snapshot.files.len(),
                     folder_count: new_snapshot.folders.len(),
                     symbol_count: new_snapshot.symbols.len(),
-                    semantic_record_count,
+                    semantic_record_count: artifacts.semantic_record_count,
+                    artifact_quality: artifacts.artifact_quality,
+                    retrieval_index: artifacts.retrieval_index,
                     changed_files: 0,
                     removed_files: 0,
                     changed_folders: repair.affected_folder_ids.len(),
@@ -189,16 +196,25 @@ where
             if let Err(err) = self.store.clear_invalidation_queue() {
                 return fail_with_progress("clearing_invalidation_queue", err, &mut progress);
             }
+            let semantic_record_count = match self.store.load_all_semantic_records() {
+                Ok(records) => records.len(),
+                Err(err) => {
+                    return fail_with_progress("loading_semantic_records", err, &mut progress);
+                }
+            };
+            let diagnostics = match self
+                .current_index_diagnostics(&new_snapshot.repo_root, &mut progress)
+            {
+                Ok(diagnostics) => diagnostics,
+                Err(err) => return fail_with_progress("checking_index_health", err, &mut progress),
+            };
             let summary = UpdateSummary {
                 file_count: new_snapshot.files.len(),
                 folder_count: new_snapshot.folders.len(),
                 symbol_count: new_snapshot.symbols.len(),
-                semantic_record_count: match self.store.load_all_semantic_records() {
-                    Ok(records) => records.len(),
-                    Err(err) => {
-                        return fail_with_progress("loading_semantic_records", err, &mut progress);
-                    }
-                },
+                semantic_record_count,
+                artifact_quality: diagnostics.artifact_quality,
+                retrieval_index: diagnostics.retrieval_index,
                 changed_files: 0,
                 removed_files: 0,
                 changed_folders: 0,
@@ -223,7 +239,7 @@ where
         {
             return fail_with_progress("applying_structural_delta", err, &mut progress);
         }
-        let semantic_record_count = self.refresh_artifacts(
+        let artifacts = self.refresh_artifacts(
             &new_snapshot,
             &delta.affected_file_ids,
             &delta.affected_folder_ids,
@@ -240,7 +256,9 @@ where
             file_count: new_snapshot.files.len(),
             folder_count: new_snapshot.folders.len(),
             symbol_count: new_snapshot.symbols.len(),
-            semantic_record_count,
+            semantic_record_count: artifacts.semantic_record_count,
+            artifact_quality: artifacts.artifact_quality,
+            retrieval_index: artifacts.retrieval_index,
             changed_files: delta.changed_or_added_file_ids.len(),
             removed_files: delta.removed_file_ids.len(),
             changed_folders: delta.affected_folder_ids.len(),
@@ -362,11 +380,26 @@ where
             return fail_with_progress("writing_late_interaction", err, &mut progress);
         }
 
+        let artifact_quality =
+            quality_report_from_cards(&file_cards, &folder_cards, repo_card.as_ref());
+        progress(MatryoshkaProgressEvent::ArtifactQuality {
+            report: artifact_quality.clone(),
+        });
+        let retrieval_index = match self.retrieval_index_report() {
+            Ok(report) => report,
+            Err(err) => return fail_with_progress("checking_index_health", err, &mut progress),
+        };
+        progress(MatryoshkaProgressEvent::RetrievalIndexHealth {
+            report: retrieval_index.clone(),
+        });
+
         let summary = SemanticRebuildSummary {
             semantic_record_count: raw_records.len(),
             file_card_record_count,
             folder_card_record_count,
             repo_card_record_count,
+            artifact_quality,
+            retrieval_index,
             embedding_model: self.embedder.model().into(),
         };
         progress(MatryoshkaProgressEvent::Completed {
@@ -387,6 +420,8 @@ pub struct IndexSummary {
     pub folder_count: usize,
     pub symbol_count: usize,
     pub semantic_record_count: usize,
+    pub artifact_quality: ArtifactQualityReport,
+    pub retrieval_index: RetrievalIndexReport,
     pub embedding_model: String,
 }
 
@@ -396,6 +431,8 @@ pub struct UpdateSummary {
     pub folder_count: usize,
     pub symbol_count: usize,
     pub semantic_record_count: usize,
+    pub artifact_quality: ArtifactQualityReport,
+    pub retrieval_index: RetrievalIndexReport,
     pub changed_files: usize,
     pub removed_files: usize,
     pub changed_folders: usize,
@@ -409,7 +446,16 @@ pub struct SemanticRebuildSummary {
     pub file_card_record_count: usize,
     pub folder_card_record_count: usize,
     pub repo_card_record_count: usize,
+    pub artifact_quality: ArtifactQualityReport,
+    pub retrieval_index: RetrievalIndexReport,
     pub embedding_model: String,
+}
+
+#[derive(Debug, Clone)]
+struct ArtifactRefreshReport {
+    semantic_record_count: usize,
+    artifact_quality: ArtifactQualityReport,
+    retrieval_index: RetrievalIndexReport,
 }
 
 #[derive(Debug, Clone)]
@@ -768,6 +814,69 @@ fn raw_file_record_content(file: &matryoshka_core_ir::FileFact) -> String {
         "path: {}\nlanguage: {}\nimports: {}\nimportant snippets: {}\nlines: {}",
         file.path, file.language, imports, snippets, file.line_count
     )
+}
+
+fn quality_report_from_cards(
+    file_cards: &[FileCard],
+    folder_cards: &[FolderCard],
+    repo_card: Option<&RepoCard>,
+) -> ArtifactQualityReport {
+    const SAMPLE_LIMIT: usize = 12;
+
+    let file_cards_with_summary = file_cards
+        .iter()
+        .filter(|card| has_useful_summary(&card.summary))
+        .count();
+    let folder_cards_with_summary = folder_cards
+        .iter()
+        .filter(|card| has_useful_summary(&card.summary))
+        .count();
+    let empty_file_summary_samples = file_cards
+        .iter()
+        .filter(|card| !has_useful_summary(&card.summary))
+        .map(|card| card.file_id.clone())
+        .take(SAMPLE_LIMIT)
+        .collect();
+    let empty_folder_summary_samples = folder_cards
+        .iter()
+        .filter(|card| !has_useful_summary(&card.summary))
+        .map(|card| card.folder_id.clone())
+        .take(SAMPLE_LIMIT)
+        .collect();
+
+    ArtifactQualityReport {
+        file_cards: file_cards.len(),
+        file_cards_with_summary,
+        file_cards_empty_summary: file_cards.len().saturating_sub(file_cards_with_summary),
+        folder_cards: folder_cards.len(),
+        folder_cards_with_summary,
+        folder_cards_empty_summary: folder_cards.len().saturating_sub(folder_cards_with_summary),
+        repo_card_has_summary: repo_card
+            .map(|card| has_useful_summary(&card.summary))
+            .unwrap_or(false),
+        empty_file_summary_samples,
+        empty_folder_summary_samples,
+    }
+}
+
+fn has_useful_summary(summary: &str) -> bool {
+    !summary.trim().is_empty()
+}
+
+fn file_card_needs_quality_repair(card: &FileCard) -> bool {
+    !is_heuristic_card_model(card.provenance.model.as_deref()) && !has_useful_summary(&card.summary)
+}
+
+fn folder_card_needs_quality_repair(card: &FolderCard) -> bool {
+    !is_heuristic_card_model(card.provenance.model.as_deref()) && !has_useful_summary(&card.summary)
+}
+
+fn repo_card_needs_quality_repair(card: &RepoCard) -> bool {
+    !is_heuristic_card_model(card.provenance.model.as_deref()) && !has_useful_summary(&card.summary)
+}
+
+fn is_heuristic_card_model(model: Option<&str>) -> bool {
+    matches!(model, Some("heuristic"))
 }
 
 #[derive(Debug)]
@@ -1149,25 +1258,29 @@ fn artifact_repair_set(
         .collect::<BTreeMap<_, _>>();
     for file in &snapshot.files {
         match file_cards_by_id.get(file.file_id.as_str()) {
-            Some(card) if card.provenance.source_hash == file.source_hash => {}
+            Some(card)
+                if card.provenance.source_hash == file.source_hash
+                    && !file_card_needs_quality_repair(card) => {}
             _ => repair.repair_file(file),
         }
     }
 
     let folder_cards = store.load_all_folder_cards()?;
-    let folder_card_ids = folder_cards
+    let folder_cards_by_id = folder_cards
         .iter()
-        .map(|card| card.folder_id.as_str())
-        .collect::<BTreeSet<_>>();
+        .map(|card| (card.folder_id.as_str(), card))
+        .collect::<BTreeMap<_, _>>();
     for folder in &snapshot.folders {
-        if !folder_card_ids.contains(folder.folder_id.as_str()) {
-            repair.repair_folder(folder.folder_id.clone());
+        match folder_cards_by_id.get(folder.folder_id.as_str()) {
+            Some(card) if !folder_card_needs_quality_repair(card) => {}
+            _ => repair.repair_folder(folder.folder_id.clone()),
         }
     }
 
     let repo_card = store.load_repo_card(&snapshot.repo_root)?;
-    if repo_card.is_none() {
-        repair.repo_card_stale = true;
+    match repo_card.as_ref() {
+        Some(card) if !repo_card_needs_quality_repair(card) => {}
+        _ => repair.repo_card_stale = true,
     }
 
     let semantic_records = store.load_all_semantic_records()?;
@@ -1226,7 +1339,7 @@ where
         removed_file_ids: BTreeSet<String>,
         removed_folder_ids: BTreeSet<String>,
         progress: &mut dyn FnMut(MatryoshkaProgressEvent),
-    ) -> Result<usize> {
+    ) -> Result<ArtifactRefreshReport> {
         let file_contexts = build_file_contexts(snapshot);
         let folder_contexts = build_folder_contexts(snapshot);
         let enrichment_pool = rayon::ThreadPoolBuilder::new()
@@ -1411,10 +1524,57 @@ where
             return fail_with_progress("writing_late_interaction", err, progress);
         }
 
-        match self.store.load_all_semantic_records() {
-            Ok(records) => Ok(records.len()),
-            Err(err) => fail_with_progress("loading_semantic_records", err, progress),
-        }
+        let semantic_record_count = match self.store.load_all_semantic_records() {
+            Ok(records) => records.len(),
+            Err(err) => return fail_with_progress("loading_semantic_records", err, progress),
+        };
+        let diagnostics = match self.current_index_diagnostics(&snapshot.repo_root, progress) {
+            Ok(diagnostics) => diagnostics,
+            Err(err) => return fail_with_progress("checking_index_health", err, progress),
+        };
+        Ok(ArtifactRefreshReport {
+            semantic_record_count,
+            artifact_quality: diagnostics.artifact_quality,
+            retrieval_index: diagnostics.retrieval_index,
+        })
+    }
+
+    fn current_index_diagnostics(
+        &self,
+        repo_root: &str,
+        progress: &mut dyn FnMut(MatryoshkaProgressEvent),
+    ) -> Result<ArtifactRefreshReport> {
+        let file_cards = self.store.load_all_file_cards()?;
+        let folder_cards = self.store.load_all_folder_cards()?;
+        let repo_card = self.store.load_repo_card(repo_root)?;
+        let artifact_quality =
+            quality_report_from_cards(&file_cards, &folder_cards, repo_card.as_ref());
+        progress(MatryoshkaProgressEvent::ArtifactQuality {
+            report: artifact_quality.clone(),
+        });
+
+        let retrieval_index = self.retrieval_index_report()?;
+        progress(MatryoshkaProgressEvent::RetrievalIndexHealth {
+            report: retrieval_index.clone(),
+        });
+
+        Ok(ArtifactRefreshReport {
+            semantic_record_count: retrieval_index.semantic_records,
+            artifact_quality,
+            retrieval_index,
+        })
+    }
+
+    fn retrieval_index_report(&self) -> Result<RetrievalIndexReport> {
+        let stats = self.store.retrieval_index_stats()?;
+        Ok(RetrievalIndexReport {
+            semantic_records: stats.semantic_records,
+            embedded_records: stats.embedded_records,
+            fts_records: stats.fts_records,
+            late_vector_rows: stats.late_vector_rows,
+            records_with_late_vectors: stats.records_with_late_vectors,
+            late_interaction_enabled: late_interaction_enabled(),
+        })
     }
 
     fn collect_folder_cards_bottom_up(

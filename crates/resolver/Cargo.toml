@@ -3,6 +3,9 @@ name = "matryoshka-resolver"
 edition.workspace = true
 license.workspace = true
 version.workspace = true
+description.workspace = true
+repository.workspace = true
+readme.workspace = true
 
 [dependencies]
 chrono.workspace = true

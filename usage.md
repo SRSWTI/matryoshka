@@ -1,526 +1,547 @@
 # Matryoshka Usage
 
-This document describes the `matryoshka-rs` CLI.
+Matryoshka prepares a repository so Jesco can work with it in fewer steps: find the right code, read the right files, and avoid wasting tokens on raw browsing.
 
-Matryoshka is designed for coding agents: index once, keep the repo warm, then
-use search/read operations to get precise context in fewer steps and fewer
-tokens than raw file browsing.
-
-## Command Summary
+The normal lifecycle has one command:
 
 ```bash
-matryoshka-rs <command> [args] [flags]
+matryoshka-rs prepare <repo-root>
 ```
 
-Commands:
+`prepare` is safe to run again and again. The IDE does not need to decide whether to index, update, repair, rebuild retrieval, or pre-warm. It calls `prepare`; Matryoshka checks the repository and does the right work.
 
-- `index`
-- `update`
-- `watch`
-- `prewarm`
-- `search`
-- `op`
-- `read`
-- `read-bundle`
-- `rebuild-semantic`
+## The IDE Rule
 
-## Default Storage
-
-Most commands accept `--db`, but it is no longer required when Matryoshka can
-infer the repo root.
-
-Default DB:
+For setup, startup, file changes, or a user pressing "Prepare", run the same command:
 
 ```bash
-<repo_root>/.matryoshka/matryoshka.db
+matryoshka-rs prepare "$REPO" \
+  --db "$DB" \
+  --base-url "$MLX_URL" \
+  --api-key "$MLX_KEY" \
+  --model "$CHAT_MODEL" \
+  --embedding-model "$EMBED_MODEL" \
+  --ignore .matryoshka \
+  --ignore target \
+  --json
 ```
 
-Watcher/daemon files:
+Recommended environment:
 
 ```bash
-<repo_root>/.matryoshka/watch.pid
-<repo_root>/.matryoshka/logs/watch.jsonl
-<repo_root>/.matryoshka/logs/watch.stdout.jsonl
+export MATRYOSHKA=/Users/rohit/cradle-embed/target/debug/matryoshka-rs
+export REPO=/path/to/repo
+export DB=$REPO/.matryoshka/matryoshka.db
+export MLX_URL=http://127.0.0.1:44447
+export MLX_KEY=2508
+export CHAT_MODEL=srswti--bodega-raptor-90m
+export EMBED_MODEL=mlx-community--embeddinggemma-300m-bf16
 ```
 
-Use explicit `--db` when you want multiple indexes for one repo:
+Then:
 
 ```bash
-matryoshka-rs index /path/to/repo --db /path/to/repo/.matryoshka/experiment.db
+$MATRYOSHKA prepare "$REPO" \
+  --db "$DB" \
+  --base-url "$MLX_URL" \
+  --api-key "$MLX_KEY" \
+  --model "$CHAT_MODEL" \
+  --embedding-model "$EMBED_MODEL" \
+  --ignore .matryoshka \
+  --ignore target \
+  --json
 ```
 
-## MLX Defaults
+## What Prepare Does
 
-Non-offline commands expect a local OpenAI-compatible MLX/oMLX server.
+`prepare` checks the current state, chooses the needed work, writes logs, and emits JSON for the IDE.
 
-Defaults:
+It handles:
 
-- `--base-url http://127.0.0.1:44445`
-- `--api-key 2508`
-- `--embedding-model mlx-community--embeddinggemma-300m-bf16`
-- `--model MercuriusDream--Qwen3.5-4B-MLX-mxfp8`
-- `--omlx-rerank-model mlx-community--Qwen3-Reranker-0.6B-mxfp8`
+- first setup
+- partial database state
+- missing ready marker
+- added files
+- changed files
+- deleted files
+- missing card text
+- missing search artifacts
+- retrieval pre-warming
 
-Aliases:
+When it finishes cleanly, it writes:
 
-- `--embed-model` for `--embedding-model`
-- `--chat-model` for `--model`
+```text
+<repo>/.matryoshka/.jesco-prewarm-complete
+```
 
-Use `--offline` for deterministic local embeddings and heuristic enrichment.
-That is good for tests and smoke checks, but production-quality cards and
-semantic matching should use MLX embeddings/enrichment.
+That marker means Jesco is ready to work with this project.
 
-The watcher daemon, FTS refresh, embedding refresh, late-vector refresh, and
-deleted-file cleanup paths have been validated with the MLX defaults below.
+## Scenario Behavior
 
-## Recommended Production Flow
+The IDE should not branch into different commands for these scenarios. It should always call `prepare`.
 
-Start MLX/oMLX first:
+| Scenario | What prepare detects | JSON `actions_taken` | Result |
+|---|---|---|---|
+| No DB | No indexed files | `["index", "prepare_results"]` | Builds the project map, writes cards, builds retrieval data, pre-warms, writes the ready marker. |
+| DB exists, marker missing | Database exists but ready marker is absent | `["update", "prepare_results"]` | Treats the state as partial, checks freshness, fills gaps, pre-warms, writes the ready marker. |
+| Added file | Filesystem has a new indexed file | `["update", "prepare_results"]` | Adds facts, symbols, cards, retrieval records, FTS rows, and late vectors for the new file. |
+| Changed file | File hash changed | `["update", "prepare_results"]` | Refreshes affected facts, cards, retrieval records, FTS rows, and late vectors. |
+| Deleted file | Indexed path no longer exists | `["update", "prepare_results"]` | Removes stale file records, cards, retrieval records, FTS rows, and late vectors. |
+| Cards have gaps | Existing card text is empty | `["repair", "prepare_results"]` | Re-runs enrichment for gaps, refreshes related retrieval data, pre-warms. |
+| Search data missing | Semantic records, FTS, or late vectors are missing/incomplete | `["rebuild_search", "prepare_results"]` | Rebuilds retrieval data from existing cards and facts, then pre-warms. |
+| Everything healthy | No gaps and no file changes | `["update", "prepare_results"]` | Performs a quick freshness pass, pre-warms, returns ready. |
+
+## JSON Output Contract
+
+Use `--json` for IDE integration. The important fields are:
+
+```json
+{
+  "status": "ready",
+  "repo_root": "/path/to/repo",
+  "db": "/path/to/repo/.matryoshka/matryoshka.db",
+  "ready_marker": "/path/to/repo/.matryoshka/.jesco-prewarm-complete",
+  "logs": "/path/to/repo/.matryoshka/logs",
+  "actions_taken": ["update", "prepare_results"],
+  "project_map": {
+    "status": "ready",
+    "files": 30,
+    "folders": 29,
+    "symbols": 552,
+    "cards": {
+      "file": 30,
+      "folder": 29,
+      "repo": 1,
+      "missing_text": 0,
+      "empty_file_samples": [],
+      "empty_folder_samples": []
+    }
+  },
+  "search": {
+    "status": "ready",
+    "semantic_records": 749,
+    "embedded_records": 719,
+    "fts_records": 749,
+    "late_vector_rows": 15538,
+    "records_with_late_vectors": 719,
+    "late_interaction_enabled": true
+  },
+  "changes": {
+    "changed_files": 0,
+    "removed_files": 0,
+    "changed_folders": 0,
+    "repo_card_updated": false
+  },
+  "prepare_results": {
+    "fts_records": 749,
+    "query_count": 6,
+    "warmed_hits": 24
+  },
+  "embedding_model": "mlx-community--embeddinggemma-300m-bf16"
+}
+```
+
+### Fields The IDE Should Read
+
+| Field | Meaning |
+|---|---|
+| `status` | Overall result. `ready` means Jesco can use the repo. `needs_attention` means show attention state and open logs. |
+| `actions_taken` | What Matryoshka decided to do internally. Good for progress text and diagnostics. |
+| `project_map.status` | Whether file/folder/repo cards are healthy. |
+| `project_map.cards.missing_text` | Number of cards that still need repair. Healthy is `0`. |
+| `search.status` | Whether search/read retrieval data is ready. Healthy is `ready`. |
+| `changes.changed_files` | Files added or changed in this run. |
+| `changes.removed_files` | Files deleted and cleaned up in this run. |
+| `changes.changed_folders` | Folder cards refreshed in this run. |
+| `prepare_results.warmed_hits` | Number of results touched by pre-warming. Nonzero means first searches should be faster. |
+| `logs` | Directory containing `prepare.jsonl` and other command logs. |
+| `ready_marker` | File written when the repo is fully ready. |
+
+## IDE State Mapping
+
+Recommended UI language:
+
+| JSON state | IDE state | Suggested copy |
+|---|---|---|
+| Command running | Getting Ready | Jesco is getting this project ready. |
+| `actions_taken` contains `index` | Preparing Project | Reading the project and building Jesco's map. |
+| `actions_taken` contains `repair` | Repairing | Filling in missing project details. |
+| `actions_taken` contains `rebuild_search` | Refreshing Results | Rebuilding the fast lookup layer. |
+| `actions_taken` contains `prepare_results` | Warming Results | Making first searches faster. |
+| `status == "ready"` | Ready | Jesco is ready to work with you on this project. |
+| `status == "needs_attention"` | Needs Attention | Jesco needs a quick check before it can use this project. |
+
+Keep the primary button simple:
+
+```text
+Prepare
+```
+
+Advanced/debug buttons can exist elsewhere, but normal setup and freshness should use `prepare`.
+
+## Logs
+
+`prepare` writes JSONL logs here:
+
+```text
+<repo>/.matryoshka/logs/prepare.jsonl
+```
+
+Useful events:
+
+```json
+{"event":"prepare_started","fields":{"existing_file_count":30,"existing_missing_text":0,"existing_search_missing":true,"ready_marker_exists":true}}
+{"event":"prepare_decision","fields":{"action":"rebuild_search","reason":"search data is missing or incomplete"}}
+{"event":"update_started","fields":{}}
+{"event":"update_completed","fields":{}}
+{"event":"prewarm_started","fields":{}}
+{"event":"prewarm_completed","fields":{}}
+{"event":"prepare_completed","fields":{"status":"ready"}}
+```
+
+For the IDE:
+
+- stream the command output for progress
+- read final JSON for state
+- open the `logs` directory when the user asks for details
+- use `prepare.jsonl` to explain what happened when a run needs attention
+
+## Tested Prepare Flow
+
+Implemented and tested against:
+
+```text
+/Users/rohit/cradle-embed/test_repo
+```
+
+Using online oMLX on port `44447`. No offline index was used for the real simulations.
+
+Command shape tested:
+
+```bash
+/Users/rohit/cradle-embed/target/debug/matryoshka-rs prepare /Users/rohit/cradle-embed/test_repo \
+  --db <scenario-db> \
+  --base-url http://127.0.0.1:44447 \
+  --api-key 2508 \
+  --model srswti--bodega-raptor-90m \
+  --embedding-model mlx-community--embeddinggemma-300m-bf16 \
+  --ignore .matryoshka \
+  --ignore target \
+  --limit 4 \
+  --json
+```
+
+Results:
+
+| Scenario | JSON `actions_taken` | Result |
+|---|---|---|
+| No DB | `["index", "prepare_results"]` | Passed. Full index, cards healthy, search ready. |
+| DB exists, marker missing | `["update", "prepare_results"]` | Passed. Detected missing marker in logs, wrote marker, ready. |
+| Added file | `["update", "prepare_results"]` | Passed. `changed_files: 1`, file count rose to 31, ready. |
+| Changed file | `["update", "prepare_results"]` | Passed. `changed_files: 1`, ready. |
+| Deleted file | `["update", "prepare_results"]` | Passed. `removed_files: 1`, file count returned to 30, stale records removed. |
+| Cards have gaps | `["repair", "prepare_results"]` | Passed. Two blanked cards were repaired; `missing_text: 0`. |
+| Search data missing | `["rebuild_search", "prepare_results"]` | Passed. Deleted retrieval rows were rebuilt; status ready. |
+| Everything healthy | `["update", "prepare_results"]` | Passed. No changed files, no gaps, search ready. |
+
+Key exact outputs:
+
+```json
+{
+  "status": "ready",
+  "actions_taken": ["index", "prepare_results"],
+  "changes": {
+    "changed_files": 30,
+    "changed_folders": 29,
+    "removed_files": 0
+  },
+  "project_map": {
+    "status": "ready"
+  },
+  "search": {
+    "status": "ready"
+  },
+  "prepare_results": {
+    "warmed_hits": 24
+  }
+}
+```
+
+```json
+{
+  "status": "ready",
+  "actions_taken": ["repair", "prepare_results"],
+  "project_map": {
+    "cards": {
+      "missing_text": 0
+    }
+  },
+  "search": {
+    "status": "ready"
+  }
+}
+```
+
+```json
+{
+  "status": "ready",
+  "actions_taken": ["rebuild_search", "prepare_results"],
+  "search": {
+    "semantic_records": 719,
+    "fts_records": 719,
+    "late_vector_rows": 15538,
+    "records_with_late_vectors": 719,
+    "status": "ready"
+  }
+}
+```
+
+Deleted file cleanup was verified directly:
+
+```text
+file_cards|0
+semantic_records|0
+```
+
+for the deleted probe path.
+
+Verification:
+
+```bash
+cargo build -p matryoshka-cli
+cargo test -p matryoshka-cli
+```
+
+Both passed.
+
+## Starting oMLX
+
+Start the local server before production `prepare` runs:
 
 ```bash
 cd /Users/rohit/cradle-mlx/helpers/omlx
 source .venv/bin/activate
-jesco-apple serve --host 127.0.0.1 --port 44445 --api-key 2508 --max-concurrent-requests 6
+
+jesco-apple serve \
+  --host 127.0.0.1 \
+  --port 44447 \
+  --api-key 2508 \
+  --max-concurrent-requests 6
 ```
 
-Index and start the watcher daemon:
+Then run `prepare` with:
 
 ```bash
-matryoshka-rs index /path/to/repo \
-  --model srswti--bodega-raptor-90m \
-  --embedding-model mlx-community--embeddinggemma-300m-bf16 \
-  --ignore target \
-  --ignore node_modules \
-  --watch-daemon
+--base-url http://127.0.0.1:44447
+--api-key 2508
+--model srswti--bodega-raptor-90m
+--embedding-model mlx-community--embeddinggemma-300m-bf16
 ```
 
-Prewarm common retrieval paths:
+## Cards Health Command
+
+`prepare` already checks card health internally. Use `cards` only for inspection or debugging.
+
+Show only cards with missing text:
 
 ```bash
-matryoshka-rs prewarm \
-  --repo-root /path/to/repo \
-  --ensure-fresh \
-  --query "auth flow token refresh" \
-  --query "where policy enforcement happens" \
-  --query "tests for parser behavior"
+matryoshka-rs cards --db "$DB" --json --empty
 ```
 
-Then use `search`, `op`, `read`, and `read-bundle` during agent work.
+Healthy output:
 
-## `index`
+```json
+[]
+```
 
-Build a full Matryoshka database.
+Non-empty output:
+
+```json
+[
+  {
+    "card_type": "file",
+    "id": "watcher/src/poller.rs",
+    "summary": "",
+    "is_empty": true
+  }
+]
+```
+
+Show all card summaries:
 
 ```bash
-matryoshka-rs index <repo_root> [flags]
+matryoshka-rs cards --db "$DB" --json --summaries
 ```
 
-Common flags:
-
-- `--db <path>`
-- `--offline`
-- `--base-url <url>`
-- `--api-key <key>`
-- `--embedding-model <model>`
-- `--model <chat-model>`
-- `--progress-jsonl`
-- `--ignore <path>`
-- `--watch`
-- `--watch-daemon`
-
-What it does:
-
-- parses source with Tree-sitter-backed extraction where supported
-- falls back to the line parser for unsupported files
-- extracts files, folders, symbols, imports, snippets, and structural metadata
-- resolves import/dependency edges
-- generates file, folder, and repo cards
-- creates semantic records for files, symbols, snippets, cards, folders, and repo
-- embeds records
-- builds SQLite FTS records
-- stores late-interaction token vectors for MaxSim-style matching
-
-Output:
-
-```text
-files: <n>
-folders: <n>
-symbols: <n>
-semantic_records: <n>
-embedding_model: <model>
-```
-
-Use `--watch-daemon` when you want the repo to stay fresh immediately after the
-first index.
-
-## `update`
-
-Refresh an existing DB after code changes.
+Markdown output for humans or LLM tools:
 
 ```bash
-matryoshka-rs update <repo_root> [flags]
+matryoshka-rs cards --db "$DB" --summaries
+matryoshka-rs cards --db "$DB" --empty
 ```
 
-Common flags:
+## Search
 
-- `--db <path>`
-- `--offline`
-- `--base-url <url>`
-- `--api-key <key>`
-- `--embedding-model <model>`
-- `--model <chat-model>`
-- `--progress-jsonl`
-- `--ignore <path>`
+After `prepare` returns `ready`, search is available.
 
-What it does:
-
-- reparses the repo
-- computes changed, added, and removed files
-- refreshes affected structural facts
-- refreshes affected file/folder/repo cards
-- deletes semantic records for removed paths
-- updates FTS and late-interaction vectors
-- repairs missing artifacts if a prior run was interrupted
-
-Output includes:
-
-```text
-changed_files: <n>
-removed_files: <n>
-changed_folders: <n>
-repo_card_updated: true|false
-```
-
-## `watch`
-
-Keep the DB fresh during active coding.
+Basic search:
 
 ```bash
-matryoshka-rs watch <repo_root> [flags]
+matryoshka-rs search \
+  --db "$DB" \
+  --base-url "$MLX_URL" \
+  --api-key "$MLX_KEY" \
+  --embedding-model "$EMBED_MODEL" \
+  "where is watcher debounce handled"
 ```
 
-Common flags:
-
-- `--db <path>`
-- `--offline`
-- `--interval-ms <n>` default `2000`
-- `--debounce-ms <n>` default `3000`
-- `--daemon`
-- `--skip-startup-update`
-- `--ignore <path>`
-
-Important behavior:
-
-- By default, `watch` runs one `update` before polling.
-- That startup update prevents stale DBs when files changed after `index` but
-  before `watch` started.
-- The watcher then polls, debounces changes, and runs `update` per change batch.
-
-Foreground:
+Search with oMLX reranker:
 
 ```bash
-matryoshka-rs watch /path/to/repo
+matryoshka-rs search \
+  --db "$DB" \
+  --base-url "$MLX_URL" \
+  --api-key "$MLX_KEY" \
+  --embedding-model "$EMBED_MODEL" \
+  --omlx-rerank \
+  --omlx-rerank-model mlx-community--Qwen3-Reranker-0.6B-mxfp8 \
+  "where is watcher debounce handled"
 ```
 
-Daemon:
+Use reranking when the first page needs to be sharper. Skip it when speed matters more.
+
+## Read
+
+Read one file from the prepared project map:
 
 ```bash
-matryoshka-rs watch /path/to/repo --daemon
+matryoshka-rs read \
+  --db "$DB" \
+  --repo-root "$REPO" \
+  watcher/src/poller.rs
 ```
 
-Daemon state:
+Read a focused bundle for an edit or investigation:
 
 ```bash
-cat /path/to/repo/.matryoshka/watch.pid
-tail -f /path/to/repo/.matryoshka/logs/watch.jsonl
-tail -f /path/to/repo/.matryoshka/logs/watch.stdout.jsonl
+matryoshka-rs read-bundle \
+  --db "$DB" \
+  --repo-root "$REPO" \
+  --mode edit \
+  --base-url "$MLX_URL" \
+  --api-key "$MLX_KEY" \
+  --embedding-model "$EMBED_MODEL" \
+  "change watcher debounce behavior"
 ```
 
-`watch.jsonl` contains structured events such as:
-
-- `watch_started`
-- `update_started`
-- `update_completed`
-- `change_batch`
-
-## `prewarm`
-
-Warm retrieval paths and rebuild FTS.
+With oMLX reranking:
 
 ```bash
-matryoshka-rs prewarm [flags]
+matryoshka-rs read-bundle \
+  --db "$DB" \
+  --repo-root "$REPO" \
+  --mode edit \
+  --base-url "$MLX_URL" \
+  --api-key "$MLX_KEY" \
+  --embedding-model "$EMBED_MODEL" \
+  --omlx-rerank \
+  --omlx-rerank-model mlx-community--Qwen3-Reranker-0.6B-mxfp8 \
+  "change watcher debounce behavior"
 ```
 
-Common flags:
+## Op Commands
 
-- `--repo-root <path>`
-- `--db <path>`
-- `--offline`
-- `--embedding-model <model>`
-- `--query <query>` repeatable
-- `--limit <n>` default `6`
-- `--ensure-fresh`
-- `--watch`
-- `--watch-daemon`
-- `--no-late-interaction`
-
-What it does:
-
-- rebuilds `semantic_records_fts`
-- runs each prewarm query through search
-- warms embedding/ranking paths
-- optionally runs `update` first with `--ensure-fresh`
-- optionally starts watcher after prewarm with `--watch` or `--watch-daemon`
-
-Output:
-
-```text
-fts_records: <n>
-queries: <n>
-warmed_hits: <n>
-```
-
-`--limit` means hits per prewarm query, not total files or total embeddings.
-
-## `search`
-
-Run hybrid retrieval over the repo intelligence index.
-
-```bash
-matryoshka-rs search "<query>" [flags]
-```
-
-Common flags:
-
-- `--db <path>`
-- `--limit <n>` default `8`
-- `--offline`
-- `--embedding-model <model>`
-- `--rerank`
-- `--rerank-model <chat-model>`
-- `--omlx-rerank`
-- `--omlx-rerank-model <reranker-model>`
-- `--omlx-rerank-candidates <n>` default `20`
-- `--no-late-interaction`
-
-Search uses:
-
-- query planning
-- SQLite FTS candidates
-- exact symbol/path candidates
-- dense embedding similarity
-- late-interaction MaxSim over indexed code-token vectors
-- behavior/edit/retrieval tags
-- file/folder/repo cards
-- facade vs implementation ownership signals
-- optional chat or oMLX reranking
-
-Example:
-
-```bash
-matryoshka-rs search "where is MCP bearer authentication enforced" \
-  --omlx-rerank
-```
-
-Search returns JSON hits with:
-
-- `path`
-- `summary`
-- `description`
-- `matched_terms`
-- `matched_symbols`
-- `score`
-- `why_matched`
-
-Use search when you know what behavior, symbol, or subsystem you need.
-
-## `op`
-
-Search with an explicit agent task.
-
-```bash
-matryoshka-rs op <task> "<query>" [flags]
-```
-
-Tasks:
-
-- `find-symbol`
-- `find-behavior`
-- `edit-target`
-- `trace-dependency`
-- `architecture`
-- `tests-for`
-- `read-next`
+`op` commands are task-shaped search/read helpers. Use them after `prepare`.
 
 Examples:
 
 ```bash
-matryoshka-rs op find-symbol "resolve_import"
-matryoshka-rs op edit-target "retry behavior in provider routing"
-matryoshka-rs op trace-dependency "token refresh credentials"
-matryoshka-rs op tests-for "parser tree sitter extraction"
+matryoshka-rs op find-symbol \
+  --db "$DB" \
+  --base-url "$MLX_URL" \
+  --api-key "$MLX_KEY" \
+  --embedding-model "$EMBED_MODEL" \
+  "RepoWatcher"
 ```
-
-Use `op` when the agent already knows its intent. It biases retrieval toward the
-right evidence: symbols, implementation owners, dependency context, architecture
-cards, or tests.
-
-## `read`
-
-Read one rich file card.
 
 ```bash
-matryoshka-rs read <file> [flags]
+matryoshka-rs op edit-target \
+  --db "$DB" \
+  --base-url "$MLX_URL" \
+  --api-key "$MLX_KEY" \
+  --embedding-model "$EMBED_MODEL" \
+  "add a new search ranking boost"
 ```
-
-Common flags:
-
-- `--repo-root <path>`
-- `--db <path>`
-
-What it returns:
-
-- file overview
-- file card summary/description
-- folder context
-- symbols
-- imports
-- dependents
-- dependencies
-- counts for the file context
-
-Use `read` after a search result points to a concrete file.
-
-Example:
 
 ```bash
-matryoshka-rs read --repo-root /path/to/repo crates/foo/src/lib.rs
+matryoshka-rs op read-next \
+  --db "$DB" \
+  --base-url "$MLX_URL" \
+  --api-key "$MLX_KEY" \
+  --embedding-model "$EMBED_MODEL" \
+  "after reading watcher/src/poller.rs, what should I read next"
 ```
 
-## `read-bundle`
+Use `--omlx-rerank` on these when top-result precision matters.
 
-Search and return a packed read context.
+## Advanced Commands
+
+These commands still exist, but normal IDE lifecycle should not call them directly.
+
+| Command | Use |
+|---|---|
+| `index` | Force a clean full build. Mostly debugging now. |
+| `update` | Force incremental refresh. `prepare` calls this when needed. |
+| `prewarm` | Warm retrieval only. `prepare` calls this automatically. |
+| `rebuild-semantic` | Rebuild retrieval data. `prepare` calls this when search data is missing. |
+| `watch` | Long-running watcher mode. IDEs can instead call `prepare` after file changes. |
+| `cards` | Inspect card health and text. |
+
+For the product path, prefer:
+
+```text
+Prepare -> Search / Read / Op
+```
+
+## Offline Mode
+
+`--offline` is for deterministic smoke tests. It avoids the LLM and can produce thinner or missing card text.
+
+Do not use offline mode for production setup.
+
+Production setup should use:
 
 ```bash
-matryoshka-rs read-bundle "<query>" [flags]
+--base-url "$MLX_URL"
+--api-key "$MLX_KEY"
+--model "$CHAT_MODEL"
+--embedding-model "$EMBED_MODEL"
 ```
 
-Common flags:
+## Practical IDE Flow
 
-- `--repo-root <path>`
-- `--db <path>`
-- `--limit <n>` default `4`
-- `--related <n>` default `3`
-- `--mode brief|edit|flow`
-- search flags such as `--offline`, `--omlx-rerank`, `--no-late-interaction`
+On project open:
 
-Modes:
-
-- `brief`
-  Smallest context. Good for orientation.
-
-- `edit`
-  More symbols and dependency context. Good before making changes.
-
-- `flow`
-  Wider dependency/import context. Good for tracing behavior.
-
-What it does:
-
-- runs a `read-next` planned search
-- picks the top file-level hit as primary
-- selects related files from nearby/top hits
-- returns packed read cards for the primary and related files
-
-Use `read-bundle` when you want one command to give an agent the next files it
-should inspect.
-
-Example:
-
-```bash
-matryoshka-rs read-bundle \
-  --repo-root /path/to/repo \
-  --mode edit \
-  --related 4 \
-  "where should I edit spend cap policy enforcement"
+```text
+run prepare
+read final JSON
+if status == ready: show "Jesco is ready to work with you on this project."
+else: show attention state and offer Open Logs
 ```
 
-## `rebuild-semantic`
+On file save, add, delete, branch change, or dependency changes:
 
-Repair or rebuild the semantic layer from persisted facts and cards.
-
-```bash
-matryoshka-rs rebuild-semantic <repo_root> [flags]
+```text
+run prepare again
+use changes.* to show what changed
+use project_map and search status to decide ready vs attention
 ```
 
-Common flags:
+Before search/read:
 
-- `--db <path>`
-- `--offline`
-- `--embedding-model <model>`
-- `--progress-jsonl`
-
-What it does:
-
-- loads persisted files, folders, symbols, and cards from SQLite
-- rebuilds semantic records
-- re-embeds records
-- rebuilds FTS records
-- rebuilds late-interaction vectors
-
-Use this when:
-
-- search returns empty/poor results but cards/facts exist
-- embedding timed out during a prior run
-- you changed retrieval/schema logic and want to avoid full enrichment
-
-## Good Query Patterns
-
-Symbol lookup:
-
-```bash
-matryoshka-rs op find-symbol "CredentialStore"
-matryoshka-rs search "where is resolve_import defined"
+```text
+if ready marker exists and latest prepare status is ready: run search/read/op
+else: run prepare first
 ```
 
-Behavior lookup:
-
-```bash
-matryoshka-rs op find-behavior "OAuth device authorization flow"
-matryoshka-rs search "how does provider import from codex and claude code work"
-```
-
-Edit target:
-
-```bash
-matryoshka-rs op edit-target "rate limit policy enforcement"
-```
-
-Dependency/blast radius:
-
-```bash
-matryoshka-rs op trace-dependency "token refresh credentials"
-```
-
-Architecture:
-
-```bash
-matryoshka-rs op architecture "repository overview"
-```
-
-Tests:
-
-```bash
-matryoshka-rs op tests-for "parser rust impl methods"
-```
-
-## Useful Environment Overrides
-
-- `MATRYOSHKA_ENRICH_CONCURRENCY`
-  Controls parallel MLX chat enrichment concurrency. Default: `6`.
-
-- `MATRYOSHKA_EMBED_BATCH`
-  Controls embedding batch size for semantic-record embedding requests.
-  Default: `64`.
-
-Tune these for your local MLX server and repo size.
+That is the simple contract: the IDE asks Matryoshka to prepare; Matryoshka decides the rest.

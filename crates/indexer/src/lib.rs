@@ -1,4 +1,6 @@
 mod indexer;
 
 pub use indexer::*;
-pub use matryoshka_core_ir::MatryoshkaProgressEvent;
+pub use matryoshka_core_ir::{
+    ArtifactQualityReport, MatryoshkaProgressEvent, RetrievalIndexReport,
+};

@@ -21,6 +21,10 @@ target/
 
 # Local analysis output
 .cradle/
+.matryoshka/
+
+# Disposable Matryoshka integration fixture copied from crates during local testing
+test_repo/
 
 # OS files
 .DS_Store

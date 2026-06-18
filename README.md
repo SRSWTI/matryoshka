@@ -131,12 +131,21 @@ Watcher daemon files live next to it:
 
 ```text
 <repo>/.matryoshka/watch.pid
+<repo>/.matryoshka/logs/index.jsonl
+<repo>/.matryoshka/logs/update.jsonl
+<repo>/.matryoshka/logs/prewarm.jsonl
+<repo>/.matryoshka/logs/semantic-rebuild.jsonl
 <repo>/.matryoshka/logs/watch.jsonl
 <repo>/.matryoshka/logs/watch.stdout.jsonl
 ```
 
 This means semantic search can be rebuilt independently when embeddings or late
 pipeline stages fail.
+
+Command summaries and JSONL logs include artifact health now: file/folder card
+summary coverage, sample paths with empty summaries, FTS row counts, embedded
+record counts, and late-interaction vector counts. If search results look too
+generic, check these logs first.
 
 ## Local MLX Defaults
 
