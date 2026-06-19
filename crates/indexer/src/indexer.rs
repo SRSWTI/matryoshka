@@ -150,6 +150,9 @@ where
             Err(err) => return fail_with_progress("parsing", err, &mut progress),
         };
         let new_snapshot = GraphResolver::resolve(parsed);
+        if let Err(err) = self.store.prune_orphaned_artifacts() {
+            return fail_with_progress("pruning_orphaned_artifacts", err, &mut progress);
+        }
         let delta = compute_delta(&old_snapshot, &new_snapshot);
 
         if delta.is_noop() {
@@ -301,11 +304,14 @@ where
             );
         }
 
-        let file_cards = match self.store.load_all_file_cards() {
+        if let Err(err) = self.store.prune_orphaned_artifacts() {
+            return fail_with_progress("pruning_orphaned_artifacts", err, &mut progress);
+        }
+        let file_cards = match self.store.load_active_file_cards() {
             Ok(cards) => cards,
             Err(err) => return fail_with_progress("loading_file_cards", err, &mut progress),
         };
-        let folder_cards = match self.store.load_all_folder_cards() {
+        let folder_cards = match self.store.load_active_folder_cards() {
             Ok(cards) => cards,
             Err(err) => return fail_with_progress("loading_folder_cards", err, &mut progress),
         };
@@ -1247,7 +1253,7 @@ fn artifact_repair_set(
         .map(|file| (file.path.as_str(), file))
         .collect::<BTreeMap<_, _>>();
 
-    let file_cards = store.load_all_file_cards()?;
+    let file_cards = store.load_active_file_cards()?;
     let file_cards_by_id = file_cards
         .iter()
         .map(|card| (card.file_id.as_str(), card))
@@ -1261,7 +1267,7 @@ fn artifact_repair_set(
         }
     }
 
-    let folder_cards = store.load_all_folder_cards()?;
+    let folder_cards = store.load_active_folder_cards()?;
     let folder_cards_by_id = folder_cards
         .iter()
         .map(|card| (card.folder_id.as_str(), card))
@@ -1336,6 +1342,9 @@ where
         removed_folder_ids: BTreeSet<String>,
         progress: &mut dyn FnMut(MatryoshkaProgressEvent),
     ) -> Result<ArtifactRefreshReport> {
+        if let Err(err) = self.store.prune_orphaned_artifacts() {
+            return fail_with_progress("pruning_orphaned_artifacts", err, progress);
+        }
         let file_contexts = build_file_contexts(snapshot);
         let folder_contexts = build_folder_contexts(snapshot);
         let enrichment_pool = rayon::ThreadPoolBuilder::new()
@@ -1519,6 +1528,9 @@ where
         {
             return fail_with_progress("writing_late_interaction", err, progress);
         }
+        if let Err(err) = self.store.prune_orphaned_artifacts() {
+            return fail_with_progress("pruning_orphaned_artifacts", err, progress);
+        }
 
         let semantic_record_count = match self.store.load_all_semantic_records() {
             Ok(records) => records.len(),
@@ -1540,8 +1552,8 @@ where
         repo_root: &str,
         progress: &mut dyn FnMut(MatryoshkaProgressEvent),
     ) -> Result<ArtifactRefreshReport> {
-        let file_cards = self.store.load_all_file_cards()?;
-        let folder_cards = self.store.load_all_folder_cards()?;
+        let file_cards = self.store.load_active_file_cards()?;
+        let folder_cards = self.store.load_active_folder_cards()?;
         let repo_card = self.store.load_repo_card(repo_root)?;
         let artifact_quality =
             quality_report_from_cards(&file_cards, &folder_cards, repo_card.as_ref());
@@ -1581,10 +1593,21 @@ where
         folder_contexts: &BTreeMap<String, FolderEnrichmentContext>,
         enrichment_pool: &rayon::ThreadPool,
     ) -> Result<Vec<FolderCard>> {
+        let active_file_ids = snapshot
+            .files
+            .iter()
+            .map(|file| file.file_id.as_str())
+            .collect::<BTreeSet<_>>();
+        let active_folder_ids = snapshot
+            .folders
+            .iter()
+            .map(|folder| folder.folder_id.as_str())
+            .collect::<BTreeSet<_>>();
         let existing_file_cards = self
             .store
-            .load_all_file_cards()?
+            .load_active_file_cards()?
             .into_iter()
+            .filter(|card| active_file_ids.contains(card.file_id.as_str()))
             .map(|card| (card.file_id.clone(), card))
             .collect::<BTreeMap<_, _>>();
         let refreshed_file_cards = refreshed_file_cards
@@ -1593,8 +1616,9 @@ where
             .collect::<BTreeMap<_, _>>();
         let existing_folder_cards = self
             .store
-            .load_all_folder_cards()?
+            .load_active_folder_cards()?
             .into_iter()
+            .filter(|card| active_folder_ids.contains(card.folder_id.as_str()))
             .map(|card| (card.folder_id.clone(), card))
             .collect::<BTreeMap<_, _>>();
         let folders_by_id = snapshot

@@ -9,6 +9,7 @@ use serde::de::DeserializeOwned;
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 #[derive(Debug, Clone)]
 pub struct MatryoshkaStore {
@@ -28,6 +29,25 @@ pub struct RetrievalIndexStats {
     pub fts_records: usize,
     pub late_vector_rows: usize,
     pub records_with_late_vectors: usize,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct OrphanPruneReport {
+    pub file_cards: usize,
+    pub folder_cards: usize,
+    pub semantic_records: usize,
+    pub fts_records: usize,
+    pub late_vectors: usize,
+}
+
+impl OrphanPruneReport {
+    pub fn is_empty(&self) -> bool {
+        self.file_cards == 0
+            && self.folder_cards == 0
+            && self.semantic_records == 0
+            && self.fts_records == 0
+            && self.late_vectors == 0
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -51,7 +71,14 @@ impl MatryoshkaStore {
 
     pub fn connect(&self) -> Result<Connection> {
         let conn = Connection::open(&self.db_path)?;
-        conn.execute_batch("PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL;")?;
+        conn.busy_timeout(Duration::from_millis(30_000))?;
+        conn.execute_batch(
+            r#"
+            PRAGMA foreign_keys = ON;
+            PRAGMA journal_mode = WAL;
+            PRAGMA synchronous = NORMAL;
+            "#,
+        )?;
         Ok(conn)
     }
 
@@ -487,6 +514,28 @@ impl MatryoshkaStore {
         self.load_all("SELECT payload_json FROM folder_cards ORDER BY folder_id")
     }
 
+    pub fn load_active_file_cards(&self) -> Result<Vec<FileCard>> {
+        self.load_all(
+            r#"
+            SELECT file_cards.payload_json
+            FROM file_cards
+            INNER JOIN files ON files.file_id = file_cards.file_id
+            ORDER BY file_cards.file_id
+            "#,
+        )
+    }
+
+    pub fn load_active_folder_cards(&self) -> Result<Vec<FolderCard>> {
+        self.load_all(
+            r#"
+            SELECT folder_cards.payload_json
+            FROM folder_cards
+            INNER JOIN folders ON folders.folder_id = folder_cards.folder_id
+            ORDER BY folder_cards.folder_id
+            "#,
+        )
+    }
+
     pub fn load_card_summaries(&self) -> Result<Vec<CardSummaryRow>> {
         let conn = self.connect()?;
         let mut rows = Vec::new();
@@ -496,15 +545,135 @@ impl MatryoshkaStore {
         Ok(rows)
     }
 
+    pub fn load_active_card_summaries(&self) -> Result<Vec<CardSummaryRow>> {
+        let conn = self.connect()?;
+        let mut rows = Vec::new();
+        load_card_summary_rows_sql(
+            &conn,
+            &mut rows,
+            r#"
+            SELECT file_cards.file_id, COALESCE(json_extract(file_cards.payload_json, '$.summary'), '')
+            FROM file_cards
+            INNER JOIN files ON files.file_id = file_cards.file_id
+            ORDER BY file_cards.file_id
+            "#,
+            "file",
+        )?;
+        load_card_summary_rows_sql(
+            &conn,
+            &mut rows,
+            r#"
+            SELECT folder_cards.folder_id, COALESCE(json_extract(folder_cards.payload_json, '$.summary'), '')
+            FROM folder_cards
+            INNER JOIN folders ON folders.folder_id = folder_cards.folder_id
+            ORDER BY folder_cards.folder_id
+            "#,
+            "folder",
+        )?;
+        if let Some(repo_root) = load_repo_root_from_conn(&conn)? {
+            load_card_summary_rows_sql_with_param(
+                &conn,
+                &mut rows,
+                r#"
+                SELECT repo_root, COALESCE(json_extract(payload_json, '$.summary'), '')
+                FROM repo_cards
+                WHERE repo_root = ?1
+                ORDER BY repo_root
+                "#,
+                "repo",
+                &repo_root,
+            )?;
+        } else {
+            load_card_summary_rows(&conn, &mut rows, "repo_cards", "repo_root", "repo")?;
+        }
+        Ok(rows)
+    }
+
+    pub fn prune_orphaned_artifacts(&self) -> Result<OrphanPruneReport> {
+        let mut conn = self.connect()?;
+        let tx = conn.transaction()?;
+        let mut report = OrphanPruneReport::default();
+
+        report.file_cards += tx.execute(
+            "DELETE FROM file_cards WHERE file_id NOT IN (SELECT file_id FROM files)",
+            [],
+        )?;
+        report.folder_cards += tx.execute(
+            "DELETE FROM folder_cards WHERE folder_id NOT IN (SELECT folder_id FROM folders)",
+            [],
+        )?;
+
+        report.semantic_records += tx.execute(
+            r#"
+            DELETE FROM semantic_records
+            WHERE record_id LIKE 'semantic:file:%'
+              AND entity_id NOT IN (SELECT file_id FROM files)
+            "#,
+            [],
+        )?;
+        report.semantic_records += tx.execute(
+            r#"
+            DELETE FROM semantic_records
+            WHERE record_id LIKE 'semantic:file_card:%'
+              AND entity_id NOT IN (SELECT file_id FROM file_cards)
+            "#,
+            [],
+        )?;
+        report.semantic_records += tx.execute(
+            r#"
+            DELETE FROM semantic_records
+            WHERE record_id LIKE 'semantic:folder_card:%'
+              AND entity_id NOT IN (SELECT folder_id FROM folder_cards)
+            "#,
+            [],
+        )?;
+        report.semantic_records += tx.execute(
+            r#"
+            DELETE FROM semantic_records
+            WHERE record_id LIKE 'semantic:repo_card:%'
+              AND entity_id NOT IN (SELECT repo_root FROM repo_cards)
+            "#,
+            [],
+        )?;
+        report.semantic_records += tx.execute(
+            r#"
+            DELETE FROM semantic_records
+            WHERE record_id LIKE 'semantic:symbol:%'
+              AND entity_id NOT IN (SELECT symbol_id FROM symbols)
+            "#,
+            [],
+        )?;
+        report.semantic_records += tx.execute(
+            r#"
+            DELETE FROM semantic_records
+            WHERE record_id LIKE 'semantic:snippet:%'
+              AND path NOT IN (SELECT path FROM files)
+            "#,
+            [],
+        )?;
+
+        report.fts_records += tx.execute(
+            r#"
+            DELETE FROM semantic_records_fts
+            WHERE record_id NOT IN (SELECT record_id FROM semantic_records)
+            "#,
+            [],
+        )?;
+        report.late_vectors += tx.execute(
+            r#"
+            DELETE FROM semantic_late_vectors
+            WHERE record_id NOT IN (SELECT record_id FROM semantic_records)
+            "#,
+            [],
+        )?;
+
+        tx.commit()?;
+        Ok(report)
+    }
+
     pub fn load_repo_root(&self) -> Result<Option<String>> {
         let conn = self.connect()?;
-        conn.query_row(
-            "SELECT value FROM meta WHERE key = 'repo_root'",
-            [],
-            |row| row.get::<_, String>(0),
-        )
-        .optional()
-        .context("failed to load repo_root from sqlite")
+        load_repo_root_from_conn(&conn)
     }
 
     pub fn mark_stale(&self, entity_kind: &str, entity_id: &str, reason: &str) -> Result<()> {
@@ -744,6 +913,63 @@ fn load_card_summary_rows(
         rows.push(row?);
     }
     Ok(())
+}
+
+fn load_card_summary_rows_sql(
+    conn: &Connection,
+    rows: &mut Vec<CardSummaryRow>,
+    sql: &str,
+    card_type: &str,
+) -> Result<()> {
+    let mut stmt = conn.prepare(sql)?;
+    let mapped = stmt.query_map([], |row| {
+        let id = row.get::<_, String>(0)?;
+        let summary = row.get::<_, String>(1)?;
+        Ok(CardSummaryRow {
+            card_type: card_type.to_string(),
+            id,
+            is_empty: summary.trim().is_empty(),
+            summary,
+        })
+    })?;
+    for row in mapped {
+        rows.push(row?);
+    }
+    Ok(())
+}
+
+fn load_card_summary_rows_sql_with_param(
+    conn: &Connection,
+    rows: &mut Vec<CardSummaryRow>,
+    sql: &str,
+    card_type: &str,
+    value: &str,
+) -> Result<()> {
+    let mut stmt = conn.prepare(sql)?;
+    let mapped = stmt.query_map([value], |row| {
+        let id = row.get::<_, String>(0)?;
+        let summary = row.get::<_, String>(1)?;
+        Ok(CardSummaryRow {
+            card_type: card_type.to_string(),
+            id,
+            is_empty: summary.trim().is_empty(),
+            summary,
+        })
+    })?;
+    for row in mapped {
+        rows.push(row?);
+    }
+    Ok(())
+}
+
+fn load_repo_root_from_conn(conn: &Connection) -> Result<Option<String>> {
+    conn.query_row(
+        "SELECT value FROM meta WHERE key = 'repo_root'",
+        [],
+        |row| row.get::<_, String>(0),
+    )
+    .optional()
+    .context("failed to load repo_root from sqlite")
 }
 
 fn table_exists(conn: &Connection, table: &str) -> Result<bool> {

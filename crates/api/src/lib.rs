@@ -13,7 +13,9 @@ use matryoshka_read_api::{ReadApi, ReadBundle, ReadPackMode};
 use matryoshka_search::{
     EndpointReranker, OmlxReranker, SearchEngine, SearchPrewarmSummary, default_prewarm_queries,
 };
-use matryoshka_store_sqlite::{CardSummaryRow, MatryoshkaStore, RetrievalIndexStats};
+use matryoshka_store_sqlite::{
+    CardSummaryRow, MatryoshkaStore, OrphanPruneReport, RetrievalIndexStats,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::fs::{self, File, OpenOptions};
@@ -23,7 +25,8 @@ use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
 };
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::thread;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub const DEFAULT_BASE_URL: &str = "http://127.0.0.1:44445";
 pub const DEFAULT_API_KEY: &str = "2508";
@@ -278,6 +281,19 @@ pub enum MatryoshkaEvent {
         existing_search_missing: bool,
         ready_marker_exists: bool,
     },
+    PrepareWaitingForLock {
+        db: PathBuf,
+        lock_path: PathBuf,
+        waited_ms: u128,
+    },
+    PrepareLockAcquired {
+        db: PathBuf,
+        lock_path: PathBuf,
+    },
+    PrepareLockReleased {
+        db: PathBuf,
+        lock_path: PathBuf,
+    },
     PrepareDecision {
         action: String,
         reason: String,
@@ -436,13 +452,6 @@ impl Matryoshka {
         let logs_dir = logs_dir(&self.config.db);
         let ready_marker = ready_marker_path(&self.config.db);
         let parser_config = parser_config(self.config.ignore.clone());
-        let existing_file_count = indexed_file_count(&self.config.db).unwrap_or(0);
-        let existing_gap_count = existing_card_gap_count(&self.config.db).unwrap_or(0);
-        let existing_search_missing =
-            existing_retrieval_needs_rebuild(&self.config.db, self.config.late_interaction)
-                .unwrap_or(false);
-        let ready_marker_exists = ready_marker.exists();
-        let mut actions_taken = Vec::new();
 
         if cancel_token.is_cancelled() {
             return cancel_prepare(
@@ -453,287 +462,334 @@ impl Matryoshka {
             );
         }
 
-        let started = MatryoshkaEvent::PrepareStarted {
-            repo_root: self.config.repo_root.clone(),
-            db: self.config.db.clone(),
-            existing_file_count,
-            existing_missing_text: existing_gap_count,
-            existing_search_missing,
-            ready_marker_exists,
-        };
-        emit_event(&mut on_event, &mut progress_writer, started.clone());
-        log.event(
-            "prepare_started",
-            json!({
-                "repo_root": self.config.repo_root,
-                "db": self.config.db,
-                "offline": self.config.offline,
-                "embedding_model": if self.config.offline { "deterministic" } else { self.config.embedding_model.as_str() },
-                "chat_model": if self.config.offline { "heuristic" } else { self.config.chat_model.as_str() },
-                "existing_file_count": existing_file_count,
-                "existing_missing_text": existing_gap_count,
-                "existing_search_missing": existing_search_missing,
-                "ready_marker_exists": ready_marker_exists,
-            }),
-        )?;
-
-        let first_action = if existing_file_count == 0 {
-            "index"
-        } else if existing_gap_count > 0 {
-            "repair"
-        } else if existing_search_missing {
-            "rebuild_search"
-        } else {
-            "update"
-        };
-        let first_reason = if existing_file_count == 0 {
-            "no indexed files found"
-        } else if existing_gap_count > 0 {
-            "project map has gaps"
-        } else if existing_search_missing {
-            "search data is missing or incomplete"
-        } else if !ready_marker_exists {
-            "ready marker missing"
-        } else {
-            "refresh current project map"
-        };
-        prepare_decision(
-            &mut on_event,
-            &mut progress_writer,
-            &mut log,
-            first_action,
-            first_reason,
-        )?;
-        if cancel_token.is_cancelled() {
-            return cancel_prepare(
-                &mut on_event,
-                &mut progress_writer,
-                &mut log,
-                "prepare was cancelled before indexing started",
-            );
-        }
-
-        let mut update = match self.run_update_once_with_progress(
-            parser_config.clone(),
-            Some(&mut log),
-            &cancel_token,
-            |progress| {
-                emit_event(
-                    &mut on_event,
-                    &mut progress_writer,
-                    MatryoshkaEvent::IndexerProgress {
-                        operation: first_action.to_string(),
-                        progress,
-                    },
-                );
-            },
-        ) {
-            Ok(summary) => summary,
-            Err(_err) if cancel_token.is_cancelled() => {
-                return cancel_prepare(
-                    &mut on_event,
-                    &mut progress_writer,
-                    &mut log,
-                    "prepare was cancelled while updating the project",
-                );
-            }
-            Err(err) => return Err(err),
-        };
-        actions_taken.push(first_action.to_string());
-
-        if artifact_gap_count(&update.artifact_quality) > 0 && first_action != "repair" {
-            if cancel_token.is_cancelled() {
-                return cancel_prepare(
-                    &mut on_event,
-                    &mut progress_writer,
-                    &mut log,
-                    "prepare was cancelled before repair",
-                );
-            }
-            prepare_decision(
-                &mut on_event,
-                &mut progress_writer,
-                &mut log,
-                "repair",
-                "project map has gaps",
-            )?;
-            update = match self.run_update_once_with_progress(
-                parser_config,
-                Some(&mut log),
-                &cancel_token,
-                |progress| {
-                    emit_event(
-                        &mut on_event,
-                        &mut progress_writer,
-                        MatryoshkaEvent::IndexerProgress {
-                            operation: "repair".into(),
-                            progress,
-                        },
-                    );
-                },
-            ) {
-                Ok(summary) => summary,
-                Err(_err) if cancel_token.is_cancelled() => {
+        let prepare_lock =
+            match acquire_prepare_lock(&self.config.db, &cancel_token, &mut on_event, &mut log) {
+                Ok(lock) => lock,
+                Err(err) if is_cancelled_error(err.as_ref()) => {
                     return cancel_prepare(
                         &mut on_event,
                         &mut progress_writer,
                         &mut log,
-                        "prepare was cancelled while repairing the project",
+                        "prepare was cancelled while waiting for the project lock",
                     );
                 }
                 Err(err) => return Err(err),
             };
-            actions_taken.push("repair".into());
-        }
 
-        let mut artifact_quality = update.artifact_quality.clone();
-        let mut retrieval_index = update.retrieval_index.clone();
-        if retrieval_needs_rebuild(&retrieval_index, self.config.late_interaction) {
-            if cancel_token.is_cancelled() {
-                return cancel_prepare(
-                    &mut on_event,
-                    &mut progress_writer,
-                    &mut log,
-                    "prepare was cancelled before rebuilding search",
-                );
-            }
-            prepare_decision(
-                &mut on_event,
-                &mut progress_writer,
-                &mut log,
-                "rebuild_search",
-                "search data is missing or incomplete",
-            )?;
-            let rebuild = match self.run_rebuild_semantic_once_with_progress(
-                Some(&mut log),
-                &cancel_token,
-                |progress| {
-                    emit_event(
-                        &mut on_event,
-                        &mut progress_writer,
-                        MatryoshkaEvent::IndexerProgress {
-                            operation: "rebuild_search".into(),
-                            progress,
-                        },
-                    );
-                },
-            ) {
-                Ok(summary) => summary,
-                Err(_err) if cancel_token.is_cancelled() => {
-                    return cancel_prepare(
-                        &mut on_event,
-                        &mut progress_writer,
-                        &mut log,
-                        "prepare was cancelled while rebuilding search",
-                    );
-                }
-                Err(err) => return Err(err),
-            };
-            artifact_quality = rebuild.artifact_quality;
-            if !actions_taken
+        let result = (|| -> Result<PrepareSummary> {
+            let store = MatryoshkaStore::open(&self.config.db)?;
+            let initial_prune = store.prune_orphaned_artifacts()?;
+            log_prune_report(&mut log, "prepare_initial_prune", &initial_prune)?;
+
+            let existing_file_count = store.load_all_files()?.len();
+            let existing_gap_count = store
+                .load_active_card_summaries()?
                 .iter()
-                .any(|action| action == "rebuild_search")
-            {
-                actions_taken.push("rebuild_search".into());
-            }
-        }
+                .filter(|row| row.is_empty)
+                .count();
+            let existing_search_missing = retrieval_needs_rebuild(
+                &retrieval_report_from_stats(
+                    store.retrieval_index_stats()?,
+                    self.config.late_interaction,
+                ),
+                self.config.late_interaction,
+            );
+            let ready_marker_exists = ready_marker.exists();
+            let mut actions_taken = Vec::new();
 
-        let queries = if options.queries.is_empty() {
-            default_prewarm_queries()
-        } else {
-            options.queries.clone()
-        };
-        if cancel_token.is_cancelled() {
-            return cancel_prepare(
+            let started = MatryoshkaEvent::PrepareStarted {
+                repo_root: self.config.repo_root.clone(),
+                db: self.config.db.clone(),
+                existing_file_count,
+                existing_missing_text: existing_gap_count,
+                existing_search_missing,
+                ready_marker_exists,
+            };
+            emit_event(&mut on_event, &mut progress_writer, started.clone());
+            log.event(
+                "prepare_started",
+                json!({
+                    "repo_root": self.config.repo_root,
+                    "db": self.config.db,
+                    "offline": self.config.offline,
+                    "embedding_model": if self.config.offline { "deterministic" } else { self.config.embedding_model.as_str() },
+                    "chat_model": if self.config.offline { "heuristic" } else { self.config.chat_model.as_str() },
+                    "existing_file_count": existing_file_count,
+                    "existing_missing_text": existing_gap_count,
+                    "existing_search_missing": existing_search_missing,
+                    "ready_marker_exists": ready_marker_exists,
+                }),
+            )?;
+
+            let first_action = if existing_file_count == 0 {
+                "index"
+            } else if existing_gap_count > 0 {
+                "repair"
+            } else if existing_search_missing {
+                "rebuild_search"
+            } else {
+                "update"
+            };
+            let first_reason = if existing_file_count == 0 {
+                "no indexed files found"
+            } else if existing_gap_count > 0 {
+                "project map has gaps"
+            } else if existing_search_missing {
+                "search data is missing or incomplete"
+            } else if !ready_marker_exists {
+                "ready marker missing"
+            } else {
+                "refresh current project map"
+            };
+            prepare_decision(
                 &mut on_event,
                 &mut progress_writer,
                 &mut log,
-                "prepare was cancelled before warming results",
-            );
-        }
-        prepare_decision(
-            &mut on_event,
-            &mut progress_writer,
-            &mut log,
-            "prepare_results",
-            "make first searches fast and precise",
-        )?;
-        emit_event(
-            &mut on_event,
-            &mut progress_writer,
-            MatryoshkaEvent::PrewarmStarted {
-                query_count: queries.len(),
-                limit: options.limit,
-            },
-        );
-        let prewarm =
-            match self.run_prewarm_once(&queries, options.limit, Some(&mut log), &cancel_token) {
+                first_action,
+                first_reason,
+            )?;
+            if cancel_token.is_cancelled() {
+                return cancel_prepare(
+                    &mut on_event,
+                    &mut progress_writer,
+                    &mut log,
+                    "prepare was cancelled before indexing started",
+                );
+            }
+
+            let mut update = match self.run_update_once_with_progress(
+                parser_config.clone(),
+                Some(&mut log),
+                &cancel_token,
+                |progress| {
+                    emit_event(
+                        &mut on_event,
+                        &mut progress_writer,
+                        MatryoshkaEvent::IndexerProgress {
+                            operation: first_action.to_string(),
+                            progress,
+                        },
+                    );
+                },
+            ) {
                 Ok(summary) => summary,
                 Err(_err) if cancel_token.is_cancelled() => {
                     return cancel_prepare(
                         &mut on_event,
                         &mut progress_writer,
                         &mut log,
-                        "prepare was cancelled while warming results",
+                        "prepare was cancelled while updating the project",
                     );
                 }
                 Err(err) => return Err(err),
             };
-        let prewarm_json = SearchPrewarmSummaryJson::from(prewarm);
-        emit_event(
-            &mut on_event,
-            &mut progress_writer,
-            MatryoshkaEvent::PrewarmCompleted {
-                summary: prewarm_json.clone(),
-            },
-        );
-        actions_taken.push("prepare_results".into());
+            actions_taken.push(first_action.to_string());
 
-        retrieval_index = retrieval_report_from_stats(
-            MatryoshkaStore::open(&self.config.db)?.retrieval_index_stats()?,
-            self.config.late_interaction,
-        );
-        let ready = artifact_gap_count(&artifact_quality) == 0
-            && retrieval_is_ready(&retrieval_index, self.config.late_interaction);
-        let status = if ready {
-            PrepareStatus::Ready
-        } else {
-            PrepareStatus::NeedsAttention
-        };
+            if artifact_gap_count(&update.artifact_quality) > 0 && first_action != "repair" {
+                if cancel_token.is_cancelled() {
+                    return cancel_prepare(
+                        &mut on_event,
+                        &mut progress_writer,
+                        &mut log,
+                        "prepare was cancelled before repair",
+                    );
+                }
+                prepare_decision(
+                    &mut on_event,
+                    &mut progress_writer,
+                    &mut log,
+                    "repair",
+                    "project map has gaps",
+                )?;
+                update = match self.run_update_once_with_progress(
+                    parser_config,
+                    Some(&mut log),
+                    &cancel_token,
+                    |progress| {
+                        emit_event(
+                            &mut on_event,
+                            &mut progress_writer,
+                            MatryoshkaEvent::IndexerProgress {
+                                operation: "repair".into(),
+                                progress,
+                            },
+                        );
+                    },
+                ) {
+                    Ok(summary) => summary,
+                    Err(_err) if cancel_token.is_cancelled() => {
+                        return cancel_prepare(
+                            &mut on_event,
+                            &mut progress_writer,
+                            &mut log,
+                            "prepare was cancelled while repairing the project",
+                        );
+                    }
+                    Err(err) => return Err(err),
+                };
+                actions_taken.push("repair".into());
+            }
 
-        let summary = PrepareSummary {
-            repo_root: self.config.repo_root.clone(),
-            db: self.config.db.clone(),
-            ready_marker,
-            logs_dir,
-            status,
-            actions_taken,
-            file_count: update.file_count,
-            folder_count: update.folder_count,
-            symbol_count: update.symbol_count,
-            semantic_record_count: retrieval_index.semantic_records,
-            changed_files: update.changed_files,
-            removed_files: update.removed_files,
-            changed_folders: update.changed_folders,
-            repo_card_updated: update.repo_card_updated,
-            artifact_quality,
-            retrieval_index,
-            prewarm: prewarm_json,
-            embedding_model: update.embedding_model,
-        };
+            let mut artifact_quality = update.artifact_quality.clone();
+            let mut retrieval_index = update.retrieval_index.clone();
+            if retrieval_needs_rebuild(&retrieval_index, self.config.late_interaction) {
+                if cancel_token.is_cancelled() {
+                    return cancel_prepare(
+                        &mut on_event,
+                        &mut progress_writer,
+                        &mut log,
+                        "prepare was cancelled before rebuilding search",
+                    );
+                }
+                prepare_decision(
+                    &mut on_event,
+                    &mut progress_writer,
+                    &mut log,
+                    "rebuild_search",
+                    "search data is missing or incomplete",
+                )?;
+                let rebuild = match self.run_rebuild_semantic_once_with_progress(
+                    Some(&mut log),
+                    &cancel_token,
+                    |progress| {
+                        emit_event(
+                            &mut on_event,
+                            &mut progress_writer,
+                            MatryoshkaEvent::IndexerProgress {
+                                operation: "rebuild_search".into(),
+                                progress,
+                            },
+                        );
+                    },
+                ) {
+                    Ok(summary) => summary,
+                    Err(_err) if cancel_token.is_cancelled() => {
+                        return cancel_prepare(
+                            &mut on_event,
+                            &mut progress_writer,
+                            &mut log,
+                            "prepare was cancelled while rebuilding search",
+                        );
+                    }
+                    Err(err) => return Err(err),
+                };
+                artifact_quality = rebuild.artifact_quality;
+                if !actions_taken
+                    .iter()
+                    .any(|action| action == "rebuild_search")
+                {
+                    actions_taken.push("rebuild_search".into());
+                }
+            }
 
-        if summary.status == PrepareStatus::Ready {
-            write_ready_marker(&summary)?;
+            let queries = if options.queries.is_empty() {
+                default_prewarm_queries()
+            } else {
+                options.queries.clone()
+            };
+            if cancel_token.is_cancelled() {
+                return cancel_prepare(
+                    &mut on_event,
+                    &mut progress_writer,
+                    &mut log,
+                    "prepare was cancelled before warming results",
+                );
+            }
+            prepare_decision(
+                &mut on_event,
+                &mut progress_writer,
+                &mut log,
+                "prepare_results",
+                "make first searches fast and precise",
+            )?;
+            emit_event(
+                &mut on_event,
+                &mut progress_writer,
+                MatryoshkaEvent::PrewarmStarted {
+                    query_count: queries.len(),
+                    limit: options.limit,
+                },
+            );
+            let prewarm =
+                match self.run_prewarm_once(&queries, options.limit, Some(&mut log), &cancel_token)
+                {
+                    Ok(summary) => summary,
+                    Err(_err) if cancel_token.is_cancelled() => {
+                        return cancel_prepare(
+                            &mut on_event,
+                            &mut progress_writer,
+                            &mut log,
+                            "prepare was cancelled while warming results",
+                        );
+                    }
+                    Err(err) => return Err(err),
+                };
+            let prewarm_json = SearchPrewarmSummaryJson::from(prewarm);
+            emit_event(
+                &mut on_event,
+                &mut progress_writer,
+                MatryoshkaEvent::PrewarmCompleted {
+                    summary: prewarm_json.clone(),
+                },
+            );
+            actions_taken.push("prepare_results".into());
+
+            let final_prune = MatryoshkaStore::open(&self.config.db)?.prune_orphaned_artifacts()?;
+            log_prune_report(&mut log, "prepare_final_prune", &final_prune)?;
+            retrieval_index = retrieval_report_from_stats(
+                MatryoshkaStore::open(&self.config.db)?.retrieval_index_stats()?,
+                self.config.late_interaction,
+            );
+            let ready = artifact_gap_count(&artifact_quality) == 0
+                && retrieval_is_ready(&retrieval_index, self.config.late_interaction);
+            let status = if ready {
+                PrepareStatus::Ready
+            } else {
+                PrepareStatus::NeedsAttention
+            };
+
+            let summary = PrepareSummary {
+                repo_root: self.config.repo_root.clone(),
+                db: self.config.db.clone(),
+                ready_marker,
+                logs_dir,
+                status,
+                actions_taken,
+                file_count: update.file_count,
+                folder_count: update.folder_count,
+                symbol_count: update.symbol_count,
+                semantic_record_count: retrieval_index.semantic_records,
+                changed_files: update.changed_files,
+                removed_files: update.removed_files,
+                changed_folders: update.changed_folders,
+                repo_card_updated: update.repo_card_updated,
+                artifact_quality,
+                retrieval_index,
+                prewarm: prewarm_json,
+                embedding_model: update.embedding_model,
+            };
+
+            if summary.status == PrepareStatus::Ready {
+                write_ready_marker(&summary)?;
+            }
+            log.event("prepare_completed", prepare_summary_json(&summary))?;
+            emit_event(
+                &mut on_event,
+                &mut progress_writer,
+                MatryoshkaEvent::PrepareCompleted {
+                    summary: summary.clone(),
+                },
+            );
+            Ok(summary)
+        })();
+
+        let release_result =
+            release_prepare_lock(prepare_lock, &self.config.db, &mut on_event, &mut log);
+        match (result, release_result) {
+            (Ok(summary), Ok(())) => Ok(summary),
+            (Ok(_), Err(err)) => Err(err),
+            (Err(err), _) => Err(err),
         }
-        log.event("prepare_completed", prepare_summary_json(&summary))?;
-        emit_event(
-            &mut on_event,
-            &mut progress_writer,
-            MatryoshkaEvent::PrepareCompleted {
-                summary: summary.clone(),
-            },
-        );
-        Ok(summary)
     }
 
     pub fn search(&self, query: &str, options: SearchOptions) -> Result<Vec<SearchHit>> {
@@ -803,7 +859,9 @@ impl Matryoshka {
 
     pub fn cards(&self, options: CardsOptions) -> Result<Vec<CardSummaryRow>> {
         ensure_matryoshka_layout(&self.config.db)?;
-        let mut rows = MatryoshkaStore::open(&self.config.db)?.load_card_summaries()?;
+        let store = MatryoshkaStore::open(&self.config.db)?;
+        store.prune_orphaned_artifacts()?;
+        let mut rows = store.load_active_card_summaries()?;
         if options.empty_only {
             rows.retain(|row| row.is_empty);
         }
@@ -1092,6 +1150,36 @@ impl ProgressStateWriter {
 
 fn progress_state_from_event(event: &MatryoshkaEvent) -> ProgressState {
     match event {
+        MatryoshkaEvent::PrepareWaitingForLock { waited_ms, .. } => progress_state(
+            "prepare",
+            "running",
+            "waiting",
+            &format!("Waiting for Matryoshka ({waited_ms} ms)"),
+            0.0,
+            None,
+            None,
+            None,
+        ),
+        MatryoshkaEvent::PrepareLockAcquired { .. } => progress_state(
+            "prepare",
+            "running",
+            "locked",
+            "Preparing Matryoshka",
+            0.01,
+            None,
+            None,
+            None,
+        ),
+        MatryoshkaEvent::PrepareLockReleased { .. } => progress_state(
+            "prepare",
+            "running",
+            "released",
+            "Matryoshka lock released",
+            1.0,
+            None,
+            None,
+            None,
+        ),
         MatryoshkaEvent::PrepareStarted { .. } => progress_state(
             "prepare",
             "running",
@@ -1413,6 +1501,193 @@ impl CommandLog {
     }
 }
 
+const PREPARE_LOCK_TIMEOUT: Duration = Duration::from_secs(120);
+const PREPARE_LOCK_POLL_INTERVAL: Duration = Duration::from_millis(200);
+const PREPARE_LOCK_EVENT_INTERVAL: Duration = Duration::from_secs(1);
+
+struct PrepareLockGuard {
+    file: File,
+    path: PathBuf,
+}
+
+impl Drop for PrepareLockGuard {
+    fn drop(&mut self) {
+        let _ = unlock_prepare_file(&self.file);
+    }
+}
+
+fn acquire_prepare_lock(
+    db: &Path,
+    cancel_token: &MatryoshkaCancelToken,
+    on_event: &mut impl FnMut(MatryoshkaEvent),
+    log: &mut CommandLog,
+) -> Result<PrepareLockGuard> {
+    let lock_path = prepare_lock_path(db);
+    if let Some(parent) = lock_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&lock_path)?;
+    let started = Instant::now();
+    let mut last_wait_event: Option<Instant> = None;
+
+    loop {
+        cancel_token.check()?;
+        if try_lock_prepare_file(&file)? {
+            file.set_len(0)?;
+            writeln!(
+                &file,
+                "{{\"pid\":{},\"acquired_at_unix_ms\":{}}}",
+                std::process::id(),
+                unix_millis()
+            )?;
+            log.event(
+                "prepare_lock_acquired",
+                json!({
+                    "db": db,
+                    "lock_path": lock_path,
+                }),
+            )?;
+            on_event(MatryoshkaEvent::PrepareLockAcquired {
+                db: db.to_path_buf(),
+                lock_path: lock_path.clone(),
+            });
+            return Ok(PrepareLockGuard {
+                file,
+                path: lock_path,
+            });
+        }
+
+        let waited = started.elapsed();
+        if waited >= PREPARE_LOCK_TIMEOUT {
+            return Err(anyhow!(
+                "timed out after {} seconds waiting for Matryoshka prepare lock at {}",
+                PREPARE_LOCK_TIMEOUT.as_secs(),
+                lock_path.display()
+            ));
+        }
+        if last_wait_event
+            .map(|last| last.elapsed() >= PREPARE_LOCK_EVENT_INTERVAL)
+            .unwrap_or(true)
+        {
+            let waited_ms = waited.as_millis();
+            log.event(
+                "prepare_waiting_for_lock",
+                json!({
+                    "db": db,
+                    "lock_path": lock_path,
+                    "waited_ms": waited_ms,
+                }),
+            )?;
+            on_event(MatryoshkaEvent::PrepareWaitingForLock {
+                db: db.to_path_buf(),
+                lock_path: lock_path.clone(),
+                waited_ms,
+            });
+            last_wait_event = Some(Instant::now());
+        }
+        thread::sleep(PREPARE_LOCK_POLL_INTERVAL);
+    }
+}
+
+fn release_prepare_lock(
+    lock: PrepareLockGuard,
+    db: &Path,
+    on_event: &mut impl FnMut(MatryoshkaEvent),
+    log: &mut CommandLog,
+) -> Result<()> {
+    let lock_path = lock.path.clone();
+    drop(lock);
+    log.event(
+        "prepare_lock_released",
+        json!({
+            "db": db,
+            "lock_path": lock_path,
+        }),
+    )?;
+    on_event(MatryoshkaEvent::PrepareLockReleased {
+        db: db.to_path_buf(),
+        lock_path,
+    });
+    Ok(())
+}
+
+fn prepare_lock_path(db: &Path) -> PathBuf {
+    PathBuf::from(format!("{}.prepare.lock", db.display()))
+}
+
+fn log_prune_report(log: &mut CommandLog, event: &str, report: &OrphanPruneReport) -> Result<()> {
+    log.event(
+        event,
+        json!({
+            "file_cards": report.file_cards,
+            "folder_cards": report.folder_cards,
+            "semantic_records": report.semantic_records,
+            "fts_records": report.fts_records,
+            "late_vectors": report.late_vectors,
+        }),
+    )
+}
+
+#[cfg(unix)]
+fn try_lock_prepare_file(file: &File) -> Result<bool> {
+    use std::ffi::c_int;
+    use std::io;
+    use std::os::fd::AsRawFd;
+
+    const LOCK_EX: c_int = 2;
+    const LOCK_NB: c_int = 4;
+
+    unsafe extern "C" {
+        fn flock(fd: c_int, operation: c_int) -> c_int;
+    }
+
+    // `flock` is an OS advisory lock tied to this file descriptor and is released on drop.
+    let rc = unsafe { flock(file.as_raw_fd(), LOCK_EX | LOCK_NB) };
+    if rc == 0 {
+        return Ok(true);
+    }
+    let err = io::Error::last_os_error();
+    if err.kind() == io::ErrorKind::WouldBlock {
+        Ok(false)
+    } else {
+        Err(err.into())
+    }
+}
+
+#[cfg(unix)]
+fn unlock_prepare_file(file: &File) -> Result<()> {
+    use std::ffi::c_int;
+    use std::os::fd::AsRawFd;
+
+    const LOCK_UN: c_int = 8;
+
+    unsafe extern "C" {
+        fn flock(fd: c_int, operation: c_int) -> c_int;
+    }
+
+    let rc = unsafe { flock(file.as_raw_fd(), LOCK_UN) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error().into())
+    }
+}
+
+#[cfg(not(unix))]
+fn try_lock_prepare_file(_file: &File) -> Result<bool> {
+    Ok(true)
+}
+
+#[cfg(not(unix))]
+fn unlock_prepare_file(_file: &File) -> Result<()> {
+    Ok(())
+}
+
 pub fn default_db_path(repo_root: &Path) -> PathBuf {
     repo_root.join(MATRYOSHKA_DIR).join(DEFAULT_DB_FILE)
 }
@@ -1485,28 +1760,6 @@ fn logs_dir(db: &Path) -> PathBuf {
     db.parent()
         .unwrap_or_else(|| Path::new(MATRYOSHKA_DIR))
         .join("logs")
-}
-
-fn indexed_file_count(db: &Path) -> Result<usize> {
-    Ok(MatryoshkaStore::open(db)?.load_all_files()?.len())
-}
-
-fn existing_card_gap_count(db: &Path) -> Result<usize> {
-    Ok(MatryoshkaStore::open(db)?
-        .load_card_summaries()?
-        .iter()
-        .filter(|row| row.is_empty)
-        .count())
-}
-
-fn existing_retrieval_needs_rebuild(db: &Path, late_interaction: bool) -> Result<bool> {
-    Ok(retrieval_needs_rebuild(
-        &retrieval_report_from_stats(
-            MatryoshkaStore::open(db)?.retrieval_index_stats()?,
-            late_interaction,
-        ),
-        late_interaction,
-    ))
 }
 
 fn write_ready_marker(summary: &PrepareSummary) -> Result<()> {

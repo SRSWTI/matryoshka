@@ -202,6 +202,20 @@ fn test_repo_live_prepare_search_read_and_progress_work_through_rust_api() {
         0
     );
 
+    seed_orphaned_cards(&db);
+    seed_orphaned_semantic_artifacts(&db);
+    assert!(orphan_file_cards(&db) > 0);
+    assert!(orphan_folder_cards(&db) > 0);
+    assert!(orphan_fts_records(&db) > 0);
+    assert!(orphan_late_vectors(&db) > 0);
+    let pruned = completed_summary(&run_prepare(&api, "orphan_prune"));
+    println!("orphan_prune actions={:?}", pruned.actions_taken);
+    assert_eq!(pruned.status, PrepareStatus::Ready);
+    assert_eq!(orphan_file_cards(&db), 0);
+    assert_eq!(orphan_folder_cards(&db), 0);
+    assert_eq!(orphan_fts_records(&db), 0);
+    assert_eq!(orphan_late_vectors(&db), 0);
+
     blank_two_card_summaries(&db);
     let repaired = completed_summary(&run_prepare(&api, "card_gaps"));
     println!("card_gaps actions={:?}", repaired.actions_taken);
@@ -241,6 +255,10 @@ fn test_repo_live_prepare_search_read_and_progress_work_through_rust_api() {
     assert_eq!(healthy.actions_taken, vec!["update", "prepare_results"]);
     assert_eq!(healthy.changed_files, 0);
     assert_eq!(healthy.removed_files, 0);
+    assert_eq!(orphan_file_cards(&db), 0);
+    assert_eq!(orphan_folder_cards(&db), 0);
+    assert_eq!(orphan_fts_records(&db), 0);
+    assert_eq!(orphan_late_vectors(&db), 0);
 }
 
 fn run_prepare(api: &Matryoshka, scenario: &str) -> Vec<MatryoshkaEvent> {
@@ -264,6 +282,7 @@ fn run_prepare(api: &Matryoshka, scenario: &str) -> Vec<MatryoshkaEvent> {
         "{scenario} prepare summary was not ready: {summary:#?}",
     );
     assert_progress_events_are_consistent(scenario, &events);
+    assert_lock_events_are_consistent(scenario, &events);
     events
 }
 
@@ -361,6 +380,21 @@ fn assert_progress_events_are_consistent(scenario: &str, events: &[MatryoshkaEve
     }
 }
 
+fn assert_lock_events_are_consistent(scenario: &str, events: &[MatryoshkaEvent]) {
+    let acquired = events
+        .iter()
+        .position(|event| matches!(event, MatryoshkaEvent::PrepareLockAcquired { .. }))
+        .unwrap_or_else(|| panic!("{scenario} did not emit lock acquired"));
+    let released = events
+        .iter()
+        .position(|event| matches!(event, MatryoshkaEvent::PrepareLockReleased { .. }))
+        .unwrap_or_else(|| panic!("{scenario} did not emit lock released"));
+    assert!(
+        acquired < released,
+        "{scenario} lock release should happen after acquisition"
+    );
+}
+
 fn assert_ready_progress_state(db: &Path) {
     let state_path = progress_state_path(db);
     assert!(state_path.exists());
@@ -430,6 +464,108 @@ fn delete_search_data(db: &Path) {
     conn.execute("delete from semantic_records_fts", [])
         .unwrap();
     conn.execute("delete from semantic_records", []).unwrap();
+}
+
+fn seed_orphaned_cards(db: &Path) {
+    let conn = conn(db);
+    conn.execute(
+        r#"
+        insert or replace into file_cards(file_id, source_hash, payload_json)
+        select 'ignored/src/stale.rs',
+               'stale',
+               json_set(payload_json, '$.file_id', 'ignored/src/stale.rs', '$.summary', '')
+        from file_cards
+        limit 1
+        "#,
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        r#"
+        insert or replace into folder_cards(folder_id, payload_json)
+        select 'ignored/src',
+               json_set(payload_json, '$.folder_id', 'ignored/src', '$.summary', '')
+        from folder_cards
+        limit 1
+        "#,
+        [],
+    )
+    .unwrap();
+}
+
+fn seed_orphaned_semantic_artifacts(db: &Path) {
+    let conn = conn(db);
+    conn.execute(
+        r#"
+        insert or replace into semantic_records(record_id, entity_id, entity_type, path, source_hash, payload_json)
+        values(
+          'semantic:file_card:ignored/src/stale.rs',
+          'ignored/src/stale.rs',
+          'File',
+          'ignored/src/stale.rs',
+          'stale',
+          '{"record_id":"semantic:file_card:ignored/src/stale.rs","entity_id":"ignored/src/stale.rs","entity_type":"file","title":"stale","content":"stale","path":"ignored/src/stale.rs","source_hash":"stale","embedding":[0.1],"metadata":{}}'
+        )
+        "#,
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        r#"
+        insert into semantic_records_fts(record_id, title, path, content, metadata_text)
+        values('semantic:missing:orphan', 'orphan', 'ignored/src/stale.rs', 'orphan stale', '')
+        "#,
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        r#"
+        insert or replace into semantic_late_vectors(record_id, token, ordinal, weight, embedding_json)
+        values('semantic:missing:orphan', 'orphan', 0, 1.0, '[0.1]')
+        "#,
+        [],
+    )
+    .unwrap();
+}
+
+fn orphan_file_cards(db: &Path) -> i64 {
+    conn(db)
+        .query_row(
+            "select count(*) from file_cards where file_id not in (select file_id from files)",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap()
+}
+
+fn orphan_folder_cards(db: &Path) -> i64 {
+    conn(db)
+        .query_row(
+            "select count(*) from folder_cards where folder_id not in (select folder_id from folders)",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap()
+}
+
+fn orphan_fts_records(db: &Path) -> i64 {
+    conn(db)
+        .query_row(
+            "select count(*) from semantic_records_fts where record_id not in (select record_id from semantic_records)",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap()
+}
+
+fn orphan_late_vectors(db: &Path) -> i64 {
+    conn(db)
+        .query_row(
+            "select count(*) from semantic_late_vectors where record_id not in (select record_id from semantic_records)",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap()
 }
 
 fn base_url() -> String {
