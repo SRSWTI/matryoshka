@@ -122,6 +122,7 @@ impl GraphResolver {
             symbols: parsed.symbols,
             edges,
             semantic_records,
+            code_chunks: parsed.code_chunks,
         }
     }
 }

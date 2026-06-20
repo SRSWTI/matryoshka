@@ -1,6 +1,6 @@
 {
   "server": {
-    "host": "127.0.0.1",
+    "host": "http://127.0.0.1:44445",
     "port": 44445,
     "log_level": "info",
     "auto_start_on_launch": true
@@ -23,8 +23,18 @@
     "max_tokens": 50000
   },
   "matryoshka": {
-    "chat_model": "MercuriusDream--Qwen3.5-4B-MLX-mxfp8",
-    "embedding_model": "mlx-community--embeddinggemma-300m-bf16"
+    "chat_model": "srswti--bodega-raptor-90m",
+    "embedding_model": "mlx-community--embeddinggemma-300m-bf16",
+    "offline": false,
+    "late_interaction": true,
+    "ignored_paths": [
+      ".matryoshka",
+      "target",
+      "tests",
+      "test",
+      ".json"
+    ],
+    "reranker": "none"
   },
   "provider": {}
 }

@@ -12,7 +12,7 @@ Call prepare.
 
 ## Preferred Integration
 
-Use the Rust API from the `matryoshka` crate.
+Use the Rust API from the published `matryoshka-api` package. In code, keep importing it as `matryoshka`.
 
 This avoids:
 
@@ -34,10 +34,12 @@ matryoshka = { path = "crates/api" }
 After publishing:
 
 ```toml
-matryoshka = "0.1.1"
+matryoshka = { package = "matryoshka-api", version = "0.1.6" }
 ```
 
-The `matryoshka` crate pulls in the internal parser, resolver, store, indexer, search, read, and enrichment crates it needs.
+Do not use `matryoshka = "..."` directly from crates.io; that package name is owned by a different project. The alias above gives IDE code the clean `use matryoshka::...` import while Cargo fetches our `matryoshka-api` package.
+
+The `matryoshka-api` package pulls in the internal parser, resolver, store, indexer, search, read, and enrichment crates it needs.
 
 ## Model Profile
 
@@ -590,7 +592,7 @@ Those are log/details concepts, not first-run UI concepts.
 Default test lane:
 
 ```bash
-cargo test -p matryoshka
+cargo test -p matryoshka-api
 cargo test
 ```
 
@@ -603,7 +605,7 @@ MATRYOSHKA_MLX_API_KEY=2508 \
 MATRYOSHKA_MLX_CHAT_MODEL=srswti--bodega-raptor-90m \
 MATRYOSHKA_MLX_EMBED_MODEL=mlx-community--embeddinggemma-300m-bf16 \
 MATRYOSHKA_OMLX_RERANK_MODEL=mlx-community--Qwen3-Reranker-0.6B-mxfp8 \
-cargo test -p matryoshka --test real_omlx -- --ignored --nocapture
+cargo test -p matryoshka-api --test real_omlx -- --ignored --nocapture
 ```
 
 This live test covers:
@@ -639,7 +641,7 @@ MATRYOSHKA_MLX_API_KEY=2508 \
 MATRYOSHKA_MLX_CHAT_MODEL=srswti--bodega-raptor-90m \
 MATRYOSHKA_MLX_EMBED_MODEL=mlx-community--embeddinggemma-300m-bf16 \
 MATRYOSHKA_OMLX_RERANK_MODEL=mlx-community--Qwen3-Reranker-0.6B-mxfp8 \
-cargo test -p matryoshka --test test_repo_omlx -- --ignored --nocapture
+cargo test -p matryoshka-api --test test_repo_omlx -- --ignored --nocapture
 ```
 
 This test uses:

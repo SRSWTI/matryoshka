@@ -18,7 +18,7 @@ members = [
 [workspace.package]
 edition = "2024"
 license = "MIT"
-version = "0.1.5"
+version = "0.1.6"
 description = "Rust-first code intelligence, search, and read context for coding agents"
 repository = "https://github.com/SRSWTI/matryoshka"
 readme = "README.md"
@@ -38,14 +38,14 @@ tempfile = "3"
 thiserror = "2"
 walkdir = "2"
 
-matryoshka-core-ir = { version = "0.1.5", path = "crates/core-ir" }
-matryoshka = { version = "0.1.5", path = "crates/api" }
-matryoshka-parser = { version = "0.1.5", path = "crates/parser" }
-matryoshka-resolver = { version = "0.1.5", path = "crates/resolver" }
-matryoshka-store-sqlite = { version = "0.1.5", path = "crates/store-sqlite" }
-matryoshka-enricher = { version = "0.1.5", path = "crates/enricher" }
-matryoshka-embed-client = { version = "0.1.5", path = "crates/embed-client" }
-matryoshka-indexer = { version = "0.1.5", path = "crates/indexer" }
-matryoshka-search = { version = "0.1.5", path = "crates/search" }
-matryoshka-read-api = { version = "0.1.5", path = "crates/read-api" }
-matryoshka-watcher = { version = "0.1.5", path = "crates/watcher" }
+matryoshka-core-ir = { version = "0.1.6", path = "crates/core-ir" }
+matryoshka-api = { version = "0.1.6", path = "crates/api" }
+matryoshka-parser = { version = "0.1.6", path = "crates/parser" }
+matryoshka-resolver = { version = "0.1.6", path = "crates/resolver" }
+matryoshka-store-sqlite = { version = "0.1.6", path = "crates/store-sqlite" }
+matryoshka-enricher = { version = "0.1.6", path = "crates/enricher" }
+matryoshka-embed-client = { version = "0.1.6", path = "crates/embed-client" }
+matryoshka-indexer = { version = "0.1.6", path = "crates/indexer" }
+matryoshka-search = { version = "0.1.6", path = "crates/search" }
+matryoshka-read-api = { version = "0.1.6", path = "crates/read-api" }
+matryoshka-watcher = { version = "0.1.6", path = "crates/watcher" }

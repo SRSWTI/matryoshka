@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use matryoshka_core_ir::{
-    EdgeFact, FileCard, FileFact, FolderCard, FolderFact, LateInteractionVector, RepoCard,
-    RepositorySnapshot, SemanticRecord, SymbolFact,
+    CodeChunkFact, EdgeFact, FileCard, FileFact, FolderCard, FolderFact, LateInteractionVector,
+    RepoCard, RepositorySnapshot, SemanticRecord, SymbolFact,
 };
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
@@ -38,6 +38,7 @@ pub struct OrphanPruneReport {
     pub semantic_records: usize,
     pub fts_records: usize,
     pub late_vectors: usize,
+    pub code_chunks: usize,
 }
 
 impl OrphanPruneReport {
@@ -47,6 +48,7 @@ impl OrphanPruneReport {
             && self.semantic_records == 0
             && self.fts_records == 0
             && self.late_vectors == 0
+            && self.code_chunks == 0
     }
 }
 
@@ -152,6 +154,16 @@ impl MatryoshkaStore {
                 embedding_json TEXT NOT NULL,
                 PRIMARY KEY(record_id, ordinal)
             );
+            CREATE TABLE IF NOT EXISTS code_chunks (
+                chunk_id TEXT PRIMARY KEY,
+                file_id TEXT NOT NULL,
+                path TEXT NOT NULL,
+                source_hash TEXT NOT NULL,
+                start_line INTEGER NOT NULL,
+                end_line INTEGER NOT NULL,
+                summary_source TEXT NOT NULL,
+                payload_json TEXT NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS invalidation_queue (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 entity_id TEXT NOT NULL,
@@ -164,6 +176,8 @@ impl MatryoshkaStore {
             CREATE INDEX IF NOT EXISTS idx_edges_target ON edges(target_id);
             CREATE INDEX IF NOT EXISTS idx_semantic_entity ON semantic_records(entity_id);
             CREATE INDEX IF NOT EXISTS idx_late_vectors_record ON semantic_late_vectors(record_id);
+            CREATE INDEX IF NOT EXISTS idx_code_chunks_file ON code_chunks(file_id);
+            CREATE INDEX IF NOT EXISTS idx_code_chunks_path ON code_chunks(path);
             "#,
         )?;
         Ok(())
@@ -173,7 +187,7 @@ impl MatryoshkaStore {
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
         tx.execute_batch(
-            "DELETE FROM files; DELETE FROM folders; DELETE FROM symbols; DELETE FROM edges; DELETE FROM semantic_records; DELETE FROM semantic_records_fts; DELETE FROM semantic_late_vectors;",
+            "DELETE FROM files; DELETE FROM folders; DELETE FROM symbols; DELETE FROM edges; DELETE FROM semantic_records; DELETE FROM semantic_records_fts; DELETE FROM semantic_late_vectors; DELETE FROM code_chunks;",
         )?;
         tx.execute(
             "INSERT OR REPLACE INTO meta(key, value) VALUES('repo_root', ?1)",
@@ -211,6 +225,9 @@ impl MatryoshkaStore {
         for record in &snapshot.semantic_records {
             upsert_semantic_record_tx(&tx, record)?;
         }
+        for chunk in &snapshot.code_chunks {
+            upsert_code_chunk_tx(&tx, chunk)?;
+        }
         tx.commit()?;
         Ok(())
     }
@@ -240,6 +257,51 @@ impl MatryoshkaStore {
             params![card.repo_root, to_json(card)?],
         )?;
         Ok(())
+    }
+
+    pub fn upsert_code_chunks(&self, chunks: &[CodeChunkFact]) -> Result<()> {
+        let mut conn = self.connect()?;
+        let tx = conn.transaction()?;
+        for chunk in chunks {
+            upsert_code_chunk_tx(&tx, chunk)?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn upsert_code_chunk(&self, chunk: &CodeChunkFact) -> Result<()> {
+        let mut conn = self.connect()?;
+        let tx = conn.transaction()?;
+        upsert_code_chunk_tx(&tx, chunk)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn load_all_code_chunks(&self) -> Result<Vec<CodeChunkFact>> {
+        self.load_all("SELECT payload_json FROM code_chunks ORDER BY chunk_id")
+    }
+
+    pub fn load_code_chunks_for_file(&self, file_id: &str) -> Result<Vec<CodeChunkFact>> {
+        self.load_many(
+            "SELECT payload_json FROM code_chunks WHERE file_id = ?1 ORDER BY start_line",
+            file_id,
+        )
+    }
+
+    pub fn delete_code_chunks_for_files(&self, file_ids: &[String]) -> Result<()> {
+        delete_many(
+            &self.connect()?,
+            "DELETE FROM code_chunks WHERE file_id = ?1",
+            file_ids,
+        )
+    }
+
+    pub fn delete_code_chunks_for_paths(&self, paths: &[String]) -> Result<()> {
+        delete_many(
+            &self.connect()?,
+            "DELETE FROM code_chunks WHERE path = ?1",
+            paths,
+        )
     }
 
     pub fn upsert_semantic_records(&self, records: &[SemanticRecord]) -> Result<()> {
@@ -667,6 +729,14 @@ impl MatryoshkaStore {
             [],
         )?;
 
+        report.code_chunks += tx.execute(
+            r#"
+            DELETE FROM code_chunks
+            WHERE file_id NOT IN (SELECT file_id FROM files)
+            "#,
+            [],
+        )?;
+
         tx.commit()?;
         Ok(report)
     }
@@ -1013,6 +1083,23 @@ fn upsert_semantic_record_tx(
         params![record.record_id, record.entity_id, format!("{:?}", record.entity_type), record.path, record.source_hash, to_json(record)?],
     )?;
     upsert_semantic_fts_tx(tx, record)?;
+    Ok(())
+}
+
+fn upsert_code_chunk_tx(tx: &rusqlite::Transaction<'_>, chunk: &CodeChunkFact) -> Result<()> {
+    tx.execute(
+        "INSERT OR REPLACE INTO code_chunks(chunk_id, file_id, path, source_hash, start_line, end_line, summary_source, payload_json) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        params![
+            chunk.chunk_id,
+            chunk.file_id,
+            chunk.path,
+            chunk.source_hash,
+            chunk.start_line as i64,
+            chunk.end_line as i64,
+            format!("{:?}", chunk.summary_source),
+            to_json(chunk)?
+        ],
+    )?;
     Ok(())
 }
 

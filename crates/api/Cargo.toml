@@ -1,11 +1,14 @@
 [package]
-name = "matryoshka"
+name = "matryoshka-api"
 edition.workspace = true
 license.workspace = true
 version.workspace = true
 description.workspace = true
 repository.workspace = true
 readme.workspace = true
+
+[lib]
+name = "matryoshka"
 
 [dependencies]
 anyhow.workspace = true

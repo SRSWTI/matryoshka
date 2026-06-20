@@ -12,7 +12,7 @@ CRATES=(
   matryoshka-search
   matryoshka-watcher
   matryoshka-indexer
-  matryoshka
+  matryoshka-api
   matryoshka-cli
 )
 
@@ -27,7 +27,7 @@ MATRYOSHKA_DEPS=(
   matryoshka-search
   matryoshka-read-api
   matryoshka-watcher
-  matryoshka
+  matryoshka-api
 )
 
 usage() {
@@ -51,6 +51,7 @@ Examples:
   scripts/publish-all.sh --execute --allow-dirty
   scripts/publish-all.sh --execute --version 0.1.3 --only matryoshka-cli
   scripts/publish-all.sh --execute --version 0.1.3 --start-at matryoshka-cli
+  scripts/publish-all.sh --execute --version 0.1.3 --only matryoshka-api
 EOF
 }
 

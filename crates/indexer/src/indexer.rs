@@ -924,6 +924,7 @@ fn load_snapshot(store: &MatryoshkaStore, repo_root: &Path) -> Result<Repository
         symbols: store.load_all_symbols()?,
         edges: store.load_all_edges()?,
         semantic_records: store.load_all_semantic_records()?,
+        code_chunks: store.load_all_code_chunks()?,
     })
 }
 
@@ -1316,7 +1317,9 @@ fn artifact_repair_set(
             SemanticEntityType::Repo => {
                 repair.repo_card_stale = true;
             }
-            SemanticEntityType::Symbol | SemanticEntityType::Snippet => {
+            SemanticEntityType::Symbol
+            | SemanticEntityType::Snippet
+            | SemanticEntityType::CodeChunk => {
                 if let Some(file) = files_by_path.get(record.path.as_str()) {
                     repair.repair_file(file);
                 }

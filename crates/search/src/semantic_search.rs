@@ -274,7 +274,8 @@ impl<M: Embedder> SearchEngine<M> {
                     }
                 }
                 matryoshka_core_ir::SemanticEntityType::Snippet
-                | matryoshka_core_ir::SemanticEntityType::Symbol => {
+                | matryoshka_core_ir::SemanticEntityType::Symbol
+                | matryoshka_core_ir::SemanticEntityType::CodeChunk => {
                     if let Some(card) = file_cards
                         .get(&hit.path)
                         .or_else(|| file_cards.get(&hit.entity_id))
@@ -425,7 +426,10 @@ fn collapse_file_hits(hits: Vec<SearchHit>, records: &[SemanticRecord]) -> Vec<S
 fn is_file_level_result(record: &SemanticRecord) -> bool {
     matches!(
         record.entity_type,
-        SemanticEntityType::File | SemanticEntityType::Symbol | SemanticEntityType::Snippet
+        SemanticEntityType::File
+            | SemanticEntityType::Symbol
+            | SemanticEntityType::Snippet
+            | SemanticEntityType::CodeChunk
     )
 }
 
@@ -554,7 +558,10 @@ impl CollapsedHit {
             .extend(hit.matched_symbols.iter().cloned());
         self.why.extend(hit.why_matched.iter().cloned());
 
-        if matches!(record.entity_type, SemanticEntityType::Symbol) {
+        if matches!(
+            record.entity_type,
+            SemanticEntityType::Symbol | SemanticEntityType::CodeChunk
+        ) {
             if let Some(symbol) = symbol_name_from_record(record) {
                 self.matched_symbols.insert(symbol);
             }
@@ -1032,8 +1039,22 @@ fn symbol_description(card: &FileCard, record: &SemanticRecord) -> String {
 }
 
 fn symbol_name_from_record(record: &SemanticRecord) -> Option<String> {
-    if !matches!(record.entity_type, SemanticEntityType::Symbol) {
+    if !matches!(
+        record.entity_type,
+        SemanticEntityType::Symbol | SemanticEntityType::CodeChunk
+    ) {
         return None;
+    }
+    // Code chunks store the qualified name in metadata; prefer that when present.
+    if record.entity_type == SemanticEntityType::CodeChunk {
+        if let Some(name) = record
+            .metadata
+            .get("qualified_name")
+            .and_then(Value::as_str)
+            .filter(|name| !name.trim().is_empty())
+        {
+            return Some(name.to_string());
+        }
     }
     record
         .entity_id
