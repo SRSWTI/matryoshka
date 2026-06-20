@@ -23,11 +23,12 @@ No useful docstring/doc comment
 
 | Milestone | Status | Summary |
 |---|---|---|
-| M1 — Code chunk extraction + doc extraction | ✅ Complete | Parser emits `CodeChunkFact` per symbol with full body + docstring/doc-comment summaries |
+| M1 — Code chunk extraction + doc extraction | ✅ Complete | Parser emits structural `CodeChunkFact`s with full body + docstring/doc-comment summaries |
 | M2 — Concurrent LLM chunk summaries + chunk semantic records | ✅ Complete | MLX/Raptor summarizes empty chunks concurrently; `code_chunk` semantic records built in target template; CLI/API flags wired |
-| M3 — Retrieval config, dense optional | ⬜ Not started | Make dense embeddings optional via CLI/API flags; stage-based candidate collection |
-| M4 — SPLADE primary retrieval | ⬜ Not started | SPLADE sparse index + postings storage; SPLADE-first scoring |
-| M5 — Measurement & recall comparison | ⬜ Not started | Retrieval diagnostics + eval harness for SPLADE-only vs hybrid |
+| M2.5 — Real-repo verification + parser hardening | ✅ Complete | Verified DB invariants on `/Users/rohit/pi/packages/agent/src`; fixed TS prompt-string false positive and removed `Unknown` chunks from embedding path |
+| M3 — Retrieval config, dense optional | ⬜ Next | Make dense embeddings optional at index/search time via CLI/API flags; stage-based candidate collection |
+| M4 — SPLADE primary retrieval | ⬜ Not started | SPLADE sparse index + postings storage using omlx SPLADE model; SPLADE-first scoring |
+| M5 — Measurement & recall comparison | ⬜ Not started | Retrieval diagnostics + eval harness for SPLADE-only vs hybrid/dense |
 
 ---
 
@@ -145,7 +146,11 @@ doc comment so the indexer can skip LLM summarization when a useful doc exists.
 5. **Contiguity enforced.** A doc is only attached if it is immediately above
    (Rust `///`, TS `/** */` / `//`) or inside the body (Python `"""`). A blank
    line or code between the doc and the symbol means no doc is attached.
-6. **Backward compatible.** `RepositorySnapshot.code_chunks` is `#[serde(default)]`,
+6. **Exact symbols stay separate from embedding chunks.** Type aliases, constants,
+   local declarations, and other `Unknown` chunk kinds remain available to the
+   exact/symbol side, but are not converted into `CodeChunkFact`s for summary
+   generation or semantic embedding.
+7. **Backward compatible.** `RepositorySnapshot.code_chunks` is `#[serde(default)]`,
    so old snapshots still deserialize.
 
 ### Data model added (`crates/core-ir/src/models.rs`)
@@ -186,7 +191,7 @@ Also:
 | File | Change |
 |---|---|
 | `crates/core-ir/src/models.rs` | Added `CodeChunkFact`, `CodeChunkKind`, `ChunkSummarySource`, `SemanticEntityType::CodeChunk`, `RepositorySnapshot.code_chunks`, schema constants; made enums `Copy` |
-| `crates/parser/src/source_parser.rs` | Extended `ParsedRepository` with `code_chunks`; `parse_file` builds chunks; `build_code_chunks`, `chunk_kind_for_symbol`, `doc_is_useful`, `doc_summary_source`, `extract_symbol_doc`, `extract_python_docstring`, `extract_leading_doc_comment`, `extract_typescript_doc`, `extract_jsdoc_block`, `extract_line_comments`; 9 new tests |
+| `crates/parser/src/source_parser.rs` | Extended `ParsedRepository` with `code_chunks`; `parse_file` builds chunks; `build_code_chunks`, `chunk_kind_for_symbol`, `doc_is_useful`, `doc_summary_source`, `extract_symbol_doc`, `extract_python_docstring`, `extract_leading_doc_comment`, `extract_typescript_doc`, `extract_jsdoc_block`, `extract_line_comments`, `typescript_variable_initializer_is_function_like`; parser regression coverage now 16 tests |
 | `crates/resolver/src/graph_resolver.rs` | Carries `parsed.code_chunks` into `RepositorySnapshot.code_chunks` |
 | `crates/store-sqlite/src/sqlite_store.rs` | New `code_chunks` table + indexes; `upsert_code_chunk(s)`, `load_all_code_chunks`, `load_code_chunks_for_file`, `delete_code_chunks_for_files`, `delete_code_chunks_for_paths`, `upsert_code_chunk_tx`; `replace_snapshot` clears/populates chunks; `prune_orphaned_artifacts` prunes orphan chunks; `OrphanPruneReport.code_chunks` field |
 | `crates/indexer/src/indexer.rs` | `load_snapshot` loads `code_chunks`; `artifact_repair_set` handles `CodeChunk` records |
@@ -379,7 +384,7 @@ chat_template_kwargs: {"enable_thinking": false}
 response_format: json_schema (SummaryDraft { summary: String })
 ```
 
-### Chunk semantic record template (planned)
+### Chunk semantic record template (implemented)
 
 ```
 path: crates/foo/src/bar.rs
@@ -395,11 +400,131 @@ fn handle_resume_countdown(...) {
 
 Metadata: `kind=code_chunk`, `summary_source`, `symbol_id`, `qualified_name`, `start_line`, `end_line`, `language`.
 
-### Incremental behavior (planned)
+### Incremental behavior
 
-- If file `source_hash` unchanged → skip chunk re-summary.
-- If changed file → regenerate only chunks in changed files.
-- Only chunks with `summary_source == Empty` (or generic/short docs) are sent to the LLM.
+Implemented:
+- If changed file → regenerate summaries only for chunks in changed files / affected files.
+- Only chunks with `summary_source == Empty` are sent to the LLM.
+- Chunks with useful docs (`DocComment` / `Docstring`) are persisted directly and never sent to the LLM.
+
+Still worth tightening in later cleanup:
+- Make the skip/reuse decision explicit in progress events when a file hash is unchanged.
+- Add a small chunk-summary cache keyed by `chunk_id + source_hash` if we need more aggressive reuse across rebuilds.
+
+---
+
+## Milestone 2.5 — Real-Repo Verification + Parser Hardening ✅
+
+### Goal
+
+Verify the full M1/M2 pipeline against a real TypeScript repo DB, confirm the
+summary-source invariants, explain the remaining dense embedding progress events,
+and harden the parser against noisy/non-structural chunks before starting M3.
+
+### What we verified
+
+DB inspected:
+
+```text
+/Users/rohit/pi/packages/agent/src/.matryoshka/matryoshka.db
+```
+
+Observed before parser cleanup:
+
+```text
+code_chunks:
+  doc_comment: 47
+  llm:         1137
+  empty:       1
+```
+
+Invariants checked:
+- `doc_comment` chunks had `doc_summary` populated and `generated_summary = null`.
+- `llm` chunks had `generated_summary` populated and `doc_summary = null`.
+- `agentLoop`, `agentLoopContinue`, and `runLoop` correctly used their source JSDoc as `doc_comment` summaries.
+- Undocumented chunks such as `AgentEventSink` used the LLM fallback.
+- `CodeChunk` semantic records existed and used the target text template:
+  `path`, `symbol`, `kind`, `signature`, `summary`, `code`.
+
+### Bug found and fixed
+
+The one remaining `empty` chunk was:
+
+```text
+harness/compaction/compaction.ts::SUMMARIZATION_PROMPT:382
+```
+
+Root cause: the TypeScript fallback classified a string constant as a function
+because the prompt text contained the word `function`.
+
+Fixes in `crates/parser/src/source_parser.rs`:
+1. Function-like TS variables are now detected from the initializer after `=`.
+2. String/template literal initializers are rejected before checking for `=>` or
+   `function` expressions.
+3. `build_code_chunks()` skips `CodeChunkKind::Unknown`, so constants, type
+   aliases, and local declarations stay on the exact/symbol side instead of being
+   sent to LLM summarization and semantic embedding.
+4. Added regression test:
+   `typescript_prompt_string_containing_function_is_not_chunked`.
+
+Parser-only verification after the fix on `/Users/rohit/pi/packages/agent/src`:
+
+```text
+total chunks: 547
+Unknown:      0
+
+Kinds:
+  Function:  185
+  Method:    235
+  Class:     16
+  Interface: 111
+
+Sources before LLM:
+  DocComment: 29
+  Empty:      518
+```
+
+### Dense progress clarification
+
+The observed events:
+
+```json
+{"type":"embedding_batch","records_in_batch":64}
+{"type":"embedded_batch","records_in_batch":64}
+```
+
+are from the existing dense embedding pipeline, not the chunk summarizer. A
+`record` here means one `semantic_records` row (`CodeChunk`, `Symbol`, `Snippet`,
+`File`, `Folder`, or `Repo`) being sent to the dense embedder. M3 will make this
+path optional/skippable.
+
+### Validation
+
+- `cargo test -p matryoshka-parser` — pass, 16 parser tests.
+- `cargo test --workspace` — pass.
+- `cargo build --release --bin matryoshka-rs` — pass.
+
+### Files touched in M2.5
+
+| File | Change |
+|---|---|
+| `crates/parser/src/source_parser.rs` | Tightened TypeScript function-like variable detection; skipped `Unknown` code chunks; added regression test |
+| `PROGRESS.md` | Documented DB verification, parser cleanup, dense-event clarification, and updated roadmap |
+
+### Reindex note
+
+Existing DBs created before this fix still contain the old noisy chunks. Use a
+fresh DB path or reindex after rebuilding the local binary:
+
+```bash
+/Users/rohit/cradle-embed/target/release/matryoshka-rs index /Users/rohit/pi/packages/agent/src \
+  --db /Users/rohit/pi/packages/agent/src/.matryoshka/matryoshka_after_parser_fix.db \
+  --base-url http://127.0.0.1:44449 \
+  --api-key 2508 \
+  --chunk-summary-model srswti--bodega-raptor-90m \
+  --chunk-summary-concurrency 6 \
+  --progress-jsonl
+```
 
 ---
 
@@ -413,16 +538,20 @@ Make dense embeddings genuinely optional so we can run `exact + FTS` (and later
 ### Planned changes
 
 - `crates/core-ir/src/models.rs` (or new config module) — `RetrievalConfig`, `RetrievalPrimary` enum (`Fts`, `Splade`, `Dense`, `Hybrid`).
+- `crates/indexer/src/indexer.rs` — make dense record embedding optional during `index`, `prepare`, `update`, and `rebuild-semantic`; skip dense vector writes and late-interaction vector generation when dense is disabled.
 - `crates/search/src/semantic_search.rs` — `SearchEngine` takes `Option<M>` embedder; stage-based candidate collection (`collect_exact_candidates`, `collect_fts_candidates`, `collect_dense_candidates`); skip query embedding when dense disabled; disable late-interaction when dense disabled.
+- `crates/store-sqlite/src/sqlite_store.rs` — make retrieval health reports explicit about dense-disabled indexes (`embedded_records=0` can be healthy when configured that way).
 - `crates/api/src/lib.rs` — `MatryoshkaConfig` gains `retrieval_primary`, `dense_enabled`, `dense_fallback_enabled`.
 - `crates/cli/src/main.rs` — `--retrieval-primary`, `--enable-dense`, `--disable-dense`, `--dense-fallback`, `--no-dense-fallback` flags on `prepare`/`index`/`update`/`search`/`op`/`prewarm`/`rebuild-semantic`.
+- Progress events — emit a clear dense-skipped/embedding-skipped state so a no-dense index run does not look stalled or broken.
 
 ### Deliverable
 
 ```bash
-matryoshka-rs search "..." --disable-dense --no-late-interaction
+matryoshka-rs index /repo --disable-dense --progress-jsonl
+matryoshka-rs search "..." --disable-dense --no-dense-fallback
 ```
-works without embedding the query.
+works without embedding records during indexing and without embedding the query during search.
 
 ---
 
@@ -435,7 +564,7 @@ support leg.
 
 ### Planned changes
 
-- New crate `crates/splade` (or `crates/sparse-search`) — `SparseEmbedder` trait, `SparseVector`, `SparseTerm`, HTTP client for the omlx SPLADE endpoint (`naver--splade-code-06B`).
+- New crate `crates/splade` (or `crates/sparse-search`) — `SparseEmbedder` trait, `SparseVector`, `SparseTerm`, HTTP client for the omlx SPLADE endpoint (`/Users/rohit/.omlx/models/naver--splade-code-06B`).
 - `crates/store-sqlite/src/sqlite_store.rs` — `splade_postings` table (`term`, `record_id`, `weight`) + indexes; upsert/load/delete helpers.
 - `crates/indexer/src/indexer.rs` — SPLADE-encode chunk/card records and store postings when `splade_enabled`.
 - `crates/search/src/semantic_search.rs` — `collect_splade_candidates`; `CandidateEvidence.splade_score`; SPLADE-primary scoring.
@@ -472,10 +601,10 @@ Quantitatively compare retrieval modes so we can decide whether to keep dense at
 
 | Mode | Config |
 |---|---|
-| A | exact + FTS (current-ish, no dense) |
-| B | exact + SPLADE |
-| C | exact + SPLADE + dense-256 fallback |
-| D | exact + SPLADE + dense-1024 (current dense) |
+| A | exact + FTS only (`--disable-dense`, no SPLADE yet) |
+| B | exact + SPLADE (`--retrieval-primary splade --disable-dense`) |
+| C | exact + SPLADE + dense fallback (`--dense-fallback`) |
+| D | exact + SPLADE + current dense embeddings (`mlx-community--embeddinggemma-300m-bf16`) |
 
 ### Decision gate
 
