@@ -2,7 +2,7 @@ use anyhow::{Result, anyhow};
 use matryoshka_core_ir::{
     ArtifactQualityReport, FileCard, FileEnrichmentContext, FileFact, FolderCard,
     FolderEnrichmentContext, FolderFact, MatryoshkaProgressEvent, ReadCard, RepoCard,
-    RetrievalIndexReport, SearchHit, SymbolFact,
+    RetrievalConfig, RetrievalIndexReport, RetrievalPrimary, SearchHit, SymbolFact,
 };
 use matryoshka_embed_client::Embedder;
 use matryoshka_embed_client::{DeterministicEmbedder, EndpointEmbedder};
@@ -13,7 +13,8 @@ use matryoshka_indexer::{FullIndexer, SemanticRebuildSummary, UpdateSummary};
 use matryoshka_parser::ParserConfig;
 use matryoshka_read_api::{ReadApi, ReadBundle, ReadPackMode};
 use matryoshka_search::{
-    EndpointReranker, OmlxReranker, SearchEngine, SearchPrewarmSummary, default_prewarm_queries,
+    EndpointReranker, OmlxReranker, SearchEngine, SearchPrewarmSummary, SearchResultGranularity,
+    default_prewarm_queries,
 };
 use matryoshka_store_sqlite::{
     CardSummaryRow, MatryoshkaStore, OrphanPruneReport, RetrievalIndexStats,
@@ -84,6 +85,9 @@ pub struct MatryoshkaConfig {
     pub chat_model: String,
     pub ignore: Vec<String>,
     pub late_interaction: bool,
+    pub retrieval_primary: RetrievalPrimary,
+    pub dense_enabled: bool,
+    pub dense_fallback_enabled: bool,
     pub chunk_summary_enabled: bool,
     pub chunk_summary_model: String,
     pub chunk_summary_concurrency: usize,
@@ -103,6 +107,9 @@ impl MatryoshkaConfig {
             chat_model: DEFAULT_CHAT_MODEL.into(),
             ignore: Vec::new(),
             late_interaction: true,
+            retrieval_primary: RetrievalPrimary::Hybrid,
+            dense_enabled: true,
+            dense_fallback_enabled: true,
             chunk_summary_enabled: true,
             chunk_summary_model: DEFAULT_CHUNK_SUMMARY_MODEL.into(),
             chunk_summary_concurrency: DEFAULT_CHUNK_SUMMARY_CONCURRENCY,
@@ -152,6 +159,42 @@ impl MatryoshkaConfig {
         self
     }
 
+    pub fn with_retrieval_primary(mut self, primary: RetrievalPrimary) -> Self {
+        self.retrieval_primary = primary;
+        self
+    }
+
+    pub fn with_dense_enabled(mut self, enabled: bool) -> Self {
+        self.dense_enabled = enabled;
+        if !enabled {
+            self.dense_fallback_enabled = false;
+        }
+        self
+    }
+
+    pub fn with_dense_fallback_enabled(mut self, enabled: bool) -> Self {
+        self.dense_fallback_enabled = enabled;
+        if enabled {
+            self.dense_enabled = true;
+        }
+        self
+    }
+
+    pub fn with_retrieval_config(mut self, config: RetrievalConfig) -> Self {
+        self.retrieval_primary = config.primary;
+        self.dense_enabled = config.dense_enabled;
+        self.dense_fallback_enabled = config.dense_fallback_enabled;
+        self
+    }
+
+    pub fn retrieval_config(&self) -> RetrievalConfig {
+        RetrievalConfig {
+            primary: self.retrieval_primary,
+            dense_enabled: self.dense_enabled,
+            dense_fallback_enabled: self.dense_fallback_enabled,
+        }
+    }
+
     pub fn with_chunk_summary_enabled(mut self, enabled: bool) -> Self {
         self.chunk_summary_enabled = enabled;
         self
@@ -189,6 +232,15 @@ impl Default for PrepareOptions {
 pub struct SearchOptions {
     pub limit: usize,
     pub reranker: RerankerOptions,
+    #[serde(default)]
+    pub result_granularity: SearchResultGranularity,
+}
+
+impl SearchOptions {
+    pub fn with_result_granularity(mut self, granularity: SearchResultGranularity) -> Self {
+        self.result_granularity = granularity;
+        self
+    }
 }
 
 impl Default for SearchOptions {
@@ -196,6 +248,7 @@ impl Default for SearchOptions {
         Self {
             limit: 8,
             reranker: RerankerOptions::None,
+            result_granularity: SearchResultGranularity::File,
         }
     }
 }
@@ -512,13 +565,11 @@ impl Matryoshka {
                 .iter()
                 .filter(|row| row.is_empty)
                 .count();
-            let existing_search_missing = retrieval_needs_rebuild(
-                &retrieval_report_from_stats(
-                    store.retrieval_index_stats()?,
-                    self.config.late_interaction,
-                ),
+            let existing_search_missing = retrieval_needs_rebuild(&retrieval_report_from_stats(
+                store.retrieval_index_stats()?,
+                self.config.retrieval_config(),
                 self.config.late_interaction,
-            );
+            ));
             let ready_marker_exists = ready_marker.exists();
             let mut actions_taken = Vec::new();
 
@@ -657,7 +708,7 @@ impl Matryoshka {
 
             let mut artifact_quality = update.artifact_quality.clone();
             let mut retrieval_index = update.retrieval_index.clone();
-            if retrieval_needs_rebuild(&retrieval_index, self.config.late_interaction) {
+            if retrieval_needs_rebuild(&retrieval_index) {
                 if cancel_token.is_cancelled() {
                     return cancel_prepare(
                         &mut on_event,
@@ -763,10 +814,11 @@ impl Matryoshka {
             log_prune_report(&mut log, "prepare_final_prune", &final_prune)?;
             retrieval_index = retrieval_report_from_stats(
                 MatryoshkaStore::open(&self.config.db)?.retrieval_index_stats()?,
+                self.config.retrieval_config(),
                 self.config.late_interaction,
             );
-            let ready = artifact_gap_count(&artifact_quality) == 0
-                && retrieval_is_ready(&retrieval_index, self.config.late_interaction);
+            let ready =
+                artifact_gap_count(&artifact_quality) == 0 && retrieval_is_ready(&retrieval_index);
             let status = if ready {
                 PrepareStatus::Ready
             } else {
@@ -821,9 +873,12 @@ impl Matryoshka {
         ensure_matryoshka_layout(&self.config.db)?;
         ensure_reranker_options(&options.reranker)?;
         let store = MatryoshkaStore::open(&self.config.db)?;
+        let result_granularity = options.result_granularity;
         if self.config.offline {
             let engine = SearchEngine::new(store, DeterministicEmbedder::default())
-                .with_late_interaction(self.config.late_interaction);
+                .with_dense(self.config.dense_enabled)
+                .with_late_interaction(self.config.late_interaction)
+                .with_result_granularity(result_granularity);
             search_with_reranker(engine, &self.config, query, options.limit, options.reranker)
         } else {
             let engine = SearchEngine::new(
@@ -834,7 +889,9 @@ impl Matryoshka {
                     self.config.embedding_model.clone(),
                 ),
             )
-            .with_late_interaction(self.config.late_interaction);
+            .with_dense(self.config.dense_enabled)
+            .with_late_interaction(self.config.late_interaction)
+            .with_result_granularity(result_granularity);
             search_with_reranker(engine, &self.config, query, options.limit, options.reranker)
         }
     }
@@ -855,6 +912,7 @@ impl Matryoshka {
             SearchOptions {
                 limit: options.limit,
                 reranker: options.search.reranker.clone(),
+                result_granularity: SearchResultGranularity::File,
             },
         )?;
         let file_ids = hits
@@ -921,6 +979,7 @@ impl Matryoshka {
                 HeuristicChunkSummarizer,
             )
             .with_parser_config(parser_config)
+            .with_retrieval_config(self.config.retrieval_config())
             .update_repo_with_progress(&self.config.repo_root, &mut progress)?
         } else {
             let enricher = MlxChatEnricher::new(&self.config.base_url, &self.config.api_key)
@@ -941,6 +1000,7 @@ impl Matryoshka {
                 chunk_summarizer,
             )
             .with_parser_config(parser_config)
+            .with_retrieval_config(self.config.retrieval_config())
             .with_chunk_summary_enabled(self.config.chunk_summary_enabled)
             .update_repo_with_progress(&self.config.repo_root, &mut progress)?
         };
@@ -977,6 +1037,7 @@ impl Matryoshka {
                 CancellableEmbedder::new(DeterministicEmbedder::default(), cancel_token.clone()),
                 HeuristicChunkSummarizer,
             )
+            .with_retrieval_config(self.config.retrieval_config())
             .rebuild_semantic_index_with_progress(&self.config.repo_root, &mut progress)?
         } else {
             FullIndexer::new(
@@ -992,6 +1053,7 @@ impl Matryoshka {
                 ),
                 HeuristicChunkSummarizer,
             )
+            .with_retrieval_config(self.config.retrieval_config())
             .rebuild_semantic_index_with_progress(&self.config.repo_root, &mut progress)?
         };
         cancel_token.check()?;
@@ -1031,6 +1093,7 @@ impl Matryoshka {
                 store,
                 CancellableEmbedder::new(DeterministicEmbedder::default(), cancel_token.clone()),
             )
+            .with_dense(self.config.dense_enabled)
             .with_late_interaction(self.config.late_interaction)
             .prewarm(queries, limit)?
         } else {
@@ -1045,6 +1108,7 @@ impl Matryoshka {
                     cancel_token.clone(),
                 ),
             )
+            .with_dense(self.config.dense_enabled)
             .with_late_interaction(self.config.late_interaction)
             .prewarm(queries, limit)?
         };
@@ -1462,6 +1526,16 @@ fn indexer_progress_state(operation: &str, event: &MatryoshkaProgressEvent) -> P
             Some(*batch_index),
             Some(*total_batches),
         ),
+        MatryoshkaProgressEvent::EmbeddingSkipped { record_count, .. } => progress_state(
+            operation,
+            "running",
+            "embedding_skipped",
+            "Dense embeddings disabled; using exact/FTS search data",
+            0.84,
+            None,
+            Some(*record_count),
+            Some(*record_count),
+        ),
         MatryoshkaProgressEvent::WritingDatabase { .. } => progress_state(
             operation,
             "running",
@@ -1791,19 +1865,22 @@ pub fn artifact_gap_count(report: &ArtifactQualityReport) -> usize {
         + usize::from(!report.repo_card_has_summary)
 }
 
-pub fn retrieval_is_ready(report: &RetrievalIndexReport, late_interaction: bool) -> bool {
+pub fn retrieval_is_ready(report: &RetrievalIndexReport) -> bool {
     report.semantic_records > 0
-        && report.embedded_records > 0
         && report.fts_records > 0
-        && (!late_interaction || report.records_with_late_vectors > 0)
+        && (!report.dense_enabled || report.embedded_records > 0)
+        && (!report.dense_enabled
+            || !report.late_interaction_enabled
+            || report.records_with_late_vectors > 0)
 }
 
-fn retrieval_needs_rebuild(report: &RetrievalIndexReport, late_interaction: bool) -> bool {
-    !retrieval_is_ready(report, late_interaction)
+fn retrieval_needs_rebuild(report: &RetrievalIndexReport) -> bool {
+    !retrieval_is_ready(report)
 }
 
 fn retrieval_report_from_stats(
     stats: RetrievalIndexStats,
+    retrieval_config: RetrievalConfig,
     late_interaction: bool,
 ) -> RetrievalIndexReport {
     RetrievalIndexReport {
@@ -1812,7 +1889,10 @@ fn retrieval_report_from_stats(
         fts_records: stats.fts_records,
         late_vector_rows: stats.late_vector_rows,
         records_with_late_vectors: stats.records_with_late_vectors,
-        late_interaction_enabled: late_interaction,
+        retrieval_primary: retrieval_config.primary,
+        dense_enabled: retrieval_config.dense_enabled,
+        dense_fallback_enabled: retrieval_config.dense_fallback_enabled,
+        late_interaction_enabled: retrieval_config.dense_enabled && late_interaction,
     }
 }
 
@@ -1864,10 +1944,7 @@ pub fn prepare_summary_json(summary: &PrepareSummary) -> serde_json::Value {
             },
         },
         "search": {
-            "status": if retrieval_is_ready(
-                &summary.retrieval_index,
-                summary.retrieval_index.late_interaction_enabled,
-            ) {
+            "status": if retrieval_is_ready(&summary.retrieval_index) {
                 "ready"
             } else {
                 "needs_refresh"
@@ -1877,6 +1954,9 @@ pub fn prepare_summary_json(summary: &PrepareSummary) -> serde_json::Value {
             "fts_records": summary.retrieval_index.fts_records,
             "late_vector_rows": summary.retrieval_index.late_vector_rows,
             "records_with_late_vectors": summary.retrieval_index.records_with_late_vectors,
+            "retrieval_primary": summary.retrieval_index.retrieval_primary,
+            "dense_enabled": summary.retrieval_index.dense_enabled,
+            "dense_fallback_enabled": summary.retrieval_index.dense_fallback_enabled,
             "late_interaction_enabled": summary.retrieval_index.late_interaction_enabled,
         },
         "changes": {
