@@ -1,47 +1,15 @@
 # Matryoshka Usage
 
-This file is the practical command guide for the current retrieval pipeline through **M3.1**.
+This is the practical command guide for the current `cradle-embed` retrieval/indexing flow.
 
-It focuses on:
+It covers:
 
-- indexing with oMLX
-- dense on/off behavior
-- function/class/method chunk search
-- symbol search
-- no-collapse raw record search
-- compact output
-- validation commands and representative outputs
-
----
-
-## Current Retrieval Flow
-
-```text
-repo files
-  -> parser extracts files, symbols, and code chunks
-  -> docstrings/doc-comments become chunk summaries when present
-  -> undocumented chunks are summarized by oMLX/Raptor
-  -> semantic_records are built from files, folders, repo, symbols, snippets, and code chunks
-  -> SQLite FTS is built
-  -> dense vectors are written only when dense is enabled
-  -> search can return file, record, symbol, or chunk-level results
-```
-
-Important distinction:
-
-```text
-Index flag controls what is stored.
-Search flag controls what is used.
-```
-
-For example:
-
-| Indexed with | Searched with | Behavior |
-|---|---|---|
-| `--enable-dense` | `--enable-dense` | exact + FTS + dense + late interaction |
-| `--enable-dense` | `--disable-dense` | exact + FTS only; existing dense vectors ignored |
-| `--disable-dense` | `--disable-dense` | exact + FTS only |
-| `--disable-dense` | `--enable-dense` | exact + FTS; dense has no stored vectors to score against |
+- first-time setup / indexing
+- normal update flow after edits, additions, or deletes
+- when to use `prepare`, `update`, `index`, and `rebuild-semantic`
+- live progress through `--progress-jsonl` and `.matryoshka/state/progress.json`
+- search modes and expected result shapes
+- read commands, including `read --chunks` and `read-bundle`
 
 ---
 
@@ -53,28 +21,21 @@ db:        /Users/rohit/cradle-embed/.matryoshka/matryoshka.db
 binary:    /Users/rohit/cradle-embed/target/debug/matryoshka-rs
 oMLX URL:  http://127.0.0.1:44449
 api key:   2508
-embedder:  mlx-community--embeddinggemma-300m-bf16
-chunk LLM: srswti--bodega-raptor-90m
 chat LLM:  MercuriusDream--Qwen3.5-4B-MLX-mxfp8
+chunk LLM: srswti--bodega-raptor-90m
+embedder:  mlx-community--embeddinggemma-300m-bf16
 ```
 
-If you have not installed the CLI globally, always use:
+Build the local CLI after code changes:
 
 ```bash
-/Users/rohit/cradle-embed/target/debug/matryoshka-rs
-```
-
-or after release build:
-
-```bash
-/Users/rohit/cradle-embed/target/release/matryoshka-rs
+cd /Users/rohit/cradle-embed
+cargo build --workspace
 ```
 
 ---
 
 ## Start oMLX
-
-Command:
 
 ```bash
 cd /Users/rohit/cradle-mlx/helpers/omlx
@@ -87,797 +48,44 @@ jesco-apple serve \
   --max-concurrent-requests 6
 ```
 
-Description:
+oMLX is used for:
 
-Starts the local oMLX server used for:
+- file/folder/repo summaries through the chat model (`--model`)
+- function/class/method chunk summaries through `--chunk-summary-model`
+- dense embeddings through `--embedding-model`
 
-- chunk summaries through `srswti--bodega-raptor-90m`
-- dense embeddings through `mlx-community--embeddinggemma-300m-bf16`
-- later SPLADE work through `/Users/rohit/.omlx/models/naver--splade-code-06B`
-
-Expected server output:
+Important model distinction:
 
 ```text
-oMLX - LLM inference, optimized for your Mac
-Binding server at http://127.0.0.1:44449
-INFO:     Uvicorn running on http://127.0.0.1:44449
+--model                 file/folder/repo summaries/cards
+--chunk-summary-model   function/class/method chunk summaries
+--embedding-model       dense retrieval vectors
 ```
+
+So seeing oMLX load the 4B chat model is expected if `prepare` or `index` needs file/folder/repo summaries, even when chunk summaries use the 90M model.
 
 ---
 
-## Build the Local CLI
+## Recommended High-Level Flow
 
-Command:
-
-```bash
-cd /Users/rohit/cradle-embed
-cargo build -p matryoshka-cli
-```
-
-Description:
-
-Builds the current local CLI binary. Use this before testing new flags if you have
-not installed the crate globally.
-
-Expected output:
+Use `prepare` as the default command for IDE/API integration and normal use.
 
 ```text
-Finished `dev` profile [unoptimized + debuginfo] target(s) in ...
+prepare
+  -> decides whether to index, update, repair missing summaries, rebuild search, and prewarm
 ```
+
+Use `update` when you explicitly want an incremental refresh and do not need the extra `prepare` readiness decisions/prewarm.
+
+Use `index` only when you intentionally want a full parser/indexer pass outside the `prepare` readiness flow.
+
+Use `rebuild-semantic` when stored artifacts/cards/chunks already exist but search records/FTS/dense embeddings need to be rebuilt.
 
 ---
 
-## Check Search CLI Flags
+## First-Time Setup / First-Time Indexing
 
-Command:
-
-```bash
-/Users/rohit/cradle-embed/target/debug/matryoshka-rs search --help
-```
-
-Description:
-
-Verifies the current search flags.
-
-Relevant output:
-
-```text
---retrieval-primary <RETRIEVAL_PRIMARY>
-    [default: hybrid] [possible values: fts, splade, dense, hybrid]
-
---enable-dense
---disable-dense
-    [aliases: --no-dense-embeddings]
---dense-fallback
---no-dense-fallback
-
---result-granularity <RESULT_GRANULARITY>
-    [default: file] [possible values: file, record, symbol, chunk]
-
---no-collapse
-
---compact
-    [aliases: --hide-match-details, --no-match-details]
-```
-
----
-
-## Result Granularity Modes
-
-Search can now expose the level of result you want.
-
-| Mode | Command flag | What you get |
-|---|---|---|
-| File collapsed | `--result-granularity file` | Default. Groups file/symbol/snippet/chunk matches into one file result. |
-| Raw record | `--result-granularity record` | No collapse. Returns raw matching semantic records. |
-| Raw record shortcut | `--no-collapse` | Same as `--result-granularity record`. |
-| Symbol only | `--result-granularity symbol` | Only symbols/functions/classes/method definitions. |
-| Chunk only | `--result-granularity chunk` | Function/class/method code chunks with chunk summaries. |
-
----
-
-## Compact Output
-
-Use:
-
-```bash
---compact
-```
-
-Aliases:
-
-```bash
---hide-match-details
---no-match-details
-```
-
-Compact output removes:
-
-```text
-matched_terms
-total_matched_symbols
-why_matched
-```
-
-Compact output keeps:
-
-```text
-matched_symbols
-```
-
-Use compact output when you want cleaner responses for agents or UI display.
-
----
-
-## Check Whether the Current DB Has Dense Embeddings
-
-Command:
-
-```bash
-cd /Users/rohit/cradle-embed
-
-sqlite3 .matryoshka/matryoshka.db "SELECT 'semantic_records', COUNT(*) FROM semantic_records UNION ALL SELECT 'embedded_records', SUM(CASE WHEN json_extract(payload_json, '$.embedding') IS NOT NULL THEN 1 ELSE 0 END) FROM semantic_records UNION ALL SELECT 'late_vector_rows', COUNT(*) FROM semantic_late_vectors UNION ALL SELECT 'records_with_late_vectors', COUNT(DISTINCT record_id) FROM semantic_late_vectors UNION ALL SELECT 'fts_records', COUNT(*) FROM semantic_records_fts;"
-```
-
-Description:
-
-Checks whether the DB contains FTS rows, dense embeddings, and late-interaction vectors.
-
-Observed output:
-
-```text
-semantic_records|1334
-embedded_records|1305
-late_vector_rows|34487
-records_with_late_vectors|1305
-fts_records|1334
-```
-
-Interpretation:
-
-```text
-FTS exists ✅
-Dense embeddings exist ✅
-Late-interaction vectors exist ✅
-```
-
----
-
-## Count Semantic Record Types
-
-Command:
-
-```bash
-cd /Users/rohit/cradle-embed
-
-sqlite3 .matryoshka/matryoshka.db "SELECT entity_type, COUNT(*) FROM semantic_records GROUP BY entity_type ORDER BY entity_type;"
-```
-
-Description:
-
-Shows which kinds of records are available for retrieval.
-
-Observed output:
-
-```text
-CodeChunk|371
-File|58
-Folder|27
-Repo|1
-Snippet|113
-Symbol|764
-```
-
-Interpretation:
-
-```text
-Function/class/method code chunks are indexed ✅
-Symbols are indexed ✅
-File/folder/repo cards are indexed ✅
-```
-
----
-
-## Fresh Index With Dense Enabled
-
-Command:
-
-```bash
-/Users/rohit/cradle-embed/target/debug/matryoshka-rs index \
-  /Users/rohit/cradle-embed \
-  --db /Users/rohit/cradle-embed/.matryoshka/matryoshka.db \
-  --base-url http://127.0.0.1:44449 \
-  --api-key 2508 \
-  --model MercuriusDream--Qwen3.5-4B-MLX-mxfp8 \
-  --embedding-model mlx-community--embeddinggemma-300m-bf16 \
-  --chunk-summary-model srswti--bodega-raptor-90m \
-  --chunk-summary-concurrency 6 \
-  --enable-dense \
-  --ignore target \
-  --ignore .git \
-  --ignore .matryoshka \
-  --progress-jsonl
-```
-
-Description:
-
-Indexes a repo with:
-
-- parser extraction
-- docstring/doc-comment chunk summaries
-- oMLX fallback summaries for undocumented chunks
-- semantic records
-- FTS
-- dense embeddings
-- late-interaction vectors
-
-Expected progress shape:
-
-```jsonl
-{"type":"started","total_steps":null}
-{"type":"discovering_files"}
-{"type":"files_discovered","total_files":...}
-{"type":"parsing_file","path":"...","index":...,"total_files":...}
-{"type":"parsed_file","path":"...","index":...,"total_files":...}
-{"type":"enriching_chunk_batch","batch_index":...,"total_batches":...,"chunks_in_batch":...}
-{"type":"enriched_chunk_batch","batch_index":...,"total_batches":...,"chunks_in_batch":...}
-{"type":"embedding_batch","batch_index":...,"total_batches":...,"records_in_batch":...}
-{"type":"embedded_batch","batch_index":...,"total_batches":...,"records_in_batch":...}
-{"type":"retrieval_index_health","report":{"semantic_records":...,"embedded_records":...,"fts_records":...,"late_vector_rows":...,"records_with_late_vectors":...,"dense_enabled":true,"late_interaction_enabled":true}}
-{"type":"completed","file_count":...,"folder_count":...,"symbol_count":...,"semantic_record_count":...,"embedding_model":"mlx-community--embeddinggemma-300m-bf16"}
-```
-
-Notes:
-
-- `records_in_batch` means semantic records being embedded.
-- Records can be file cards, folder cards, repo cards, symbols, snippets, and code chunks.
-
----
-
-## Fresh Index With Dense Disabled
-
-Command:
-
-```bash
-/Users/rohit/cradle-embed/target/debug/matryoshka-rs index \
-  /Users/rohit/cradle-embed \
-  --db /tmp/cradle_embed_dense_off.db \
-  --base-url http://127.0.0.1:44449 \
-  --api-key 2508 \
-  --model MercuriusDream--Qwen3.5-4B-MLX-mxfp8 \
-  --embedding-model mlx-community--embeddinggemma-300m-bf16 \
-  --chunk-summary-model srswti--bodega-raptor-90m \
-  --chunk-summary-concurrency 6 \
-  --disable-dense \
-  --ignore target \
-  --ignore .git \
-  --ignore .matryoshka \
-  --progress-jsonl
-```
-
-Description:
-
-Indexes a repo while skipping dense embeddings. This still writes:
-
-```text
-semantic_records
-semantic_records_fts
-code_chunks
-file/folder/repo cards
-symbols/snippets
-```
-
-It does not write:
-
-```text
-dense record embeddings
-semantic_late_vectors
-```
-
-Observed M3 validation output for a dense-disabled `cradle-embed` temp DB:
-
-```text
-files_discovered: 35
-symbol_count: 856
-code_chunks: 856
-chunk summaries requested: 842
-chunk summary batches: 27
-semantic_records: 1956
-fts_records: 1956
-embedded_records: 0
-late_vectors: 0
-retrieval_primary: hybrid
-dense_enabled: false
-late_interaction_enabled: false
-```
-
-DB summary after index + no-change update:
-
-```text
-code_chunks: 856
-chunk_sources:
-  doc_comment: 14
-  llm:         842
-  empty:       0
-semantic_records: 1956
-fts_records: 1956
-embedded_records: 0
-late_vectors: 0
-```
-
----
-
-## Update Existing Repo
-
-Command:
-
-```bash
-/Users/rohit/cradle-embed/target/debug/matryoshka-rs update \
-  /Users/rohit/cradle-embed \
-  --db /Users/rohit/cradle-embed/.matryoshka/matryoshka.db \
-  --base-url http://127.0.0.1:44449 \
-  --api-key 2508 \
-  --embedding-model mlx-community--embeddinggemma-300m-bf16 \
-  --chunk-summary-model srswti--bodega-raptor-90m \
-  --chunk-summary-concurrency 6 \
-  --enable-dense \
-  --ignore target \
-  --ignore .git \
-  --ignore .matryoshka \
-  --progress-jsonl
-```
-
-Description:
-
-Refreshes only changed/deleted/added files. It preserves generated summaries for
-unchanged chunks and only calls the LLM for changed undocumented chunks.
-
-Expected progress shape:
-
-```jsonl
-{"type":"started","total_steps":null}
-{"type":"discovering_files"}
-{"type":"files_discovered","total_files":...}
-{"type":"parsing_file","path":"...","index":...,"total_files":...}
-{"type":"parsed_file","path":"...","index":...,"total_files":...}
-{"type":"enriching_chunk_batch","batch_index":...,"total_batches":...,"chunks_in_batch":...}
-{"type":"enriched_chunk_batch","batch_index":...,"total_batches":...,"chunks_in_batch":...}
-{"type":"writing_database","records_written":...}
-{"type":"embedding_batch","batch_index":...,"total_batches":...,"records_in_batch":...}
-{"type":"embedded_batch","batch_index":...,"total_batches":...,"records_in_batch":...}
-{"type":"retrieval_index_health","report":{...}}
-{"type":"completed","file_count":...,"folder_count":...,"symbol_count":...,"semantic_record_count":...,"embedding_model":"mlx-community--embeddinggemma-300m-bf16"}
-```
-
-Use this before searching for newly-added symbols such as:
-
-```text
-resolve_search_result_granularity
-```
-
----
-
-## Search: Default File-Collapsed Dense Search
-
-Command:
-
-```bash
-/Users/rohit/cradle-embed/target/debug/matryoshka-rs search \
-  "where is dense embedding disabled during indexing" \
-  --db /Users/rohit/cradle-embed/.matryoshka/matryoshka.db \
-  --base-url http://127.0.0.1:44449 \
-  --api-key 2508 \
-  --embedding-model mlx-community--embeddinggemma-300m-bf16 \
-  --enable-dense \
-  --limit 8
-```
-
-Description:
-
-Runs normal dense-enabled search. This is default file-collapsed output.
-
-Uses:
-
-```text
-exact candidates
-SQLite FTS
-dense vector similarity
-late-interaction MaxSim
-query-plan boosts
-```
-
-Representative top output:
-
-```json
-[
-  {
-    "entity_id": "crates/indexer/src/indexer.rs",
-    "record_id": "semantic:file_card:crates/indexer/src/indexer.rs",
-    "path": "crates/indexer/src/indexer.rs",
-    "title": "File crates/indexer/src/indexer.rs",
-    "entity_type": "file",
-    "matched_terms": [
-      "dense",
-      "disabled",
-      "embedding",
-      "indexing"
-    ],
-    "matched_symbols": [
-      "ArtifactRepairSet",
-      "ArtifactRepairSet::is_empty",
-      "EmbeddingProgress",
-      "EmbeddingProgress::new",
-      "FullIndexer",
-      "FullIndexer::collect_file_cards_with_progress",
-      "FullIndexer::index_repo",
-      "FullIndexer::index_repo_with_progress",
-      "FullIndexer::new",
-      "FullIndexer::rebuild_semantic_index",
-      "FullIndexer::rebuild_semantic_index_with_progress",
-      "FullIndexer::refresh_artifacts"
-    ],
-    "total_matched_symbols": 62,
-    "score": 1.5974306,
-    "why_matched": [
-      "Exact token, symbol, or path candidate matched the query",
-      "Late-interaction MaxSim matched indexed code-token vectors",
-      "SQLite FTS matched exact query terms in path, title, content, or metadata",
-      "Summary/content is semantically close to the query"
-    ]
-  }
-]
-```
-
-Interpretation:
-
-```text
-Top file is correct: indexing dense gating lives in crates/indexer/src/indexer.rs ✅
-Late-interaction evidence is present, so dense search path is active ✅
-```
-
----
-
-## Search: Function/Class/Method Chunk Results
-
-Command:
-
-```bash
-/Users/rohit/cradle-embed/target/debug/matryoshka-rs search \
-  "how does update preserve unchanged generated chunk summaries" \
-  --db /Users/rohit/cradle-embed/.matryoshka/matryoshka.db \
-  --base-url http://127.0.0.1:44449 \
-  --api-key 2508 \
-  --embedding-model mlx-community--embeddinggemma-300m-bf16 \
-  --enable-dense \
-  --result-granularity chunk \
-  --compact \
-  --limit 3
-```
-
-Description:
-
-Returns only `code_chunk` records. This exposes function/class/method-level answers.
-
-`--compact` hides noisy fields while keeping `matched_symbols`.
-
-Observed output:
-
-```json
-[
-  {
-    "description": "Symbol: FullIndexer::refresh_chunk_summaries\nKind: method\nSignature: fn refresh_chunk_summaries(\nLines: 1859-1965\nSummary source: doccomment",
-    "entity_id": "crates/indexer/src/indexer.rs::FullIndexer::refresh_chunk_summaries:1859",
-    "entity_type": "code_chunk",
-    "matched_symbols": [
-      "FullIndexer::refresh_chunk_summaries"
-    ],
-    "path": "crates/indexer/src/indexer.rs",
-    "record_id": "semantic:code_chunk:crates/indexer/src/indexer.rs::FullIndexer::refresh_chunk_summaries:1859",
-    "score": 1.6419492959976196,
-    "summary": "Summarize code chunks that have no useful docstring/doc comment, persist the updated chunks to the store, and build `code_chunk` semantic records in the target template for retrieval.  Only chunks with `summary_source == Empty` (or generic/short docs) are sent to the LLM. Chunks with useful docs are used directly. Chunks in files whose `source_hash` is unchanged are skipped entirely.",
-    "title": "CodeChunk FullIndexer::refresh_chunk_summaries in crates/indexer/src/indexer.rs"
-  },
-  {
-    "description": "Symbol: main\nKind: function\nSignature: fn main() -> Result<()>\nLines: 535-1362\nSummary source: llm",
-    "entity_id": "crates/cli/src/main.rs::main:535",
-    "entity_type": "code_chunk",
-    "matched_symbols": [
-      "main"
-    ],
-    "path": "crates/cli/src/main.rs",
-    "record_id": "semantic:code_chunk:crates/cli/src/main.rs::main:535",
-    "score": 1.3671839237213135,
-    "summary": "The code handles command-line arguments for a crate's main function, which processes different commands like preparing, indexing, and updating data. It initializes configuration parameters, resolves database paths, ensures layout, and performs operations based on the command's type, returning results or logging details accordingly.",
-    "title": "CodeChunk main in crates/cli/src/main.rs"
-  },
-  {
-    "description": "Symbol: FullIndexer::refresh_artifacts\nKind: method\nSignature: fn refresh_artifacts(\nLines: 1375-1616\nSummary source: llm",
-    "entity_id": "crates/indexer/src/indexer.rs::FullIndexer::refresh_artifacts:1375",
-    "entity_type": "code_chunk",
-    "matched_symbols": [
-      "FullIndexer::refresh_artifacts"
-    ],
-    "path": "crates/indexer/src/indexer.rs",
-    "record_id": "semantic:code_chunk:crates/indexer/src/indexer.rs::FullIndexer::refresh_artifacts:1375",
-    "score": 1.3214116096496582,
-    "summary": "The method refresh_artifacts updates file and folder cards in the store, prunes orphaned artifacts, and enriches files with progress tracking. It also handles repository cards, updating them if necessary, and manages deleted files. The code includes milestones for summarizing and embedding data.",
-    "title": "CodeChunk FullIndexer::refresh_artifacts in crates/indexer/src/indexer.rs"
-  }
-]
-```
-
-Interpretation:
-
-```text
-The top result is now a function/method-level chunk ✅
-The summary shown is the chunk summary, not the file-card summary ✅
-matched_terms, total_matched_symbols, and why_matched are hidden ✅
-matched_symbols is preserved ✅
-```
-
----
-
-## Search: Raw Record / No Collapse
-
-Command:
-
-```bash
-/Users/rohit/cradle-embed/target/debug/matryoshka-rs search \
-  "where is resolve_retrieval_config defined" \
-  --db /Users/rohit/cradle-embed/.matryoshka/matryoshka.db \
-  --base-url http://127.0.0.1:44449 \
-  --api-key 2508 \
-  --embedding-model mlx-community--embeddinggemma-300m-bf16 \
-  --enable-dense \
-  --no-collapse \
-  --compact \
-  --limit 4
-```
-
-Description:
-
-Returns raw matching records instead of collapsing them into one file result.
-
-`--no-collapse` is equivalent to:
-
-```bash
---result-granularity record
-```
-
-Observed output:
-
-```json
-[
-  {
-    "description": "Symbol: resolve_retrieval_config\nKind: Function\nFile: crates/cli/src/main.rs",
-    "entity_id": "crates/cli/src/main.rs::resolve_retrieval_config:498",
-    "entity_type": "symbol",
-    "matched_symbols": [
-      "resolve_retrieval_config"
-    ],
-    "path": "crates/cli/src/main.rs",
-    "record_id": "semantic:symbol:crates/cli/src/main.rs::resolve_retrieval_config:498",
-    "score": 2.02943754196167,
-    "summary": "fn resolve_retrieval_config(",
-    "title": "Symbol resolve_retrieval_config in crates/cli/src/main.rs"
-  },
-  {
-    "description": "Symbol: RetrievalConfig\nKind: Struct\nFile: crates/core-ir/src/models.rs",
-    "entity_id": "crates/core-ir/src/models.rs::RetrievalConfig:516",
-    "entity_type": "symbol",
-    "matched_symbols": [
-      "RetrievalConfig"
-    ],
-    "path": "crates/core-ir/src/models.rs",
-    "record_id": "semantic:symbol:crates/core-ir/src/models.rs::RetrievalConfig:516",
-    "score": 1.0542629957199097,
-    "summary": "pub struct RetrievalConfig",
-    "title": "Symbol RetrievalConfig in crates/core-ir/src/models.rs"
-  },
-  {
-    "description": "Symbol: MatryoshkaConfig::retrieval_config\nKind: Method\nFile: crates/api/src/lib.rs",
-    "entity_id": "crates/api/src/lib.rs::MatryoshkaConfig::retrieval_config:189",
-    "entity_type": "symbol",
-    "matched_symbols": [
-      "retrieval_config"
-    ],
-    "path": "crates/api/src/lib.rs",
-    "record_id": "semantic:symbol:crates/api/src/lib.rs::MatryoshkaConfig::retrieval_config:189",
-    "score": 1.0455865859985352,
-    "summary": "pub fn retrieval_config(&self) -> RetrievalConfig",
-    "title": "Symbol MatryoshkaConfig::retrieval_config in crates/api/src/lib.rs"
-  },
-  {
-    "description": "Symbol: MatryoshkaConfig::with_retrieval_config\nKind: Method\nFile: crates/api/src/lib.rs",
-    "entity_id": "crates/api/src/lib.rs::MatryoshkaConfig::with_retrieval_config:182",
-    "entity_type": "symbol",
-    "matched_symbols": [
-      "with_retrieval_config"
-    ],
-    "path": "crates/api/src/lib.rs",
-    "record_id": "semantic:symbol:crates/api/src/lib.rs::MatryoshkaConfig::with_retrieval_config:182",
-    "score": 1.0392932891845703,
-    "summary": "pub fn with_retrieval_config(mut self, config: RetrievalConfig) -> Self",
-    "title": "Symbol MatryoshkaConfig::with_retrieval_config in crates/api/src/lib.rs"
-  }
-]
-```
-
-Interpretation:
-
-```text
-The exact symbol record is returned directly ✅
-The result is not collapsed into File crates/cli/src/main.rs ✅
-Compact output keeps matched_symbols and removes noisy debug fields ✅
-```
-
----
-
-## Search: Symbol-Only Results
-
-Command:
-
-```bash
-/Users/rohit/cradle-embed/target/debug/matryoshka-rs search \
-  "where is resolve_retrieval_config defined" \
-  --db /Users/rohit/cradle-embed/.matryoshka/matryoshka.db \
-  --base-url http://127.0.0.1:44449 \
-  --api-key 2508 \
-  --embedding-model mlx-community--embeddinggemma-300m-bf16 \
-  --enable-dense \
-  --result-granularity symbol \
-  --compact \
-  --limit 3
-```
-
-Description:
-
-Returns only symbol records. Use this when you explicitly want definitions,
-methods, structs, classes, or named declarations instead of file or chunk cards.
-
-Representative output:
-
-```json
-[
-  {
-    "description": "Symbol: resolve_retrieval_config\nKind: Function\nFile: crates/cli/src/main.rs",
-    "entity_id": "crates/cli/src/main.rs::resolve_retrieval_config:498",
-    "entity_type": "symbol",
-    "matched_symbols": [
-      "resolve_retrieval_config"
-    ],
-    "path": "crates/cli/src/main.rs",
-    "record_id": "semantic:symbol:crates/cli/src/main.rs::resolve_retrieval_config:498",
-    "score": 2.02943754196167,
-    "summary": "fn resolve_retrieval_config(",
-    "title": "Symbol resolve_retrieval_config in crates/cli/src/main.rs"
-  }
-]
-```
-
----
-
-## Search: Dense-Off Comparison
-
-Command:
-
-```bash
-/Users/rohit/cradle-embed/target/debug/matryoshka-rs search \
-  "where is resolve_retrieval_config defined" \
-  --db /Users/rohit/cradle-embed/.matryoshka/matryoshka.db \
-  --base-url http://127.0.0.1:44449 \
-  --api-key 2508 \
-  --embedding-model mlx-community--embeddinggemma-300m-bf16 \
-  --disable-dense \
-  --no-dense-fallback \
-  --no-collapse \
-  --compact \
-  --limit 4
-```
-
-Description:
-
-Uses the same dense-enabled DB but disables dense query embedding and late-interaction at search time.
-
-Expected output shape:
-
-```json
-[
-  {
-    "entity_type": "symbol",
-    "matched_symbols": [
-      "resolve_retrieval_config"
-    ],
-    "path": "crates/cli/src/main.rs",
-    "record_id": "semantic:symbol:crates/cli/src/main.rs::resolve_retrieval_config:498",
-    "summary": "fn resolve_retrieval_config(",
-    "title": "Symbol resolve_retrieval_config in crates/cli/src/main.rs"
-  }
-]
-```
-
-Key difference from dense-on mode:
-
-```text
-No query embedding call is required.
-No Late-interaction MaxSim evidence is produced.
-Exact/FTS/symbol matching still works.
-```
-
----
-
-## Search: Dense Primary
-
-Command:
-
-```bash
-/Users/rohit/cradle-embed/target/debug/matryoshka-rs search \
-  "where is dense embedding disabled during indexing" \
-  --db /Users/rohit/cradle-embed/.matryoshka/matryoshka.db \
-  --base-url http://127.0.0.1:44449 \
-  --api-key 2508 \
-  --embedding-model mlx-community--embeddinggemma-300m-bf16 \
-  --retrieval-primary dense \
-  --enable-dense \
-  --limit 8
-```
-
-Description:
-
-Runs dense-enabled search with dense as the requested primary retrieval mode.
-
-Current M3 caveat:
-
-```text
-M3 makes dense configurable and skippable.
-M4 will make SPLADE/dense lane scoring cleaner.
-```
-
-So in M3, even with `--retrieval-primary dense`, output can still include FTS/exact evidence.
-
-Observed top result:
-
-```text
-crates/indexer/src/indexer.rs
-```
-
-This is correct because dense embedding gating during indexing lives in the indexer.
-
----
-
-## Search: Dense Enabled but Late Interaction Disabled
-
-Command:
-
-```bash
-/Users/rohit/cradle-embed/target/debug/matryoshka-rs search \
-  "how are code chunks summarized with omlx" \
-  --db /Users/rohit/cradle-embed/.matryoshka/matryoshka.db \
-  --base-url http://127.0.0.1:44449 \
-  --api-key 2508 \
-  --embedding-model mlx-community--embeddinggemma-300m-bf16 \
-  --enable-dense \
-  --no-late-interaction \
-  --limit 8
-```
-
-Description:
-
-Uses dense record/query embeddings but skips late-interaction MaxSim.
-
-Expected relevant areas:
-
-```text
-crates/enricher/src/mlx_chat.rs
-crates/indexer/src/indexer.rs
-crates/enricher/src/prompts.rs
-```
-
----
-
-## Prepare Command
-
-Command:
+For first-time use, run `prepare`, not `index` directly. If the DB has no indexed files, `prepare` chooses `action: "index"` automatically.
 
 ```bash
 /Users/rohit/cradle-embed/target/debug/matryoshka-rs prepare \
@@ -893,49 +101,205 @@ Command:
   --ignore target \
   --ignore .git \
   --ignore .matryoshka \
-  --json
+  --progress-jsonl
 ```
 
-Description:
+What this does on a fresh DB:
 
-Recommended high-level operation for IDE integration. It decides whether the repo needs:
+1. discovers files
+2. parses files, symbols, imports, and code chunks
+3. extracts docstrings/doc-comments for chunks when available
+4. sends undocumented chunks to the chunk-summary model
+5. creates file/folder/repo cards
+6. builds semantic records for files, folders, repo, symbols, snippets, and code chunks
+7. builds SQLite FTS records
+8. writes dense embeddings and late-interaction vectors when dense is enabled
+9. prewarms initial search results
+10. writes readiness state/marker if everything is ready
 
-- full index
-- update
-- repair
-- rebuild search
-- prewarm only
+Expected `prepare --progress-jsonl` events include raw events and canonical UX events. For UI, prefer the canonical events:
 
-Expected output shape:
-
-```json
-{
-  "status": "ready",
-  "actions_taken": [
-    "update",
-    "prepare_results"
-  ],
-  "file_count": 35,
-  "folder_count": 6,
-  "symbol_count": 856,
-  "semantic_record_count": 1956,
-  "retrieval_index": {
-    "semantic_records": 1956,
-    "embedded_records": 1956,
-    "fts_records": 1956,
-    "late_vector_rows": 0,
-    "dense_enabled": true
-  }
-}
+```jsonl
+{"event":"progress_state","state":{"operation":"prepare","action":"index","phase":"discovering_files","message":"Looking through the project"}}
+{"event":"progress_state","state":{"operation":"prepare","action":"index","phase":"enriching_chunks","message":"Understanding code","items_done":12,"items_total":28,"item_label":"batches"}}
 ```
 
-Actual counts vary by DB and current repo state.
+The latest canonical progress state is also written to:
+
+```text
+/Users/rohit/cradle-embed/.matryoshka/state/progress.json
+```
 
 ---
 
-## Rebuild Semantic Index With Dense Disabled
+## Rare: Explicit Full Index Command
 
-Command:
+You usually do **not** need this. Use raw `index` only when you intentionally want a full parser/indexer pass instead of `prepare`'s readiness decisions, repair checks, and prewarm step.
+
+For first-time setup, `prepare` is still preferred because it automatically chooses `action: "index"` on an empty DB and then verifies readiness.
+
+```bash
+/Users/rohit/cradle-embed/target/debug/matryoshka-rs index \
+  /Users/rohit/cradle-embed \
+  --db /Users/rohit/cradle-embed/.matryoshka/matryoshka.db \
+  --base-url http://127.0.0.1:44449 \
+  --api-key 2508 \
+  --model MercuriusDream--Qwen3.5-4B-MLX-mxfp8 \
+  --embedding-model mlx-community--embeddinggemma-300m-bf16 \
+  --chunk-summary-model srswti--bodega-raptor-90m \
+  --chunk-summary-concurrency 6 \
+  --enable-dense \
+  --ignore target \
+  --ignore .git \
+  --ignore .matryoshka \
+  --progress-jsonl
+```
+
+Use `prepare` for normal IDE/API readiness; use `update` or `prepare` for normal source edits.
+
+---
+
+## Normal Edits: Modified, Added, or Deleted Files
+
+After editing, adding, or deleting files, run `prepare` again:
+
+```bash
+/Users/rohit/cradle-embed/target/debug/matryoshka-rs prepare \
+  /Users/rohit/cradle-embed \
+  --db /Users/rohit/cradle-embed/.matryoshka/matryoshka.db \
+  --base-url http://127.0.0.1:44449 \
+  --api-key 2508 \
+  --model MercuriusDream--Qwen3.5-4B-MLX-mxfp8 \
+  --embedding-model mlx-community--embeddinggemma-300m-bf16 \
+  --chunk-summary-model srswti--bodega-raptor-90m \
+  --chunk-summary-concurrency 6 \
+  --enable-dense \
+  --ignore target \
+  --ignore .git \
+  --ignore .matryoshka \
+  --progress-jsonl
+```
+
+If the DB already exists and is mostly healthy, `prepare` usually chooses:
+
+```json
+{
+  "operation": "prepare",
+  "action": "update"
+}
+```
+
+### What update handles automatically
+
+`update` / `prepare(action=update)` handles:
+
+- changed files, detected by `source_hash`
+- newly added files
+- deleted files
+- changed/added/deleted folders
+- stale file/folder/repo cards caused by those changes
+- stale raw semantic records for changed files
+- stale card semantic records for changed files/folders
+- stale code chunks for changed files
+- dense embeddings/FTS for refreshed semantic records
+- import/context neighbors when relationships change
+
+### Deleted files
+
+If a source file is removed, update removes stale data for that file from the index, including relevant cards/chunks/search records. `prepare` also prunes orphaned artifacts before/after the readiness flow.
+
+### Modified files and chunk summaries
+
+Yes: changed-file chunk summaries are handled by `update` already.
+
+More specifically:
+
+- the parser re-extracts chunks for changed files
+- chunks with useful docstrings/doc-comments use those docs directly
+- undocumented changed chunks are sent to the chunk-summary model
+- unchanged chunks preserve their existing generated summaries
+- files whose `source_hash` is unchanged are skipped for chunk summarization
+- related/import-neighbor files may be refreshed when context changed
+
+So for normal code edits, do **not** manually rebuild all summaries. Run `prepare` or `update`.
+
+---
+
+## Explicit Incremental Update Command
+
+Use this if you want just the incremental index refresh, without the full `prepare` decision/prewarm layer:
+
+```bash
+/Users/rohit/cradle-embed/target/debug/matryoshka-rs update \
+  /Users/rohit/cradle-embed \
+  --db /Users/rohit/cradle-embed/.matryoshka/matryoshka.db \
+  --base-url http://127.0.0.1:44449 \
+  --api-key 2508 \
+  --model MercuriusDream--Qwen3.5-4B-MLX-mxfp8 \
+  --embedding-model mlx-community--embeddinggemma-300m-bf16 \
+  --chunk-summary-model srswti--bodega-raptor-90m \
+  --chunk-summary-concurrency 6 \
+  --enable-dense \
+  --ignore target \
+  --ignore .git \
+  --ignore .matryoshka \
+  --progress-jsonl
+```
+
+Expected output in normal successful update summary:
+
+```text
+changed_files: <number of changed/added files>
+removed_files: <number of deleted files>
+changed_folders: <number of affected folders>
+repo_card_updated: true|false
+```
+
+Use `prepare` instead of raw `update` when building an IDE workflow, because `prepare` also repairs gaps, rebuilds search if needed, warms search, and writes readiness state.
+
+---
+
+## Repairing Missing Summaries / Gaps
+
+If cards/chunks/search artifacts are missing or incomplete, run `prepare`.
+
+`prepare` detects gaps and may choose:
+
+```json
+{
+  "operation": "prepare",
+  "action": "repair"
+}
+```
+
+Important UX semantics:
+
+- top-level `operation` stays `prepare`
+- internal sub-step is `action: "repair"`
+- `progress.json` should not show top-level `operation: "repair"`
+
+Example progress state:
+
+```json
+{
+  "operation": "prepare",
+  "action": "repair",
+  "status": "running",
+  "phase": "enriching_chunks",
+  "message": "Understanding code",
+  "files_done": null,
+  "files_total": null,
+  "items_done": 16,
+  "items_total": 24,
+  "item_label": "batches"
+}
+```
+
+---
+
+## Rebuilding Search Records / Embeddings
+
+Use `rebuild-semantic` when existing cards/chunks are good but search data is missing/stale.
 
 ```bash
 /Users/rohit/cradle-embed/target/debug/matryoshka-rs rebuild-semantic \
@@ -944,201 +308,127 @@ Command:
   --base-url http://127.0.0.1:44449 \
   --api-key 2508 \
   --embedding-model mlx-community--embeddinggemma-300m-bf16 \
-  --disable-dense \
+  --enable-dense \
   --progress-jsonl
 ```
 
-Description:
+What it does:
 
-Rebuilds semantic records and FTS from existing stored artifacts while skipping dense embeddings.
+- rebuilds semantic records from stored files/cards/chunks
+- rebuilds SQLite FTS
+- rebuilds dense embeddings if dense is enabled
 
-Important:
+What it does **not** do:
 
-```text
-rebuild-semantic does not accept --chunk-summary-model or --chunk-summary-concurrency.
-```
+- it does not parse changed source files as the main operation
+- it does not regenerate file/folder/repo cards
+- it does not perform normal changed-file chunk-summary refresh
 
-Representative live corrected output:
+For changed source files, prefer `prepare` or `update`.
+
+---
+
+## Progress UX Contract
+
+There are two progress streams:
+
+1. raw indexer events, useful for debugging
+2. canonical `ProgressState`, useful for UI/IDE progress
+
+For UI, prefer:
 
 ```jsonl
-{"type":"embedding_skipped","record_count":15,"reason":"dense embeddings disabled"}
-{"type":"retrieval_index_health","report":{"semantic_records":15,"embedded_records":0,"fts_records":15,"late_vector_rows":0,"records_with_late_vectors":0,"retrieval_primary":"hybrid","dense_enabled":false,"dense_fallback_enabled":false,"late_interaction_enabled":false}}
+{"event":"progress_state","state":{...}}
 ```
+
+The same latest state is written to:
+
+```text
+.matryoshka/state/progress.json
+```
+
+Canonical fields:
+
+```json
+{
+  "operation": "prepare",
+  "action": "update",
+  "status": "running",
+  "phase": "enriching_chunks",
+  "message": "Understanding code",
+  "percent": 0.72,
+  "current_file": null,
+  "files_done": null,
+  "files_total": null,
+  "items_done": 12,
+  "items_total": 28,
+  "item_label": "batches"
+}
+```
+
+Meanings:
+
+| Field | Meaning |
+|---|---|
+| `operation` | user-facing command, e.g. `prepare`, `update`, `index`, `rebuild-semantic` |
+| `action` | prepare sub-step, e.g. `index`, `update`, `repair`, `rebuild_search`, `prepare_results` |
+| `phase` | user-facing current phase |
+| `message` | short UI copy |
+| `files_done/files_total` | only file progress |
+| `items_done/items_total/item_label` | non-file progress, e.g. `chunks`, `batches`, `records`, `queries` |
+
+Common phases/messages:
+
+| Phase | Message |
+|---|---|
+| `starting` | `Getting ready` |
+| `discovering_files` | `Looking through the project` |
+| `reading_files` | `Reading code structure` |
+| `enriching_files` | `Understanding files` |
+| `enriching_chunks` | `Understanding code` |
+| `saving` | `Saving updates` |
+| `embedding` | `Preparing search` |
+| `embedding_skipped` | `Preparing text search` |
+| `checking` | `Checking everything` |
+| `warming_search` | `Warming search` |
+| `complete` | `Ready` |
+| `failed` | `Needs attention` |
+| `cancelled` | `Cancelled` |
 
 ---
 
-## CLI Config Errors That Should Be Rejected
-
-### Invalid: dense primary while dense disabled
-
-Command:
-
-```bash
-/Users/rohit/cradle-embed/target/debug/matryoshka-rs search \
-  "anything" \
-  --db /Users/rohit/cradle-embed/.matryoshka/matryoshka.db \
-  --retrieval-primary dense \
-  --disable-dense
-```
-
-Expected output:
-
-```text
---retrieval-primary dense requires dense embeddings; remove --disable-dense or choose another primary
-```
-
-### Invalid: dense fallback while dense disabled
-
-Command:
-
-```bash
-/Users/rohit/cradle-embed/target/debug/matryoshka-rs search \
-  "anything" \
-  --db /Users/rohit/cradle-embed/.matryoshka/matryoshka.db \
-  --disable-dense \
-  --dense-fallback
-```
-
-Expected output:
-
-```text
---dense-fallback requires dense embeddings; remove --disable-dense or use --no-dense-fallback
-```
-
----
-
-## Rust API Search Examples
+## Search Commands
 
 ### Default file-collapsed search
 
-```rust
-use matryoshka::{Matryoshka, MatryoshkaConfig, SearchOptions};
-
-let api = Matryoshka::new(
-    MatryoshkaConfig::new("/Users/rohit/cradle-embed")
-        .with_db("/Users/rohit/cradle-embed/.matryoshka/matryoshka.db")
-        .with_endpoint("http://127.0.0.1:44449", "2508")
-        .with_models(
-            "MercuriusDream--Qwen3.5-4B-MLX-mxfp8",
-            "mlx-community--embeddinggemma-300m-bf16",
-        ),
-);
-
-let hits = api.search(
-    "where is dense embedding disabled during indexing",
-    SearchOptions::default(),
-)?;
-```
-
-### Chunk-level search
-
-```rust
-use matryoshka::{SearchOptions};
-use matryoshka_search::SearchResultGranularity;
-
-let hits = api.search(
-    "how does update preserve unchanged generated chunk summaries",
-    SearchOptions::default().with_result_granularity(SearchResultGranularity::Chunk),
-)?;
-```
-
-### Dense disabled search
-
-```rust
-use matryoshka::{Matryoshka, MatryoshkaConfig, SearchOptions};
-
-let api = Matryoshka::new(
-    MatryoshkaConfig::new("/Users/rohit/cradle-embed")
-        .with_db("/Users/rohit/cradle-embed/.matryoshka/matryoshka.db")
-        .with_endpoint("http://127.0.0.1:44449", "2508")
-        .with_models(
-            "MercuriusDream--Qwen3.5-4B-MLX-mxfp8",
-            "mlx-community--embeddinggemma-300m-bf16",
-        )
-        .with_dense_enabled(false)
-        .with_dense_fallback_enabled(false),
-);
-
-let hits = api.search(
-    "where is resolve_retrieval_config defined",
-    SearchOptions::default(),
-)?;
-```
-
----
-
-## Validation Commands
-
-Command:
-
-```bash
-cd /Users/rohit/cradle-embed
-
-cargo fmt --all
-cargo check --workspace
-cargo test -p matryoshka-search
-cargo test --workspace
-cargo build -p matryoshka-cli
-```
-
-Description:
-
-Validates formatting, compilation, search tests, the full workspace, and the CLI binary.
-
-Observed output summary:
-
-```text
-cargo check --workspace
-  Finished `dev` profile ... ok
-
-cargo test -p matryoshka-search
-  15 passed; 0 failed
-
-cargo test --workspace
-  api facade: 7 passed
-  indexer rust_core: 12 passed, 1 ignored live test
-  parser: 16 passed
-  resolver: 3 passed
-  search: 15 passed
-  watcher: 3 passed
-  enricher: 5 passed, 2 ignored live oMLX tests
-  doc-tests: passed
-
-cargo build -p matryoshka-cli
-  Finished `dev` profile ... ok
-```
-
----
-
-## Useful Search Queries
-
-Try these against the current `cradle-embed` DB.
-
-### Dense indexing behavior
-
 ```bash
 /Users/rohit/cradle-embed/target/debug/matryoshka-rs search \
-  "where is dense embedding disabled during indexing" \
+  "where is progress state written" \
   --db /Users/rohit/cradle-embed/.matryoshka/matryoshka.db \
   --base-url http://127.0.0.1:44449 \
   --api-key 2508 \
   --embedding-model mlx-community--embeddinggemma-300m-bf16 \
   --enable-dense \
-  --compact \
-  --limit 5
+  --limit 8
 ```
 
-Expected top area:
+Expect file-level results. This is best for “what file owns this behavior?”
 
-```text
-crates/indexer/src/indexer.rs
+### Compact output
+
+Add:
+
+```bash
+--compact
 ```
 
-### Update chunk-summary preservation
+`--compact` hides noisy debug fields like `matched_terms`, `why_matched`, and `total_matched_symbols`, while keeping useful fields like `matched_symbols`.
+
+### Chunk/function-level search
 
 ```bash
 /Users/rohit/cradle-embed/target/debug/matryoshka-rs search \
-  "how does update preserve unchanged generated chunk summaries" \
+  "which functions are sent to the LLM for chunk summaries and which are skipped because docs exist" \
   --db /Users/rohit/cradle-embed/.matryoshka/matryoshka.db \
   --base-url http://127.0.0.1:44449 \
   --api-key 2508 \
@@ -1149,40 +439,23 @@ crates/indexer/src/indexer.rs
   --limit 5
 ```
 
-Expected top area:
+Expect `entity_type: "code_chunk"` records with:
 
-```text
-crates/indexer/src/indexer.rs
-FullIndexer::refresh_chunk_summaries
+```json
+{
+  "path": "crates/indexer/src/indexer.rs",
+  "matched_symbols": ["FullIndexer::refresh_chunk_summaries"],
+  "summary": "Summarize code chunks that have no useful docstring/doc comment..."
+}
 ```
 
-### Doc comments attached to chunks
+Use this when you want function/class/method-level answers.
+
+### Symbol-only search
 
 ```bash
 /Users/rohit/cradle-embed/target/debug/matryoshka-rs search \
-  "where are rust doc comments attached to code chunks" \
-  --db /Users/rohit/cradle-embed/.matryoshka/matryoshka.db \
-  --base-url http://127.0.0.1:44449 \
-  --api-key 2508 \
-  --embedding-model mlx-community--embeddinggemma-300m-bf16 \
-  --enable-dense \
-  --result-granularity chunk \
-  --compact \
-  --limit 5
-```
-
-Expected top areas:
-
-```text
-crates/parser/src/source_parser.rs
-crates/indexer/src/indexer.rs
-```
-
-### oMLX chunk summarizer implementation
-
-```bash
-/Users/rohit/cradle-embed/target/debug/matryoshka-rs search \
-  "where is MlxChunkSummarizer implemented" \
+  "where is ProgressState defined" \
   --db /Users/rohit/cradle-embed/.matryoshka/matryoshka.db \
   --base-url http://127.0.0.1:44449 \
   --api-key 2508 \
@@ -1193,46 +466,314 @@ crates/indexer/src/indexer.rs
   --limit 5
 ```
 
-Expected top area:
+Expect `entity_type: "symbol"` records.
 
-```text
-crates/enricher/src/mlx_chat.rs
-MlxChunkSummarizer
-```
-
-### Search dense-disabled code path
+### Raw record / no-collapse search
 
 ```bash
 /Users/rohit/cradle-embed/target/debug/matryoshka-rs search \
-  "where does search skip query embeddings when dense is disabled" \
+  "where is resolve_search_result_granularity defined" \
   --db /Users/rohit/cradle-embed/.matryoshka/matryoshka.db \
   --base-url http://127.0.0.1:44449 \
   --api-key 2508 \
   --embedding-model mlx-community--embeddinggemma-300m-bf16 \
   --enable-dense \
+  --no-collapse \
   --compact \
   --limit 5
 ```
 
-Expected top area:
+`--no-collapse` is equivalent to:
+
+```bash
+--result-granularity record
+```
+
+Do not combine `--no-collapse` with `--result-granularity chunk` or `symbol`; choose one result granularity selector.
+
+### Dense disabled search
+
+```bash
+/Users/rohit/cradle-embed/target/debug/matryoshka-rs search \
+  "where is ProgressState defined" \
+  --db /Users/rohit/cradle-embed/.matryoshka/matryoshka.db \
+  --disable-dense \
+  --no-dense-fallback \
+  --result-granularity symbol \
+  --compact \
+  --limit 5
+```
+
+This uses exact/FTS-style retrieval and avoids query embedding calls.
+
+---
+
+## Read Commands
+
+### Direct file read
+
+```bash
+/Users/rohit/cradle-embed/target/debug/matryoshka-rs read crates/api/src/lib.rs \
+  --db /Users/rohit/cradle-embed/.matryoshka/matryoshka.db \
+  --repo-root /Users/rohit/cradle-embed
+```
+
+Expect:
+
+- file metadata
+- file summary
+- description
+- folder overview
+- symbols
+- imports
+- dependency summaries when available
+
+This is best after search tells you which file matters.
+
+### Direct file read with function/class/method chunk summaries
+
+```bash
+/Users/rohit/cradle-embed/target/debug/matryoshka-rs read crates/api/src/lib.rs \
+  --db /Users/rohit/cradle-embed/.matryoshka/matryoshka.db \
+  --repo-root /Users/rohit/cradle-embed \
+  --chunks
+```
+
+Alias:
+
+```bash
+--include-chunks
+```
+
+Expect an extra `chunks` array:
+
+```json
+{
+  "chunk_id": "crates/api/src/lib.rs::task_query:2051",
+  "symbol": "task_query",
+  "qualified_name": "task_query",
+  "kind": "function",
+  "signature": "fn task_query(task: AgentTask, query: &str) -> String",
+  "lines": "2051-2065",
+  "summary_source": "llm",
+  "summary": "The function processes agent tasks..."
+}
+```
+
+`generated_summary` is intentionally not included because it duplicates `summary` for LLM-generated chunks. `summary_source` keeps provenance.
+
+Useful compact view:
+
+```bash
+/Users/rohit/cradle-embed/target/debug/matryoshka-rs read crates/api/src/lib.rs \
+  --db /Users/rohit/cradle-embed/.matryoshka/matryoshka.db \
+  --repo-root /Users/rohit/cradle-embed \
+  --chunks \
+  | jq '{file: .file.file_id, chunk_count: (.chunks | length), chunks: [.chunks[:8][] | {name: (.qualified_name // .symbol), kind, lines, summary_source, summary}]}'
+```
+
+### Read bundle: search first, then pack context
+
+`read-bundle` searches for a query, picks a primary file hit, selects related files, then returns packed file cards.
+
+```bash
+/Users/rohit/cradle-embed/target/debug/matryoshka-rs read-bundle \
+  "progress state operation action item_label batches chunks prepare progress json" \
+  --db /Users/rohit/cradle-embed/.matryoshka/matryoshka.db \
+  --repo-root /Users/rohit/cradle-embed \
+  --base-url http://127.0.0.1:44449 \
+  --api-key 2508 \
+  --embedding-model mlx-community--embeddinggemma-300m-bf16 \
+  --enable-dense \
+  --mode brief \
+  --limit 5 \
+  --related 3
+```
+
+Expected result:
 
 ```text
-crates/search/src/semantic_search.rs
-SearchEngine::with_dense
-SearchEngine::search
+primary: crates/api/src/lib.rs
+related: crates/cli/src/main.rs
+```
+
+Modes:
+
+| Mode | Use for | Shape |
+|---|---|---|
+| `brief` | quick agent context | fewer symbols/dependencies, no description |
+| `edit` | code editing | more symbols/dependencies, includes description |
+| `flow` | tracing relationships | more dependency context, includes description |
+
+Example chunk-summary bundle:
+
+```bash
+/Users/rohit/cradle-embed/target/debug/matryoshka-rs read-bundle \
+  "which functions are sent to the LLM for chunk summaries and which are skipped because docs exist" \
+  --db /Users/rohit/cradle-embed/.matryoshka/matryoshka.db \
+  --repo-root /Users/rohit/cradle-embed \
+  --base-url http://127.0.0.1:44449 \
+  --api-key 2508 \
+  --embedding-model mlx-community--embeddinggemma-300m-bf16 \
+  --enable-dense \
+  --mode edit \
+  --limit 5 \
+  --related 3
+```
+
+Expected primary area:
+
+```text
+crates/indexer/src/indexer.rs
+FullIndexer::refresh_chunk_summaries
+```
+
+Caveat: current `read-bundle` chooses good primary files, but packed symbol lists are still source-order limited. For large files, the most query-relevant symbol/chunk may be omitted from the visible packed symbol list. If you need function-level summaries, use search `--result-granularity chunk` or direct `read --chunks` after identifying the file.
+
+---
+
+## Useful Stress-Test Queries
+
+### Prepare lifecycle
+
+```bash
+/Users/rohit/cradle-embed/target/debug/matryoshka-rs search \
+  "prepare lifecycle add changed deleted files repair missing summaries rebuild search data ready marker" \
+  --db /Users/rohit/cradle-embed/.matryoshka/matryoshka.db \
+  --base-url http://127.0.0.1:44449 \
+  --api-key 2508 \
+  --embedding-model mlx-community--embeddinggemma-300m-bf16 \
+  --enable-dense \
+  --result-granularity chunk \
+  --compact \
+  --limit 5
+```
+
+Expected areas:
+
+```text
+crates/api/src/lib.rs::Matryoshka::prepare_with_progress_and_cancel
+crates/api/tests/facade.rs::prepare_search_read_and_repair_lifecycle_work_through_rust_api
+```
+
+### Progress UX
+
+```bash
+/Users/rohit/cradle-embed/target/debug/matryoshka-rs search \
+  "progress state operation action phase message items_done item_label batches chunks prepare repair progress json" \
+  --db /Users/rohit/cradle-embed/.matryoshka/matryoshka.db \
+  --base-url http://127.0.0.1:44449 \
+  --api-key 2508 \
+  --embedding-model mlx-community--embeddinggemma-300m-bf16 \
+  --enable-dense \
+  --result-granularity chunk \
+  --compact \
+  --limit 5
+```
+
+Expected areas:
+
+```text
+ProgressState
+indexer_progress_state
+CliProgressStateWriter::state_with_counters
+assert_progress_events_are_consistent
+```
+
+### Parser/chunks/docstrings
+
+```bash
+/Users/rohit/cradle-embed/target/debug/matryoshka-rs search \
+  "how does parser extract functions classes methods code chunks and attach doc comments or docstrings" \
+  --db /Users/rohit/cradle-embed/.matryoshka/matryoshka.db \
+  --base-url http://127.0.0.1:44449 \
+  --api-key 2508 \
+  --embedding-model mlx-community--embeddinggemma-300m-bf16 \
+  --enable-dense \
+  --result-granularity chunk \
+  --compact \
+  --limit 5
+```
+
+Expected areas:
+
+```text
+build_code_chunks
+doc_summary_source
+extract_python_docstring
+extract_typescript_doc
+```
+
+### Deleted files / stale artifacts
+
+```bash
+/Users/rohit/cradle-embed/target/debug/matryoshka-rs search \
+  "deleted files remove stale semantic records orphaned file cards prune artifacts incremental update" \
+  --db /Users/rohit/cradle-embed/.matryoshka/matryoshka.db \
+  --base-url http://127.0.0.1:44449 \
+  --api-key 2508 \
+  --embedding-model mlx-community--embeddinggemma-300m-bf16 \
+  --enable-dense \
+  --result-granularity chunk \
+  --compact \
+  --limit 5
+```
+
+Expected areas:
+
+```text
+FullIndexer::refresh_artifacts
+FullIndexer::update_repo_with_progress
+MatryoshkaStore::prune_orphaned_artifacts
+apply_structural_delta
+```
+
+---
+
+## Inspecting the DB
+
+Check semantic record types:
+
+```bash
+sqlite3 /Users/rohit/cradle-embed/.matryoshka/matryoshka.db \
+  "SELECT entity_type, COUNT(*) FROM semantic_records GROUP BY entity_type ORDER BY entity_type;"
+```
+
+Check dense/FTS/late-vector coverage:
+
+```bash
+sqlite3 /Users/rohit/cradle-embed/.matryoshka/matryoshka.db \
+  "SELECT 'semantic_records', COUNT(*) FROM semantic_records UNION ALL SELECT 'embedded_records', SUM(CASE WHEN json_extract(payload_json, '$.embedding') IS NOT NULL THEN 1 ELSE 0 END) FROM semantic_records UNION ALL SELECT 'late_vector_rows', COUNT(*) FROM semantic_late_vectors UNION ALL SELECT 'records_with_late_vectors', COUNT(DISTINCT record_id) FROM semantic_late_vectors UNION ALL SELECT 'fts_records', COUNT(*) FROM semantic_records_fts;"
+```
+
+Check chunk summary sources:
+
+```bash
+sqlite3 /Users/rohit/cradle-embed/.matryoshka/matryoshka.db \
+  "SELECT json_extract(payload_json, '$.summary_source') AS source, COUNT(*) FROM code_chunks GROUP BY source ORDER BY source;"
 ```
 
 ---
 
 ## Notes and Caveats
 
-1. `--compact` only changes output shape. It does not change retrieval scoring.
-2. `--result-granularity chunk` only returns existing `code_chunk` semantic records.
-3. If newly-added code does not appear in search, run `update` or reindex first.
-4. `--retrieval-primary splade` is reserved for M4. The SPLADE model is available at:
+1. `prepare` is the safest default command for IDE integration.
+2. `update` handles changed/added/deleted source files and changed-file chunk summaries incrementally.
+3. `rebuild-semantic` rebuilds search records/FTS/embeddings from existing artifacts; use it for search-data repair, not normal source edits.
+4. `read --chunks` exposes function/class/method summaries for a file; it does not include full chunk source code.
+5. `read-bundle` currently packs symbols by file/source order, not by query-relevance inside the chosen file.
+6. `--compact` only changes output shape. It does not change retrieval scoring.
+7. `--result-granularity chunk` returns existing code chunk semantic records; run `prepare` or `update` first if code changed.
+8. `--omlx-rerank` requires an oMLX `/v1/rerank` endpoint. If your server returns 404 for `/v1/rerank`, use non-reranked search or the chat reranker path.
 
-   ```text
-   /Users/rohit/.omlx/models/naver--splade-code-06B
-   ```
+---
 
-5. M3 makes dense optional and configurable. M4 will add SPLADE-primary retrieval.
+## Validation Commands
+
+```bash
+cd /Users/rohit/cradle-embed
+cargo fmt --all
+cargo check --workspace
+cargo test --workspace
+cargo build --workspace
+```
