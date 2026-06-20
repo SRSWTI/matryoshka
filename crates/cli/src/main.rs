@@ -1188,6 +1188,9 @@ fn run_prepare(options: PrepareOptions) -> Result<PrepareSummary> {
         &options.embed_model,
         &options.chat_model,
         parser_config.clone(),
+        &options.chunk_summary_model,
+        options.chunk_summary_concurrency,
+        !options.no_chunk_summaries,
         Some(&mut log),
     )?;
     actions_taken.push(first_action.to_string());
@@ -1210,6 +1213,9 @@ fn run_prepare(options: PrepareOptions) -> Result<PrepareSummary> {
             &options.embed_model,
             &options.chat_model,
             parser_config,
+            &options.chunk_summary_model,
+            options.chunk_summary_concurrency,
+            !options.no_chunk_summaries,
             Some(&mut log),
         )?;
         actions_taken.push("repair".to_string());
