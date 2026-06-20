@@ -24,7 +24,7 @@ No useful docstring/doc comment
 | Milestone | Status | Summary |
 |---|---|---|
 | M1 — Code chunk extraction + doc extraction | ✅ Complete | Parser emits `CodeChunkFact` per symbol with full body + docstring/doc-comment summaries |
-| M2 — Concurrent LLM chunk summaries + chunk semantic records | ⬜ Not started | MLX/Raptor fills `generated_summary` for empty chunks; `code_chunk` semantic records created |
+| M2 — Concurrent LLM chunk summaries + chunk semantic records | 🔄 In progress | Chunk summarizer trait + MLX/Raptor concurrent impl done & live-tested; indexer wiring + chunk semantic records next |
 | M3 — Retrieval config, dense optional | ⬜ Not started | Make dense embeddings optional via CLI/API flags; stage-based candidate collection |
 | M4 — SPLADE primary retrieval | ⬜ Not started | SPLADE sparse index + postings storage; SPLADE-first scoring |
 | M5 — Measurement & recall comparison | ⬜ Not started | Retrieval diagnostics + eval harness for SPLADE-only vs hybrid |
@@ -232,13 +232,73 @@ After the fix, `/Users/rohit/pi` `doc_comment` count dropped 2719 → 2363
 
 ---
 
-## Milestone 2 — Concurrent LLM Chunk Summaries + Chunk Semantic Records ⬜
+## Milestone 2 — Concurrent LLM Chunk Summaries + Chunk Semantic Records 🔄
 
 ### Goal
 
 For every chunk with `summary_source == Empty`, call the local MLX/Raptor model
 to generate a 2-3 line summary. Then build `code_chunk` semantic records in the
 target template and persist them so search can use them.
+
+### Progress
+
+#### Done
+
+- **`ChunkSummarizer` trait + `ChunkSummaryDraft`** (`crates/enricher/src/lib.rs`)
+  - `ChunkSummaryDraft { chunk_id, summary }` — keyed by `chunk_id` so the
+    indexer can map summaries back onto chunks.
+  - `trait ChunkSummarizer { fn summarize_chunks(&self, chunks: &[CodeChunkFact]) -> Result<Vec<ChunkSummaryDraft>>; }`
+
+- **Prompt builder** (`crates/enricher/src/prompts.rs`)
+  - `chunk_summary_prompt(chunk)` — plain-text user message:
+    ```
+    Summarize this code chunk in 2-3 concise lines.
+
+    path: crates/foo/src/bar.rs
+    symbol: Foo::resume
+    kind: method
+    code:
+    fn resume(&mut self) {
+        self.countdown.cancel();
+        self.mode = Mode::Attack;
+    }
+    ```
+  - `chunk_summary_system_prompt()` — asks for strict JSON `{"summary": "..."}`.
+  - `DEFAULT_CHUNK_SUMMARY_MODEL = "srswti--bodega-raptor-90m"`.
+  - `MAX_CHUNK_CODE_CHARS = 8_000` — prompt-side cap only; stored `code` is never truncated.
+
+- **`HeuristicChunkSummarizer`** (`crates/enricher/src/heuristic.rs`)
+  - Fallback that produces a grounded one-line summary from symbol/kind/path/signature.
+  - No LLM call. Used when MLX is unavailable or as a last resort.
+
+- **`MlxChunkSummarizer`** (`crates/enricher/src/mlx_chat.rs`)
+  - Concurrent chunk summarizer backed by an OpenAI-compatible chat endpoint (omlx).
+  - Sends one request per chunk in parallel using a rayon thread pool.
+  - `enable_thinking: false` passed via `chat_template_kwargs` to skip reasoning.
+  - JSON-schema-constrained response (`SummaryDraft { summary }`).
+  - Builders: `.with_model()`, `.with_concurrency()`, `.with_max_tokens()`.
+  - Graceful partial-failure: collects successes, errors only if everything fails.
+  - Reuses the existing `ChatRequest`/`parse_chat_response`/`cleanup_summary` helpers.
+
+- **Live-tested against omlx** (`http://127.0.0.1:44449`, `srswti--bodega-raptor-90m`)
+  - Single chunk: `"The function sets the mode to 'Attack' and returns true, canceling the countdown."`
+  - 3 concurrent chunks in 2.16s — continuous batching on the omlx side handled it cleanly.
+  - Tests: `mlx_chunk_summarizer_live`, `mlx_chunk_summarizer_concurrent_live` (ignored by default).
+
+- **`rayon` added** to `crates/enricher/Cargo.toml` for the concurrent thread pool.
+
+#### Next (indexer wiring + chunk semantic records)
+
+- `crates/indexer/src/indexer.rs` — during `refresh_artifacts`:
+  - Filter chunks to those with `summary_source == Empty` (or generic/short docs).
+  - Call `ChunkSummarizer::summarize_chunks` for those chunks only.
+  - Map returned `ChunkSummaryDraft`s back onto chunks by `chunk_id`.
+  - Set `generated_summary`, `summary`, and `summary_source = Llm` (or `Heuristic` on fallback).
+  - Skip unchanged chunks by `source_hash` for incremental updates.
+  - Build `code_chunk` semantic records in the target template.
+  - Persist updated chunks + semantic records to the store.
+- `crates/api/src/lib.rs` — `MatryoshkaConfig` gains `chunk_summary_enabled`, `chunk_summary_model`, `chunk_summary_concurrency`.
+- `crates/cli/src/main.rs` — `--chunk-summary-model`, `--chunk-summary-concurrency`, `--no-chunk-summaries` flags on `prepare`/`index`/`update`/`rebuild-semantic`.
 
 ### LLM call shape (one chunk per request)
 
@@ -258,24 +318,24 @@ fn resume(&mut self) {
 
 Output:
 ```json
-{ "summary": "Cancels the active countdown and switches the object into attack mode." }
+{"summary": "Cancels the active countdown and switches the object into attack mode."}
 ```
 
 The caller already knows the `chunk_id` it sent, so the returned summary is
 mapped back onto that chunk. Concurrency is handled by firing many requests in
 parallel (the omlx server already does continuous batching internally).
 
-### Planned changes
+### omlx endpoint config (live-tested)
 
-- `crates/enricher/src/lib.rs` — add `ChunkSummarizer` trait + `ChunkSummaryDraft`.
-- `crates/enricher/src/heuristic.rs` — `HeuristicChunkSummarizer` fallback.
-- `crates/enricher/src/mlx_chat.rs` — `MlxChunkSummarizer` with concurrent requests (rayon thread pool).
-- `crates/enricher/src/prompts.rs` — `chunk_summary_prompt`.
-- `crates/indexer/src/indexer.rs` — summarize chunks during refresh; only call LLM for `Empty` chunks; skip unchanged chunks by `source_hash`; build `code_chunk` semantic records.
-- `crates/api/src/lib.rs` — `MatryoshkaConfig` gains `chunk_summary_enabled`, `chunk_summary_model`, `chunk_summary_concurrency`.
-- `crates/cli/src/main.rs` — `--chunk-summary-model`, `--chunk-summary-concurrency`, `--no-chunk-summaries` flags on `prepare`/`index`/`update`/`rebuild-semantic`.
+```
+base_url: http://127.0.0.1:44449
+api_key: 2508
+model: srswti--bodega-raptor-90m
+chat_template_kwargs: {"enable_thinking": false}
+response_format: json_schema (SummaryDraft { summary: String })
+```
 
-### Chunk semantic record template
+### Chunk semantic record template (planned)
 
 ```
 path: crates/foo/src/bar.rs
@@ -291,7 +351,7 @@ fn handle_resume_countdown(...) {
 
 Metadata: `kind=code_chunk`, `summary_source`, `symbol_id`, `qualified_name`, `start_line`, `end_line`, `language`.
 
-### Incremental behavior
+### Incremental behavior (planned)
 
 - If file `source_hash` unchanged → skip chunk re-summary.
 - If changed file → regenerate only chunks in changed files.

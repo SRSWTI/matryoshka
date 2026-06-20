@@ -11,6 +11,7 @@ readme.workspace = true
 anyhow.workspace = true
 chrono.workspace = true
 matryoshka-core-ir.workspace = true
+rayon.workspace = true
 reqwest.workspace = true
 schemars.workspace = true
 serde.workspace = true

@@ -1,10 +1,10 @@
-use crate::CodeEnricher;
+use crate::{ChunkSummarizer, ChunkSummaryDraft, CodeEnricher};
 use anyhow::Result;
 use chrono::Utc;
 use matryoshka_core_ir::{
-    DependencyInterpretation, FileCard, FileEnrichmentContext, FileFact, FileOwnershipKind,
-    FolderCard, FolderEnrichmentContext, FolderFact, Provenance, RelatedFileContext, RepoCard,
-    SubareaSummary, SymbolBehavior, SymbolFact,
+    CodeChunkFact, DependencyInterpretation, FileCard, FileEnrichmentContext, FileFact,
+    FileOwnershipKind, FolderCard, FolderEnrichmentContext, FolderFact, Provenance,
+    RelatedFileContext, RepoCard, SubareaSummary, SymbolBehavior, SymbolFact,
 };
 
 #[derive(Debug, Default, Clone)]
@@ -768,4 +768,40 @@ fn risk_notes(file: &FileFact, context: &FileEnrichmentContext) -> Vec<String> {
         ));
     }
     notes
+}
+
+/// Fallback chunk summarizer that produces a grounded one-line summary from
+/// the chunk's symbol name, kind, signature, and path — without calling any
+/// LLM. Used when MLX is unavailable or as a last resort.
+#[derive(Debug, Default, Clone)]
+pub struct HeuristicChunkSummarizer;
+
+impl ChunkSummarizer for HeuristicChunkSummarizer {
+    fn summarize_chunks(&self, chunks: &[CodeChunkFact]) -> Result<Vec<ChunkSummaryDraft>> {
+        Ok(chunks
+            .iter()
+            .map(|chunk| ChunkSummaryDraft {
+                chunk_id: chunk.chunk_id.clone(),
+                summary: heuristic_chunk_summary(chunk),
+            })
+            .collect())
+    }
+}
+
+fn heuristic_chunk_summary(chunk: &CodeChunkFact) -> String {
+    let kind = format!("{:?}", chunk.kind).to_ascii_lowercase();
+    let symbol = chunk
+        .qualified_name
+        .as_deref()
+        .or(chunk.symbol.as_deref())
+        .unwrap_or("symbol");
+    let signature = chunk.signature.trim();
+    if signature.is_empty() {
+        format!("{} {} defined in {}.", kind, symbol, chunk.path)
+    } else {
+        format!(
+            "{} {} defined in {} with signature: {}",
+            kind, symbol, chunk.path, signature
+        )
+    }
 }

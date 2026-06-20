@@ -1,9 +1,11 @@
 use matryoshka_core_ir::{
-    FileEnrichmentContext, FileFact, FolderCard, FolderEnrichmentContext, FolderFact, SymbolFact,
+    CodeChunkFact, FileEnrichmentContext, FileFact, FolderCard, FolderEnrichmentContext,
+    FolderFact, SymbolFact,
 };
 use serde_json::{Value, json};
 
 pub const ENRICHMENT_MODEL: &str = "MercuriusDream--Qwen3.5-4B-MLX-mxfp8";
+pub const DEFAULT_CHUNK_SUMMARY_MODEL: &str = "srswti--bodega-raptor-90m";
 
 pub fn file_summary_enrichment_prompt(
     file: &FileFact,
@@ -253,4 +255,50 @@ fn truncate_value_string_array(value: Option<&Value>, max_items: usize, max_char
             })
             .unwrap_or_default(),
     )
+}
+
+/// Maximum number of code characters to send to the LLM for a single chunk.
+/// Chunks are not truncated for storage (the full body lives in `code`), but
+/// very large bodies are capped in the prompt to keep token costs bounded.
+const MAX_CHUNK_CODE_CHARS: usize = 8_000;
+
+/// Build the user-message prompt for a single code chunk summary request.
+///
+/// Shape (plain text, one chunk per LLM call):
+///
+/// ```text
+/// Summarize this code chunk in 2-3 concise lines.
+///
+/// path: crates/foo/src/bar.rs
+/// symbol: Foo::resume
+/// kind: method
+/// code:
+/// fn resume(&mut self) {
+///     self.countdown.cancel();
+///     self.mode = Mode::Attack;
+/// }
+/// ```
+pub fn chunk_summary_prompt(chunk: &CodeChunkFact) -> String {
+    let kind = format!("{:?}", chunk.kind).to_ascii_lowercase();
+    let symbol = chunk
+        .qualified_name
+        .as_deref()
+        .or(chunk.symbol.as_deref())
+        .unwrap_or("<unknown>");
+    let code = truncate(&chunk.code, MAX_CHUNK_CODE_CHARS);
+    format!(
+        "Summarize this code chunk in 2-3 concise lines.\n\npath: {}\nsymbol: {}\nkind: {}\ncode:\n{}",
+        chunk.path, symbol, kind, code
+    )
+}
+
+/// System prompt for chunk summarization. Asks for strict JSON output.
+pub fn chunk_summary_system_prompt() -> &'static str {
+    "Summarize code chunks in 2-3 concise lines. \
+\
+     Only describe behavior visible in the code. \n\
+     Prefer side effects, state changes, returned values, delegated calls, important conditions, and errors. \n\
+     Do not mention that this is a function/class/method unless that is necessary for meaning. \n\
+     Do not invent behavior. \n\
+     Return only valid JSON with exactly one field: {\"summary\": \"...\"}"
 }

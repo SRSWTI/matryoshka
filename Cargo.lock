@@ -874,6 +874,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "matryoshka-core-ir",
+ "rayon",
  "reqwest",
  "schemars",
  "serde",

@@ -1,6 +1,7 @@
 use crate::{
-    CodeEnricher, ENRICHMENT_MODEL, HeuristicEnricher, file_summary_enrichment_prompt,
-    folder_summary_enrichment_prompt, repo_summary_enrichment_prompt,
+    CodeEnricher, DEFAULT_CHUNK_SUMMARY_MODEL, ENRICHMENT_MODEL, HeuristicEnricher,
+    file_summary_enrichment_prompt, folder_summary_enrichment_prompt,
+    repo_summary_enrichment_prompt,
 };
 use anyhow::{Context, Result, anyhow};
 use chrono::Utc;
@@ -953,6 +954,268 @@ mod tests {
             agent_guidance: Vec::new(),
             search_phrases: Vec::new(),
             provenance: Provenance::source_only(id),
+        }
+    }
+}
+
+// ============================================================================
+// Chunk summarizer (Milestone 2)
+// ============================================================================
+
+use crate::{
+    ChunkSummarizer, ChunkSummaryDraft, chunk_summary_prompt, chunk_summary_system_prompt,
+};
+use matryoshka_core_ir::CodeChunkFact;
+use rayon::prelude::*;
+
+/// Concurrent chunk summarizer backed by an OpenAI-compatible chat endpoint
+/// (omlx). Sends one request per chunk in parallel using a rayon thread pool.
+///
+/// The omlx server already does continuous batching internally, so we just fire
+/// many blocking requests concurrently up to `concurrency`.
+#[derive(Debug, Clone)]
+pub struct MlxChunkSummarizer {
+    client: Client,
+    base_url: String,
+    api_key: String,
+    model: String,
+    concurrency: usize,
+    max_tokens: u32,
+}
+
+impl MlxChunkSummarizer {
+    pub fn new(base_url: impl Into<String>, api_key: impl Into<String>) -> Self {
+        Self {
+            client: Client::builder()
+                .http1_only()
+                .pool_max_idle_per_host(0)
+                .connect_timeout(Duration::from_secs(10))
+                .timeout(Duration::from_secs(120))
+                .build()
+                .expect("failed to build MLX chunk summarizer client"),
+            base_url: base_url.into().trim_end_matches('/').to_string(),
+            api_key: api_key.into(),
+            model: DEFAULT_CHUNK_SUMMARY_MODEL.into(),
+            concurrency: 6,
+            max_tokens: 160,
+        }
+    }
+
+    pub fn with_model(mut self, model: impl Into<String>) -> Self {
+        self.model = model.into();
+        self
+    }
+
+    pub fn with_concurrency(mut self, concurrency: usize) -> Self {
+        self.concurrency = concurrency.max(1);
+        self
+    }
+
+    pub fn with_max_tokens(mut self, max_tokens: u32) -> Self {
+        self.max_tokens = max_tokens;
+        self
+    }
+
+    /// Summarize a single chunk synchronously. Returns the cleaned summary text.
+    fn summarize_one(&self, chunk: &CodeChunkFact) -> Result<String> {
+        let prompt = chunk_summary_prompt(chunk);
+        let request = ChatRequest {
+            model: self.model.clone(),
+            messages: vec![
+                ChatMessage {
+                    role: "system",
+                    content: chunk_summary_system_prompt(),
+                },
+                ChatMessage {
+                    role: "user",
+                    content: &prompt,
+                },
+            ],
+            max_tokens: self.max_tokens,
+            temperature: 0.0,
+            chat_template_kwargs: json!({ "enable_thinking": false }),
+            response_format: json!({
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "chunk_summary",
+                    "description": "A 2-3 line summary of a code chunk",
+                    "strict": true,
+                    "schema": serde_json::to_value(&schemars::schema_for!(SummaryDraft))
+                        .expect("schema should serialize"),
+                }
+            }),
+            stream: false,
+        };
+
+        let response = self
+            .client
+            .post(format!("{}/v1/chat/completions", self.base_url))
+            .header(CONNECTION, "close")
+            .bearer_auth(&self.api_key)
+            .json(&request)
+            .send()
+            .context("failed to call chunk summary endpoint")?
+            .error_for_status()
+            .context("chunk summary endpoint returned an error")?;
+
+        let chat_response = parse_chat_response(response)?;
+        let content = chat_response
+            .choices
+            .into_iter()
+            .next()
+            .and_then(|choice| choice.message.content)
+            .ok_or_else(|| anyhow!("chunk summary response had no content"))?;
+
+        let summary = serde_json::from_str::<SummaryDraft>(&content)
+            .or_else(|_| {
+                extract_json_object(&content)
+                    .and_then(|json| serde_json::from_str(json).map_err(Into::into))
+            })
+            .with_context(|| {
+                let preview = content.chars().take(500).collect::<String>();
+                format!("chunk summary response was not valid JSON: {preview:?}")
+            })?;
+        Ok(cleanup_summary(summary.summary))
+    }
+}
+
+impl ChunkSummarizer for MlxChunkSummarizer {
+    fn summarize_chunks(&self, chunks: &[CodeChunkFact]) -> Result<Vec<ChunkSummaryDraft>> {
+        if chunks.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(self.concurrency)
+            .build()
+            .map_err(anyhow::Error::from)?;
+
+        let drafts: Vec<Result<ChunkSummaryDraft>> = pool.install(|| {
+            chunks
+                .par_iter()
+                .map(|chunk| {
+                    let summary = self.summarize_one(chunk)?;
+                    Ok(ChunkSummaryDraft {
+                        chunk_id: chunk.chunk_id.clone(),
+                        summary,
+                    })
+                })
+                .collect()
+        });
+
+        // Collect successes; collect failures into a single error if everything failed.
+        let mut ok = Vec::with_capacity(chunks.len());
+        let mut errors = Vec::new();
+        for result in drafts {
+            match result {
+                Ok(draft) => ok.push(draft),
+                Err(err) => errors.push(format!("{err:#}")),
+            }
+        }
+        if ok.is_empty() && !errors.is_empty() {
+            return Err(anyhow!(
+                "all chunk summary requests failed; first error: {}",
+                errors.into_iter().next().unwrap_or_default()
+            ));
+        }
+        Ok(ok)
+    }
+}
+
+#[cfg(test)]
+mod chunk_summarizer_tests {
+    use super::*;
+    use crate::HeuristicChunkSummarizer;
+    use matryoshka_core_ir::{ChunkSummarySource, CodeChunkFact, CodeChunkKind};
+
+    fn make_chunk(symbol: &str, code: &str) -> CodeChunkFact {
+        CodeChunkFact {
+            chunk_id: format!("test::{}:1", symbol),
+            file_id: "src/lib.rs".into(),
+            symbol_id: Some(format!("src/lib.rs::{}:1", symbol)),
+            path: "src/lib.rs".into(),
+            symbol: Some(symbol.into()),
+            qualified_name: Some(symbol.into()),
+            kind: CodeChunkKind::Function,
+            signature: format!("fn {}()", symbol),
+            start_line: 1,
+            end_line: code.lines().count(),
+            doc_summary: None,
+            generated_summary: None,
+            summary: String::new(),
+            summary_source: ChunkSummarySource::Empty,
+            code: code.into(),
+            source_hash: "test".into(),
+        }
+    }
+
+    #[test]
+    fn heuristic_chunk_summarizer_produces_grounded_summary() {
+        let chunk = make_chunk(
+            "handle_resume_countdown",
+            "fn handle_resume_countdown(state: &mut State) -> bool {\n    state.countdown.cancel();\n    true\n}",
+        );
+        let summarizer = HeuristicChunkSummarizer;
+        let drafts = summarizer.summarize_chunks(&[chunk.clone()]).unwrap();
+        assert_eq!(drafts.len(), 1);
+        assert_eq!(drafts[0].chunk_id, chunk.chunk_id);
+        assert!(drafts[0].summary.contains("handle_resume_countdown"));
+        assert!(drafts[0].summary.contains("src/lib.rs"));
+    }
+
+    #[test]
+    #[ignore = "requires a live omlx server at 127.0.0.1:44449"]
+    fn mlx_chunk_summarizer_live() {
+        let chunk = make_chunk(
+            "handle_resume_countdown",
+            "fn handle_resume_countdown(state: &mut State) -> bool {\n    state.countdown.cancel();\n    state.mode = Mode::Attack;\n    true\n}",
+        );
+        let summarizer = MlxChunkSummarizer::new("http://127.0.0.1:44449", "2508")
+            .with_model("srswti--bodega-raptor-90m")
+            .with_concurrency(2);
+        let drafts = summarizer.summarize_chunks(&[chunk]).unwrap();
+        assert_eq!(drafts.len(), 1);
+        let summary = &drafts[0].summary;
+        println!("generated summary: {summary}");
+        assert!(!summary.is_empty());
+        // The summary should mention at least one of the key behaviors.
+        let lower = summary.to_ascii_lowercase();
+        assert!(
+            lower.contains("countdown")
+                || lower.contains("attack")
+                || lower.contains("cancel")
+                || lower.contains("mode"),
+            "summary should be grounded in the code: {summary}"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires a live omlx server at 127.0.0.1:44449"]
+    fn mlx_chunk_summarizer_concurrent_live() {
+        // Fire several chunks concurrently to verify the thread pool + omlx
+        // continuous batching path works.
+        let chunks = vec![
+            make_chunk(
+                "cancel_countdown",
+                "fn cancel_countdown(&mut self) {\n    self.timer.cancel();\n}",
+            ),
+            make_chunk(
+                "enter_attack_mode",
+                "fn enter_attack_mode(&mut self) {\n    self.mode = Mode::Attack;\n}",
+            ),
+            make_chunk(
+                "reset_state",
+                "fn reset_state(&mut self) {\n    self.mode = Mode::Idle;\n    self.target = None;\n}",
+            ),
+        ];
+        let summarizer = MlxChunkSummarizer::new("http://127.0.0.1:44449", "2508")
+            .with_model("srswti--bodega-raptor-90m")
+            .with_concurrency(3);
+        let drafts = summarizer.summarize_chunks(&chunks).unwrap();
+        assert_eq!(drafts.len(), 3, "all three chunks should get summaries");
+        for draft in &drafts {
+            assert!(!draft.summary.is_empty(), "summary should not be empty");
+            println!("  {}: {}", draft.chunk_id, draft.summary);
         }
     }
 }
