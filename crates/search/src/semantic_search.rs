@@ -5,6 +5,7 @@ use matryoshka_core_ir::{
 };
 use matryoshka_embed_client::{Embedder, cosine};
 use matryoshka_store_sqlite::MatryoshkaStore;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -20,6 +21,27 @@ pub struct SearchEngine<M> {
     embedder: M,
     reranker: Option<Box<dyn Reranker>>,
     late_interaction: bool,
+    dense_enabled: bool,
+    result_granularity: SearchResultGranularity,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SearchResultGranularity {
+    /// Collapse file/symbol/snippet/chunk hits into one file-level result.
+    File,
+    /// Return raw matching records without file-level collapse.
+    Record,
+    /// Return only symbol records.
+    Symbol,
+    /// Return only function/class/method code chunk records.
+    Chunk,
+}
+
+impl Default for SearchResultGranularity {
+    fn default() -> Self {
+        Self::File
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -36,6 +58,8 @@ impl<M: Embedder> SearchEngine<M> {
             embedder,
             reranker: None,
             late_interaction: true,
+            dense_enabled: true,
+            result_granularity: SearchResultGranularity::File,
         }
     }
 
@@ -46,6 +70,16 @@ impl<M: Embedder> SearchEngine<M> {
 
     pub fn with_late_interaction(mut self, enabled: bool) -> Self {
         self.late_interaction = enabled;
+        self
+    }
+
+    pub fn with_dense(mut self, enabled: bool) -> Self {
+        self.dense_enabled = enabled;
+        self
+    }
+
+    pub fn with_result_granularity(mut self, granularity: SearchResultGranularity) -> Self {
+        self.result_granularity = granularity;
         self
     }
 
@@ -68,11 +102,14 @@ impl<M: Embedder> SearchEngine<M> {
 
     pub fn search(&self, query: &str, limit: usize) -> Result<Vec<SearchHit>> {
         let plan = plan_query(query);
-        let query_embedding = self
-            .embedder
-            .embed(&[query.to_string()])?
-            .pop()
-            .unwrap_or_default();
+        let query_embedding = if self.dense_enabled {
+            self.embedder
+                .embed(&[query.to_string()])?
+                .pop()
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
         let records = self.store.load_all_semantic_records()?;
         let query_tokens = tokens(query);
         let candidates = collect_candidates(
@@ -101,7 +138,7 @@ impl<M: Embedder> SearchEngine<M> {
             .collect::<Vec<_>>();
         self.apply_late_interaction(&query_tokens, &mut hits)?;
         self.apply_reranker(query, &mut hits, &candidate_records)?;
-        hits = collapse_file_hits(hits, &candidate_records);
+        hits = apply_result_granularity(hits, &candidate_records, self.result_granularity);
         hits.sort_by(|left, right| {
             right
                 .score
@@ -118,7 +155,11 @@ impl<M: Embedder> SearchEngine<M> {
         query_tokens: &[String],
         hits: &mut [SearchHit],
     ) -> Result<()> {
-        if !self.late_interaction || query_tokens.is_empty() || hits.is_empty() {
+        if !self.dense_enabled
+            || !self.late_interaction
+            || query_tokens.is_empty()
+            || hits.is_empty()
+        {
             return Ok(());
         }
 
@@ -276,13 +317,22 @@ impl<M: Embedder> SearchEngine<M> {
                 matryoshka_core_ir::SemanticEntityType::Snippet
                 | matryoshka_core_ir::SemanticEntityType::Symbol
                 | matryoshka_core_ir::SemanticEntityType::CodeChunk => {
-                    if let Some(card) = file_cards
+                    if self.result_granularity == SearchResultGranularity::File {
+                        if let Some(card) = file_cards
+                            .get(&hit.path)
+                            .or_else(|| file_cards.get(&hit.entity_id))
+                        {
+                            apply_file_card(hit, card, record);
+                        } else if let Some(record) = record {
+                            apply_record_hit(hit, record);
+                        }
+                    } else if let Some(record) = record {
+                        apply_record_hit(hit, record);
+                    } else if let Some(card) = file_cards
                         .get(&hit.path)
                         .or_else(|| file_cards.get(&hit.entity_id))
                     {
                         apply_file_card(hit, card, record);
-                    } else if let Some(record) = record {
-                        apply_record_fallback(hit, record);
                     }
                 }
             }
@@ -392,6 +442,32 @@ fn candidate_limit(limit: usize) -> usize {
         .max(8)
         .saturating_mul(DEFAULT_CANDIDATE_MULTIPLIER)
         .max(96)
+}
+
+fn apply_result_granularity(
+    hits: Vec<SearchHit>,
+    records: &[SemanticRecord],
+    granularity: SearchResultGranularity,
+) -> Vec<SearchHit> {
+    match granularity {
+        SearchResultGranularity::File => collapse_file_hits(hits, records),
+        SearchResultGranularity::Record => hits,
+        SearchResultGranularity::Symbol => {
+            filter_hits_by_entity_type(hits, SemanticEntityType::Symbol)
+        }
+        SearchResultGranularity::Chunk => {
+            filter_hits_by_entity_type(hits, SemanticEntityType::CodeChunk)
+        }
+    }
+}
+
+fn filter_hits_by_entity_type(
+    hits: Vec<SearchHit>,
+    entity_type: SemanticEntityType,
+) -> Vec<SearchHit> {
+    hits.into_iter()
+        .filter(|hit| hit.entity_type == entity_type)
+        .collect()
 }
 
 fn collapse_file_hits(hits: Vec<SearchHit>, records: &[SemanticRecord]) -> Vec<SearchHit> {
@@ -1018,8 +1094,87 @@ fn apply_repo_card(hit: &mut SearchHit, card: &RepoCard) {
     ]));
 }
 
+fn apply_record_hit(hit: &mut SearchHit, record: &SemanticRecord) {
+    match record.entity_type {
+        SemanticEntityType::CodeChunk => apply_code_chunk_record(hit, record),
+        SemanticEntityType::Symbol => apply_symbol_record(hit, record),
+        SemanticEntityType::Snippet => apply_snippet_record(hit, record),
+        _ => apply_record_fallback(hit, record),
+    }
+}
+
+fn apply_code_chunk_record(hit: &mut SearchHit, record: &SemanticRecord) {
+    hit.summary =
+        content_field(&record.content, "summary").or_else(|| non_empty(record.content.clone()));
+    let mut description_parts = Vec::new();
+    if let Some(symbol) = content_field(&record.content, "symbol") {
+        push_labeled(&mut description_parts, "Symbol", &symbol);
+    }
+    if let Some(kind) = content_field(&record.content, "kind") {
+        push_labeled(&mut description_parts, "Kind", &kind);
+    }
+    if let Some(signature) = content_field(&record.content, "signature") {
+        push_labeled(&mut description_parts, "Signature", &signature);
+    }
+    if let Some(line_range) = record_line_range(record) {
+        push_labeled(&mut description_parts, "Lines", &line_range);
+    }
+    if let Some(summary_source) = record
+        .metadata
+        .get("summary_source")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+    {
+        push_labeled(&mut description_parts, "Summary source", summary_source);
+    }
+    hit.description = non_empty(description_parts.join("\n"));
+}
+
+fn apply_symbol_record(hit: &mut SearchHit, record: &SemanticRecord) {
+    hit.summary =
+        content_field(&record.content, "signature").or_else(|| non_empty(record.content.clone()));
+    let mut description_parts = Vec::new();
+    if let Some(symbol) = content_field(&record.content, "symbol") {
+        push_labeled(&mut description_parts, "Symbol", &symbol);
+    }
+    if let Some(kind) = content_field(&record.content, "kind") {
+        push_labeled(&mut description_parts, "Kind", &kind);
+    }
+    push_labeled(&mut description_parts, "File", &record.path);
+    hit.description = non_empty(description_parts.join("\n"));
+}
+
+fn apply_snippet_record(hit: &mut SearchHit, record: &SemanticRecord) {
+    hit.summary = non_empty(record.content.clone());
+    let mut description_parts = Vec::new();
+    if let Some(start_line) = record.metadata.get("start_line").and_then(Value::as_u64) {
+        push_labeled(
+            &mut description_parts,
+            "Start line",
+            &start_line.to_string(),
+        );
+    }
+    hit.description = non_empty(description_parts.join("\n"));
+}
+
 fn apply_record_fallback(hit: &mut SearchHit, record: &SemanticRecord) {
     hit.summary = non_empty(record.content.clone());
+}
+
+fn content_field(content: &str, key: &str) -> Option<String> {
+    let prefix = format!("{key}: ");
+    content
+        .lines()
+        .find_map(|line| line.strip_prefix(&prefix))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+}
+
+fn record_line_range(record: &SemanticRecord) -> Option<String> {
+    let start = record.metadata.get("start_line").and_then(Value::as_u64)?;
+    let end = record.metadata.get("end_line").and_then(Value::as_u64)?;
+    Some(format!("{start}-{end}"))
 }
 
 fn symbol_description(card: &FileCard, record: &SemanticRecord) -> String {

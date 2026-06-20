@@ -502,14 +502,67 @@ pub struct ArtifactQualityReport {
     pub empty_folder_summary_samples: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum RetrievalPrimary {
+    Fts,
+    Splade,
+    Dense,
+    #[default]
+    Hybrid,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RetrievalConfig {
+    pub primary: RetrievalPrimary,
+    pub dense_enabled: bool,
+    pub dense_fallback_enabled: bool,
+}
+
+impl Default for RetrievalConfig {
+    fn default() -> Self {
+        Self {
+            primary: RetrievalPrimary::Hybrid,
+            dense_enabled: true,
+            dense_fallback_enabled: true,
+        }
+    }
+}
+
+fn default_true() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RetrievalIndexReport {
     pub semantic_records: usize,
     pub embedded_records: usize,
     pub fts_records: usize,
     pub late_vector_rows: usize,
     pub records_with_late_vectors: usize,
+    #[serde(default)]
+    pub retrieval_primary: RetrievalPrimary,
+    #[serde(default = "default_true")]
+    pub dense_enabled: bool,
+    #[serde(default = "default_true")]
+    pub dense_fallback_enabled: bool,
     pub late_interaction_enabled: bool,
+}
+
+impl Default for RetrievalIndexReport {
+    fn default() -> Self {
+        Self {
+            semantic_records: 0,
+            embedded_records: 0,
+            fts_records: 0,
+            late_vector_rows: 0,
+            records_with_late_vectors: 0,
+            retrieval_primary: RetrievalPrimary::Hybrid,
+            dense_enabled: true,
+            dense_fallback_enabled: true,
+            late_interaction_enabled: true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -567,6 +620,10 @@ pub enum MatryoshkaProgressEvent {
         batch_index: usize,
         total_batches: usize,
         records_in_batch: usize,
+    },
+    EmbeddingSkipped {
+        record_count: usize,
+        reason: String,
     },
     WritingDatabase {
         records_written: Option<usize>,

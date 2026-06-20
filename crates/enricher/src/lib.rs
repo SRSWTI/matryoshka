@@ -8,8 +8,8 @@ pub use prompts::*;
 
 use anyhow::Result;
 use matryoshka_core_ir::{
-    CodeChunkFact, FileCard, FileEnrichmentContext, FileFact, FolderCard, FolderEnrichmentContext,
-    FolderFact, RepoCard, SymbolFact,
+    ChunkSummarySource, CodeChunkFact, FileCard, FileEnrichmentContext, FileFact, FolderCard,
+    FolderEnrichmentContext, FolderFact, RepoCard, SymbolFact,
 };
 
 pub trait CodeEnricher {
@@ -35,6 +35,7 @@ pub trait CodeEnricher {
 pub struct ChunkSummaryDraft {
     pub chunk_id: String,
     pub summary: String,
+    pub source: ChunkSummarySource,
 }
 
 /// Summarizes code chunks that have no useful docstring/doc comment.

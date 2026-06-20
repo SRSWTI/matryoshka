@@ -2,8 +2,8 @@ use crate::{ChunkSummarizer, ChunkSummaryDraft, CodeEnricher};
 use anyhow::Result;
 use chrono::Utc;
 use matryoshka_core_ir::{
-    CodeChunkFact, DependencyInterpretation, FileCard, FileEnrichmentContext, FileFact,
-    FileOwnershipKind, FolderCard, FolderEnrichmentContext, FolderFact, Provenance,
+    ChunkSummarySource, CodeChunkFact, DependencyInterpretation, FileCard, FileEnrichmentContext,
+    FileFact, FileOwnershipKind, FolderCard, FolderEnrichmentContext, FolderFact, Provenance,
     RelatedFileContext, RepoCard, SubareaSummary, SymbolBehavior, SymbolFact,
 };
 
@@ -783,6 +783,7 @@ impl ChunkSummarizer for HeuristicChunkSummarizer {
             .map(|chunk| ChunkSummaryDraft {
                 chunk_id: chunk.chunk_id.clone(),
                 summary: heuristic_chunk_summary(chunk),
+                source: ChunkSummarySource::Heuristic,
             })
             .collect())
     }

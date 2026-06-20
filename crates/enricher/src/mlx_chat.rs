@@ -6,8 +6,8 @@ use crate::{
 use anyhow::{Context, Result, anyhow};
 use chrono::Utc;
 use matryoshka_core_ir::{
-    FileCard, FileEnrichmentContext, FileFact, FolderCard, FolderEnrichmentContext, FolderFact,
-    Provenance, RepoCard, SubareaSummary, SymbolFact,
+    ChunkSummarySource, FileCard, FileEnrichmentContext, FileFact, FolderCard,
+    FolderEnrichmentContext, FolderFact, Provenance, RepoCard, SubareaSummary, SymbolFact,
 };
 use reqwest::blocking::Client;
 use reqwest::blocking::Response;
@@ -1098,6 +1098,7 @@ impl ChunkSummarizer for MlxChunkSummarizer {
                     Ok(ChunkSummaryDraft {
                         chunk_id: chunk.chunk_id.clone(),
                         summary,
+                        source: ChunkSummarySource::Llm,
                     })
                 })
                 .collect()
@@ -1149,6 +1150,7 @@ impl ChunkSummarizer for MlxChunkSummarizer {
                         Ok(ChunkSummaryDraft {
                             chunk_id: chunk.chunk_id.clone(),
                             summary,
+                            source: ChunkSummarySource::Llm,
                         })
                     })
                     .collect()
