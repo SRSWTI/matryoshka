@@ -24,7 +24,7 @@ No useful docstring/doc comment
 | Milestone | Status | Summary |
 |---|---|---|
 | M1 — Code chunk extraction + doc extraction | ✅ Complete | Parser emits `CodeChunkFact` per symbol with full body + docstring/doc-comment summaries |
-| M2 — Concurrent LLM chunk summaries + chunk semantic records | 🔄 In progress | Chunk summarizer trait + MLX/Raptor concurrent impl done & live-tested; indexer wiring + chunk semantic records next |
+| M2 — Concurrent LLM chunk summaries + chunk semantic records | ✅ Complete | MLX/Raptor summarizes empty chunks concurrently; `code_chunk` semantic records built in target template; CLI/API flags wired |
 | M3 — Retrieval config, dense optional | ⬜ Not started | Make dense embeddings optional via CLI/API flags; stage-based candidate collection |
 | M4 — SPLADE primary retrieval | ⬜ Not started | SPLADE sparse index + postings storage; SPLADE-first scoring |
 | M5 — Measurement & recall comparison | ⬜ Not started | Retrieval diagnostics + eval harness for SPLADE-only vs hybrid |
@@ -232,7 +232,7 @@ After the fix, `/Users/rohit/pi` `doc_comment` count dropped 2719 → 2363
 
 ---
 
-## Milestone 2 — Concurrent LLM Chunk Summaries + Chunk Semantic Records 🔄
+## Milestone 2 — Concurrent LLM Chunk Summaries + Chunk Semantic Records ✅
 
 ### Goal
 
@@ -287,18 +287,27 @@ target template and persist them so search can use them.
 
 - **`rayon` added** to `crates/enricher/Cargo.toml` for the concurrent thread pool.
 
-#### Next (indexer wiring + chunk semantic records)
+#### Done (indexer wiring + chunk semantic records)
 
-- `crates/indexer/src/indexer.rs` — during `refresh_artifacts`:
-  - Filter chunks to those with `summary_source == Empty` (or generic/short docs).
-  - Call `ChunkSummarizer::summarize_chunks` for those chunks only.
-  - Map returned `ChunkSummaryDraft`s back onto chunks by `chunk_id`.
-  - Set `generated_summary`, `summary`, and `summary_source = Llm` (or `Heuristic` on fallback).
-  - Skip unchanged chunks by `source_hash` for incremental updates.
-  - Build `code_chunk` semantic records in the target template.
-  - Persist updated chunks + semantic records to the store.
-- `crates/api/src/lib.rs` — `MatryoshkaConfig` gains `chunk_summary_enabled`, `chunk_summary_model`, `chunk_summary_concurrency`.
-- `crates/cli/src/main.rs` — `--chunk-summary-model`, `--chunk-summary-concurrency`, `--no-chunk-summaries` flags on `prepare`/`index`/`update`/`rebuild-semantic`.
+- `crates/indexer/src/indexer.rs`:
+  - `FullIndexer` now generic over `S: ChunkSummarizer` (3rd type param, defaults to `HeuristicChunkSummarizer`).
+  - `refresh_chunk_summaries()` method: filters `Empty` chunks in affected files, calls `ChunkSummarizer`, maps drafts back by `chunk_id`, sets `generated_summary`/`summary`/`summary_source = Llm`, persists via `upsert_code_chunks`, builds `code_chunk` semantic records.
+  - Heuristic fallback if LLM fails entirely (summaries prefixed with `[heuristic]`).
+  - Incremental: only summarizes chunks in `affected_file_ids`.
+  - `code_chunk_semantic_records()` helper builds records in the target template.
+  - Chunk records added to `raw_records` so they get embedded + FTS-indexed.
+- `crates/core-ir/src/models.rs`: added `EnrichingChunks`/`EnrichedChunks` progress events.
+- `crates/api/src/lib.rs`: `MatryoshkaConfig` gains `chunk_summary_enabled`, `chunk_summary_model`, `chunk_summary_concurrency` + builders; `indexer_progress_state` handles new events.
+- `crates/cli/src/main.rs`: `--chunk-summary-model`, `--chunk-summary-concurrency`, `--no-chunk-summaries` flags on `index` and `update`; offline uses `HeuristicChunkSummarizer`, online uses `MlxChunkSummarizer`.
+- All call sites updated to pass a chunk summarizer (tests, CLI, API).
+
+#### Live end-to-end test
+
+Indexed a 2-function Rust file (1 documented, 1 undocumented) against `http://127.0.0.1:44449` with `srswti--bodega-raptor-90m`:
+- `documented_function` → `doc_comment`, no LLM call.
+- `undocumented_function` → `llm`, summary: `"The undocumented function takes two i32 parameters, sums them, and multiplies them, returning the sum."`
+- Chunk semantic record built in target template (path/symbol/kind/signature/summary/code).
+- `enriching_chunks`/`enriched_chunks` progress events emitted correctly.
 
 ### LLM call shape (one chunk per request)
 

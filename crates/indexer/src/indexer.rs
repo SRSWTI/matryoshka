@@ -6,9 +6,7 @@ use matryoshka_core_ir::{
     RetrievalIndexReport, SemanticEntityType, SemanticRecord,
 };
 use matryoshka_embed_client::Embedder;
-use matryoshka_enricher::{
-    ChunkSummarizer, ChunkSummaryDraft, CodeEnricher, HeuristicChunkSummarizer,
-};
+use matryoshka_enricher::{ChunkSummarizer, CodeEnricher, HeuristicChunkSummarizer};
 use matryoshka_parser::{ParserConfig, SourceParser};
 use matryoshka_resolver::GraphResolver;
 use matryoshka_store_sqlite::MatryoshkaStore;
@@ -1477,7 +1475,15 @@ where
             None
         };
 
+        // ---- Milestone 2: summarize code chunks that have no useful doc ----
+        let chunk_records =
+            match self.refresh_chunk_summaries(snapshot, affected_file_ids, progress) {
+                Ok(records) => records,
+                Err(err) => return fail_with_progress("summarizing_code_chunks", err, progress),
+            };
+
         let mut raw_records = selected_embedded_raw_records(snapshot, affected_file_ids);
+        raw_records.extend(chunk_records);
         let mut card_records =
             card_semantic_records(&file_cards, &folder_cards, repo_card.as_ref());
         let raw_batches = selected_batch_count(&raw_records, |_| true);
@@ -1792,6 +1798,121 @@ where
             })
         })
     }
+
+    /// Summarize code chunks that have no useful docstring/doc comment, persist
+    /// the updated chunks to the store, and build `code_chunk` semantic records
+    /// in the target template for retrieval.
+    ///
+    /// Only chunks with `summary_source == Empty` (or generic/short docs) are
+    /// sent to the LLM. Chunks with useful docs are used directly. Chunks in
+    /// files whose `source_hash` is unchanged are skipped entirely.
+    fn refresh_chunk_summaries(
+        &self,
+        snapshot: &RepositorySnapshot,
+        affected_file_ids: &BTreeSet<String>,
+        progress: &mut dyn FnMut(MatryoshkaProgressEvent),
+    ) -> Result<Vec<SemanticRecord>> {
+        if !self.chunk_summary_enabled {
+            return Ok(Vec::new());
+        }
+
+        // Collect chunks that need summarization: affected files + Empty source.
+        let affected: BTreeSet<&str> = affected_file_ids.iter().map(String::as_str).collect();
+        let chunks_to_summarize: Vec<CodeChunkFact> = snapshot
+            .code_chunks
+            .iter()
+            .filter(|chunk| {
+                // Only summarize chunks in affected files (incremental).
+                if !affected_file_ids.is_empty() && !affected.contains(chunk.file_id.as_str()) {
+                    return false;
+                }
+                // Only summarize chunks that actually need a generated summary.
+                chunk.summary_source == ChunkSummarySource::Empty
+            })
+            .cloned()
+            .collect();
+
+        if chunks_to_summarize.is_empty() {
+            // Still build semantic records for all chunks (docs + any previously
+            // generated summaries) so they're searchable.
+            return Ok(code_chunk_semantic_records(&snapshot.code_chunks));
+        }
+
+        progress(MatryoshkaProgressEvent::EnrichingChunks {
+            chunk_count: chunks_to_summarize.len(),
+        });
+
+        let drafts = match self.chunk_summarizer.summarize_chunks_with_progress(
+            &chunks_to_summarize,
+            &mut |batch_index, total_batches, chunks_in_batch| {
+                progress(MatryoshkaProgressEvent::EnrichingChunkBatch {
+                    batch_index,
+                    total_batches,
+                    chunks_in_batch,
+                });
+                progress(MatryoshkaProgressEvent::EnrichedChunkBatch {
+                    batch_index,
+                    total_batches,
+                    chunks_in_batch,
+                });
+            },
+        ) {
+            Ok(drafts) => drafts,
+            Err(_err) => {
+                // If LLM summarization fails entirely, fall back to heuristic
+                // summaries so chunks still get a (grounded) summary record.
+                let fallback = matryoshka_enricher::HeuristicChunkSummarizer;
+                fallback
+                    .summarize_chunks(&chunks_to_summarize)?
+                    .into_iter()
+                    .map(|mut d| {
+                        // Mark as heuristic so we know it wasn't LLM-generated.
+                        d.summary = format!("[heuristic] {}", d.summary);
+                        d
+                    })
+                    .collect()
+            }
+        };
+
+        // Map drafts back onto chunks by chunk_id.
+        let drafts_by_id: BTreeMap<String, String> = drafts
+            .into_iter()
+            .map(|d| (d.chunk_id, d.summary))
+            .collect();
+
+        // Build the full updated chunk list: update summarized chunks, keep
+        // the rest as-is.
+        let updated_chunks: Vec<CodeChunkFact> = snapshot
+            .code_chunks
+            .iter()
+            .map(|chunk| {
+                if let Some(summary) = drafts_by_id.get(&chunk.chunk_id) {
+                    let mut updated = chunk.clone();
+                    updated.generated_summary = Some(summary.clone());
+                    updated.summary = summary.clone();
+                    updated.summary_source = ChunkSummarySource::Llm;
+                    updated
+                } else {
+                    chunk.clone()
+                }
+            })
+            .collect();
+
+        // Persist updated chunks to the store.
+        progress(MatryoshkaProgressEvent::WritingDatabase {
+            records_written: Some(updated_chunks.len()),
+        });
+        if let Err(err) = self.store.upsert_code_chunks(&updated_chunks) {
+            return fail_with_progress("writing_code_chunks", err, progress);
+        }
+
+        progress(MatryoshkaProgressEvent::EnrichedChunks {
+            chunk_count: drafts_by_id.len(),
+        });
+
+        // Build semantic records for ALL chunks (docs + generated).
+        Ok(code_chunk_semantic_records(&updated_chunks))
+    }
 }
 
 fn card_semantic_records(
@@ -1880,6 +2001,62 @@ fn card_semantic_records(
         records.push(repo_card_semantic_record(card));
     }
     records
+}
+
+/// Build `code_chunk` semantic records in the target template:
+///
+/// ```text
+/// path: crates/foo/src/bar.rs
+/// symbol: Foo::handle_resume_countdown
+/// kind: method
+/// signature: fn handle_resume_countdown(&mut self, ...)
+/// summary: Resumes attack mode after handoff, cancels the countdown, and updates state.
+/// code:
+/// fn handle_resume_countdown(...) {
+///     ...
+/// }
+/// ```
+fn code_chunk_semantic_records(chunks: &[CodeChunkFact]) -> Vec<SemanticRecord> {
+    chunks
+        .iter()
+        .filter(|chunk| !chunk.summary.is_empty())
+        .map(|chunk| {
+            let symbol = chunk
+                .qualified_name
+                .as_deref()
+                .or(chunk.symbol.as_deref())
+                .unwrap_or("<unknown>");
+            let kind = format!("{:?}", chunk.kind).to_ascii_lowercase();
+            let content = format!(
+                "path: {}\nsymbol: {}\nkind: {}\nsignature: {}\nsummary: {}\ncode:\n{}",
+                chunk.path, symbol, kind, chunk.signature, chunk.summary, chunk.code
+            );
+            let title = format!("CodeChunk {} in {}", symbol, chunk.path);
+            let record_id = format!("semantic:code_chunk:{}", chunk.chunk_id);
+            let metadata = BTreeMap::from([
+                ("kind".into(), json!("code_chunk")),
+                (
+                    "summary_source".into(),
+                    json!(format!("{:?}", chunk.summary_source).to_ascii_lowercase()),
+                ),
+                ("symbol_id".into(), json!(chunk.symbol_id)),
+                ("qualified_name".into(), json!(chunk.qualified_name)),
+                ("start_line".into(), json!(chunk.start_line)),
+                ("end_line".into(), json!(chunk.end_line)),
+            ]);
+            SemanticRecord {
+                record_id,
+                entity_id: chunk.chunk_id.clone(),
+                entity_type: SemanticEntityType::CodeChunk,
+                title,
+                content,
+                path: chunk.path.clone(),
+                source_hash: chunk.source_hash.clone(),
+                embedding: None,
+                metadata,
+            }
+        })
+        .collect()
 }
 
 fn repo_card_semantic_record(card: &RepoCard) -> SemanticRecord {

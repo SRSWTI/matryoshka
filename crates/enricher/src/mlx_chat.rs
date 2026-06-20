@@ -1120,6 +1120,59 @@ impl ChunkSummarizer for MlxChunkSummarizer {
         }
         Ok(ok)
     }
+
+    fn summarize_chunks_with_progress(
+        &self,
+        chunks: &[CodeChunkFact],
+        progress: &mut dyn FnMut(usize, usize, usize),
+    ) -> Result<Vec<ChunkSummaryDraft>> {
+        if chunks.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        const BATCH_SIZE: usize = 32;
+        let total_batches = chunks.len().div_ceil(BATCH_SIZE);
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(self.concurrency)
+            .build()
+            .map_err(anyhow::Error::from)?;
+
+        let mut all_drafts = Vec::with_capacity(chunks.len());
+        for (batch_index, batch) in chunks.chunks(BATCH_SIZE).enumerate() {
+            progress(batch_index + 1, total_batches, batch.len());
+
+            let drafts: Vec<Result<ChunkSummaryDraft>> = pool.install(|| {
+                batch
+                    .par_iter()
+                    .map(|chunk| {
+                        let summary = self.summarize_one(chunk)?;
+                        Ok(ChunkSummaryDraft {
+                            chunk_id: chunk.chunk_id.clone(),
+                            summary,
+                        })
+                    })
+                    .collect()
+            });
+
+            for result in drafts {
+                match result {
+                    Ok(draft) => all_drafts.push(draft),
+                    Err(_err) => {
+                        // Individual chunk failures are tolerated; only fail if
+                        // the entire batch failed.
+                    }
+                }
+            }
+        }
+
+        if all_drafts.is_empty() {
+            return Err(anyhow!(
+                "all chunk summary requests failed across {} batches",
+                total_batches
+            ));
+        }
+        Ok(all_drafts)
+    }
 }
 
 #[cfg(test)]

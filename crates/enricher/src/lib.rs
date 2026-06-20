@@ -44,4 +44,17 @@ pub struct ChunkSummaryDraft {
 /// used directly and never passed to the summarizer.
 pub trait ChunkSummarizer {
     fn summarize_chunks(&self, chunks: &[CodeChunkFact]) -> Result<Vec<ChunkSummaryDraft>>;
+
+    /// Summarize chunks with a progress callback. The callback is invoked once
+    /// per batch with `(batch_index, total_batches, chunks_in_batch)`.
+    ///
+    /// Default implementation delegates to `summarize_chunks` without progress.
+    fn summarize_chunks_with_progress(
+        &self,
+        chunks: &[CodeChunkFact],
+        progress: &mut dyn FnMut(usize, usize, usize),
+    ) -> Result<Vec<ChunkSummaryDraft>> {
+        let _ = progress;
+        self.summarize_chunks(chunks)
+    }
 }

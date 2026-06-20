@@ -71,6 +71,12 @@ enum Command {
         no_late_interaction: bool,
         #[arg(long, default_value_t = false)]
         json: bool,
+        #[arg(long = "chunk-summary-model", default_value = DEFAULT_CHUNK_SUMMARY_MODEL)]
+        chunk_summary_model: String,
+        #[arg(long = "chunk-summary-concurrency", default_value_t = DEFAULT_CHUNK_SUMMARY_CONCURRENCY)]
+        chunk_summary_concurrency: usize,
+        #[arg(long, default_value_t = false)]
+        no_chunk_summaries: bool,
     },
     Index {
         repo_root: PathBuf,
@@ -360,6 +366,9 @@ fn main() -> Result<()> {
             queries,
             no_late_interaction,
             json,
+            chunk_summary_model,
+            chunk_summary_concurrency,
+            no_chunk_summaries,
         } => {
             let db = resolve_db_path(db, Some(&repo_root))?;
             ensure_matryoshka_layout(&db)?;
@@ -375,6 +384,9 @@ fn main() -> Result<()> {
                 limit,
                 queries,
                 late_interaction: !no_late_interaction,
+                chunk_summary_model,
+                chunk_summary_concurrency,
+                no_chunk_summaries,
             })?;
             if json {
                 println!(
@@ -1041,6 +1053,9 @@ struct PrepareOptions {
     limit: usize,
     queries: Vec<String>,
     late_interaction: bool,
+    chunk_summary_model: String,
+    chunk_summary_concurrency: usize,
+    no_chunk_summaries: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -1516,6 +1531,9 @@ fn run_update_once(
     embed_model: &str,
     chat_model: &str,
     parser_config: ParserConfig,
+    chunk_summary_model: &str,
+    chunk_summary_concurrency: usize,
+    chunk_summary_enabled: bool,
     mut log: Option<&mut CommandLog>,
 ) -> Result<UpdateSummary> {
     if let Some(log) = log.as_deref_mut() {
@@ -1542,8 +1560,12 @@ fn run_update_once(
     } else {
         let enricher = MlxChatEnricher::new(base_url, api_key).with_model(chat_model.to_string());
         let embedder = EndpointEmbedder::new(base_url, api_key, embed_model.to_string());
-        FullIndexer::new(store, enricher, embedder, HeuristicChunkSummarizer)
+        let chunk_summarizer = MlxChunkSummarizer::new(base_url, api_key)
+            .with_model(chunk_summary_model)
+            .with_concurrency(chunk_summary_concurrency);
+        FullIndexer::new(store, enricher, embedder, chunk_summarizer)
             .with_parser_config(parser_config)
+            .with_chunk_summary_enabled(chunk_summary_enabled)
             .update_repo(repo_root)?
     };
     if let Some(log) = log.as_deref_mut() {
@@ -1574,6 +1596,9 @@ fn run_rebuild_semantic_once(
     base_url: &str,
     api_key: &str,
     embed_model: &str,
+    chunk_summary_model: &str,
+    chunk_summary_concurrency: usize,
+    chunk_summary_enabled: bool,
     mut log: Option<&mut CommandLog>,
 ) -> Result<SemanticRebuildSummary> {
     if let Some(log) = log.as_deref_mut() {
@@ -1597,12 +1622,16 @@ fn run_rebuild_semantic_once(
         )
         .rebuild_semantic_index(repo_root)?
     } else {
+        let chunk_summarizer = MlxChunkSummarizer::new(base_url, api_key)
+            .with_model(chunk_summary_model)
+            .with_concurrency(chunk_summary_concurrency);
         FullIndexer::new(
             store,
             HeuristicEnricher,
             EndpointEmbedder::new(base_url, api_key, embed_model.to_string()),
-            HeuristicChunkSummarizer,
+            chunk_summarizer,
         )
+        .with_chunk_summary_enabled(chunk_summary_enabled)
         .rebuild_semantic_index(repo_root)?
     };
     if let Some(log) = log.as_deref_mut() {

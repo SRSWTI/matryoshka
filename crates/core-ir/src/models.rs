@@ -542,6 +542,22 @@ pub enum MatryoshkaProgressEvent {
         index: usize,
         total_files: usize,
     },
+    EnrichingChunks {
+        chunk_count: usize,
+    },
+    EnrichingChunkBatch {
+        batch_index: usize,
+        total_batches: usize,
+        chunks_in_batch: usize,
+    },
+    EnrichedChunkBatch {
+        batch_index: usize,
+        total_batches: usize,
+        chunks_in_batch: usize,
+    },
+    EnrichedChunks {
+        chunk_count: usize,
+    },
     EmbeddingBatch {
         batch_index: usize,
         total_batches: usize,

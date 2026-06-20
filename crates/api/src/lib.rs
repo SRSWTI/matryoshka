@@ -7,8 +7,7 @@ use matryoshka_core_ir::{
 use matryoshka_embed_client::Embedder;
 use matryoshka_embed_client::{DeterministicEmbedder, EndpointEmbedder};
 use matryoshka_enricher::{
-    ChunkSummarizer, CodeEnricher, HeuristicChunkSummarizer, HeuristicEnricher, MlxChatEnricher,
-    MlxChunkSummarizer,
+    CodeEnricher, HeuristicChunkSummarizer, HeuristicEnricher, MlxChatEnricher, MlxChunkSummarizer,
 };
 use matryoshka_indexer::{FullIndexer, SemanticRebuildSummary, UpdateSummary};
 use matryoshka_parser::ParserConfig;
@@ -1412,6 +1411,36 @@ fn indexer_progress_state(operation: &str, event: &MatryoshkaProgressEvent) -> P
             Some(path.clone()),
             Some(*index),
             Some(*total_files),
+        ),
+        MatryoshkaProgressEvent::EnrichingChunks { chunk_count }
+        | MatryoshkaProgressEvent::EnrichedChunks { chunk_count } => progress_state(
+            operation,
+            "running",
+            "summarizing_chunks",
+            "Summarizing code chunks",
+            0.34,
+            None,
+            Some(*chunk_count),
+            Some(*chunk_count),
+        ),
+        MatryoshkaProgressEvent::EnrichingChunkBatch {
+            batch_index,
+            total_batches,
+            ..
+        }
+        | MatryoshkaProgressEvent::EnrichedChunkBatch {
+            batch_index,
+            total_batches,
+            ..
+        } => progress_state(
+            operation,
+            "running",
+            "summarizing_chunks",
+            "Summarizing code chunks",
+            0.34 + ratio(*batch_index, *total_batches) * 0.10,
+            None,
+            Some(*batch_index),
+            Some(*total_batches),
         ),
         MatryoshkaProgressEvent::EmbeddingBatch {
             batch_index,
