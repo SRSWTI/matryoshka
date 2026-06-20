@@ -17,6 +17,7 @@ use matryoshka_search::{
 use matryoshka_store_sqlite::{CardSummaryRow, MatryoshkaStore, RetrievalIndexStats};
 use matryoshka_watcher::RepoWatcher;
 use serde_json::{Value, json};
+use std::collections::BTreeSet;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 #[cfg(unix)]
@@ -708,6 +709,7 @@ fn main() -> Result<()> {
             )?;
             let store = MatryoshkaStore::open(&db)?;
             let parser_config = parser_config(ignore);
+            let mut progress_writer = CliProgressStateWriter::new(&db, "index");
             if offline {
                 let indexer = FullIndexer::new(
                     store,
@@ -718,11 +720,9 @@ fn main() -> Result<()> {
                 .with_parser_config(parser_config)
                 .with_retrieval_config(retrieval_config)
                 .with_chunk_summary_enabled(!no_chunk_summaries);
-                let summary = if progress_jsonl {
-                    indexer.index_repo_with_progress(&repo_root, print_progress_jsonl)?
-                } else {
-                    indexer.index_repo(&repo_root)?
-                };
+                let summary = indexer.index_repo_with_progress(&repo_root, |event| {
+                    record_cli_progress(&mut progress_writer, progress_jsonl, event);
+                })?;
                 command_log.event("index_completed", index_summary_json(&summary))?;
                 if !progress_jsonl {
                     print_index_summary(summary);
@@ -738,11 +738,9 @@ fn main() -> Result<()> {
                     .with_parser_config(parser_config)
                     .with_retrieval_config(retrieval_config)
                     .with_chunk_summary_enabled(!no_chunk_summaries);
-                let summary = if progress_jsonl {
-                    indexer.index_repo_with_progress(&repo_root, print_progress_jsonl)?
-                } else {
-                    indexer.index_repo(&repo_root)?
-                };
+                let summary = indexer.index_repo_with_progress(&repo_root, |event| {
+                    record_cli_progress(&mut progress_writer, progress_jsonl, event);
+                })?;
                 command_log.event("index_completed", index_summary_json(&summary))?;
                 if !progress_jsonl {
                     print_index_summary(summary);
@@ -803,6 +801,7 @@ fn main() -> Result<()> {
             )?;
             let store = MatryoshkaStore::open(&db)?;
             let parser_config = parser_config(ignore);
+            let mut progress_writer = CliProgressStateWriter::new(&db, "update");
             if offline {
                 let indexer = FullIndexer::new(
                     store,
@@ -813,11 +812,9 @@ fn main() -> Result<()> {
                 .with_parser_config(parser_config)
                 .with_retrieval_config(retrieval_config)
                 .with_chunk_summary_enabled(!no_chunk_summaries);
-                let summary = if progress_jsonl {
-                    indexer.update_repo_with_progress(repo_root, print_progress_jsonl)?
-                } else {
-                    indexer.update_repo(repo_root)?
-                };
+                let summary = indexer.update_repo_with_progress(&repo_root, |event| {
+                    record_cli_progress(&mut progress_writer, progress_jsonl, event);
+                })?;
                 command_log.event("update_completed", update_summary_json(&summary))?;
                 if !progress_jsonl {
                     print_update_summary(summary);
@@ -832,11 +829,9 @@ fn main() -> Result<()> {
                     .with_parser_config(parser_config)
                     .with_retrieval_config(retrieval_config)
                     .with_chunk_summary_enabled(!no_chunk_summaries);
-                let summary = if progress_jsonl {
-                    indexer.update_repo_with_progress(repo_root, print_progress_jsonl)?
-                } else {
-                    indexer.update_repo(repo_root)?
-                };
+                let summary = indexer.update_repo_with_progress(&repo_root, |event| {
+                    record_cli_progress(&mut progress_writer, progress_jsonl, event);
+                })?;
                 command_log.event("update_completed", update_summary_json(&summary))?;
                 if !progress_jsonl {
                     print_update_summary(summary);
@@ -1216,6 +1211,7 @@ fn main() -> Result<()> {
                 }),
             )?;
             let store = MatryoshkaStore::open(&db)?;
+            let mut progress_writer = CliProgressStateWriter::new(&db, "rebuild_search");
             let summary = if offline {
                 let indexer = FullIndexer::new(
                     store,
@@ -1224,11 +1220,9 @@ fn main() -> Result<()> {
                     HeuristicChunkSummarizer,
                 )
                 .with_retrieval_config(retrieval_config);
-                if progress_jsonl {
-                    indexer.rebuild_semantic_index_with_progress(repo_root, print_progress_jsonl)?
-                } else {
-                    indexer.rebuild_semantic_index(repo_root)?
-                }
+                indexer.rebuild_semantic_index_with_progress(&repo_root, |event| {
+                    record_cli_progress(&mut progress_writer, progress_jsonl, event);
+                })?
             } else {
                 let indexer = FullIndexer::new(
                     store,
@@ -1237,11 +1231,9 @@ fn main() -> Result<()> {
                     HeuristicChunkSummarizer,
                 )
                 .with_retrieval_config(retrieval_config);
-                if progress_jsonl {
-                    indexer.rebuild_semantic_index_with_progress(repo_root, print_progress_jsonl)?
-                } else {
-                    indexer.rebuild_semantic_index(repo_root)?
-                }
+                indexer.rebuild_semantic_index_with_progress(&repo_root, |event| {
+                    record_cli_progress(&mut progress_writer, progress_jsonl, event);
+                })?
             };
             command_log.event(
                 "semantic_rebuild_completed",
@@ -1516,6 +1508,267 @@ struct WatchLoopOptions {
 struct CommandLog {
     path: PathBuf,
     file: File,
+}
+
+struct CliProgressStateWriter {
+    operation: String,
+    path: PathBuf,
+    enriched_files: BTreeSet<String>,
+    last_percent: f32,
+}
+
+impl CliProgressStateWriter {
+    fn new(db: &Path, operation: &str) -> Self {
+        Self {
+            operation: operation.into(),
+            path: progress_state_path(db),
+            enriched_files: BTreeSet::new(),
+            last_percent: 0.0,
+        }
+    }
+
+    fn record(&mut self, event: &MatryoshkaProgressEvent) {
+        let state = self.state_for_event(event);
+        if let Some(parent) = self.path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        let _ = fs::write(
+            &self.path,
+            serde_json::to_string_pretty(&state).unwrap_or_default(),
+        );
+    }
+
+    fn state_for_event(&mut self, event: &MatryoshkaProgressEvent) -> Value {
+        match event {
+            MatryoshkaProgressEvent::Started { .. } => self.state(
+                "running",
+                "starting",
+                "Starting project map",
+                0.02,
+                None,
+                None,
+                None,
+            ),
+            MatryoshkaProgressEvent::DiscoveringFiles => self.state(
+                "running",
+                "discovering",
+                "Finding project files",
+                0.04,
+                None,
+                None,
+                None,
+            ),
+            MatryoshkaProgressEvent::FilesDiscovered { total_files } => self.state(
+                "running",
+                "discovered",
+                "Project files found",
+                0.06,
+                None,
+                Some(0),
+                Some(*total_files),
+            ),
+            MatryoshkaProgressEvent::ParsingFile {
+                path,
+                index,
+                total_files,
+            }
+            | MatryoshkaProgressEvent::ParsedFile {
+                path,
+                index,
+                total_files,
+            } => self.state(
+                "running",
+                "parsing",
+                "Reading code structure",
+                0.06 + progress_ratio(*index, *total_files) * 0.22,
+                Some(path.clone()),
+                Some(*index),
+                Some(*total_files),
+            ),
+            MatryoshkaProgressEvent::EnrichingFile {
+                path, total_files, ..
+            } => self.state(
+                "running",
+                "enriching",
+                "Writing file summaries",
+                0.30 + progress_ratio(self.enriched_files.len(), *total_files) * 0.36,
+                Some(path.clone()),
+                Some(self.enriched_files.len()),
+                Some(*total_files),
+            ),
+            MatryoshkaProgressEvent::EnrichedFile {
+                path, total_files, ..
+            } => {
+                self.enriched_files.insert(path.clone());
+                self.state(
+                    "running",
+                    "enriching",
+                    "Writing file summaries",
+                    0.30 + progress_ratio(self.enriched_files.len(), *total_files) * 0.36,
+                    Some(path.clone()),
+                    Some(self.enriched_files.len()),
+                    Some(*total_files),
+                )
+            }
+            MatryoshkaProgressEvent::EnrichingChunks { chunk_count } => self.state(
+                "running",
+                "summarizing_chunks",
+                "Summarizing code chunks",
+                0.66,
+                None,
+                Some(0),
+                Some(*chunk_count),
+            ),
+            MatryoshkaProgressEvent::EnrichingChunkBatch {
+                batch_index,
+                total_batches,
+                ..
+            }
+            | MatryoshkaProgressEvent::EnrichedChunkBatch {
+                batch_index,
+                total_batches,
+                ..
+            } => self.state(
+                "running",
+                "summarizing_chunks",
+                "Summarizing code chunks",
+                0.66 + progress_ratio(*batch_index, *total_batches) * 0.10,
+                None,
+                Some(*batch_index),
+                Some(*total_batches),
+            ),
+            MatryoshkaProgressEvent::EnrichedChunks { chunk_count } => self.state(
+                "running",
+                "summarizing_chunks",
+                "Code chunks summarized",
+                0.76,
+                None,
+                Some(*chunk_count),
+                Some(*chunk_count),
+            ),
+            MatryoshkaProgressEvent::EmbeddingBatch {
+                batch_index,
+                total_batches,
+                ..
+            }
+            | MatryoshkaProgressEvent::EmbeddedBatch {
+                batch_index,
+                total_batches,
+                ..
+            } => self.state(
+                "running",
+                "embedding",
+                "Building search data",
+                0.76 + progress_ratio(*batch_index, *total_batches) * 0.14,
+                None,
+                Some(*batch_index),
+                Some(*total_batches),
+            ),
+            MatryoshkaProgressEvent::EmbeddingSkipped { record_count, .. } => self.state(
+                "running",
+                "embedding_skipped",
+                "Dense embeddings disabled; using exact/FTS search data",
+                0.90,
+                None,
+                Some(*record_count),
+                Some(*record_count),
+            ),
+            MatryoshkaProgressEvent::WritingDatabase { records_written } => self.state(
+                "running",
+                "writing",
+                "Saving Matryoshka data",
+                (self.last_percent + 0.01).min(0.92),
+                None,
+                *records_written,
+                None,
+            ),
+            MatryoshkaProgressEvent::ArtifactQuality { .. } => self.state(
+                "running",
+                "checking",
+                "Checking project map",
+                0.94,
+                None,
+                None,
+                None,
+            ),
+            MatryoshkaProgressEvent::RetrievalIndexHealth { .. } => self.state(
+                "running",
+                "checking_search",
+                "Checking search",
+                0.96,
+                None,
+                None,
+                None,
+            ),
+            MatryoshkaProgressEvent::Completed { file_count, .. } => self.state(
+                "completed",
+                "complete",
+                "Project map complete",
+                1.0,
+                None,
+                Some(*file_count),
+                Some(*file_count),
+            ),
+            MatryoshkaProgressEvent::Failed { stage, message } => self.state(
+                "failed",
+                stage,
+                message,
+                self.last_percent,
+                None,
+                None,
+                None,
+            ),
+        }
+    }
+
+    fn state(
+        &mut self,
+        status: &str,
+        phase: &str,
+        message: &str,
+        percent: f32,
+        current_file: Option<String>,
+        files_done: Option<usize>,
+        files_total: Option<usize>,
+    ) -> Value {
+        let percent = if status == "failed" {
+            percent
+        } else {
+            percent.max(self.last_percent)
+        }
+        .clamp(0.0, 1.0);
+        self.last_percent = self.last_percent.max(percent);
+        json!({
+            "operation": self.operation.clone(),
+            "status": status,
+            "phase": phase,
+            "message": message,
+            "percent": percent,
+            "current_file": current_file,
+            "files_done": files_done,
+            "files_total": files_total,
+            "updated_at_unix_ms": unix_millis(),
+        })
+    }
+}
+
+fn record_cli_progress(
+    writer: &mut CliProgressStateWriter,
+    progress_jsonl: bool,
+    event: MatryoshkaProgressEvent,
+) {
+    writer.record(&event);
+    if progress_jsonl {
+        print_progress_jsonl(event);
+    }
+}
+
+fn progress_ratio(done: usize, total: usize) -> f32 {
+    if total == 0 {
+        0.0
+    } else {
+        (done as f32 / total as f32).clamp(0.0, 1.0)
+    }
 }
 
 impl CommandLog {
@@ -2238,6 +2491,13 @@ fn logs_dir(db: &Path) -> PathBuf {
     db.parent()
         .unwrap_or_else(|| Path::new(MATRYOSHKA_DIR))
         .join("logs")
+}
+
+fn progress_state_path(db: &Path) -> PathBuf {
+    db.parent()
+        .unwrap_or_else(|| Path::new(MATRYOSHKA_DIR))
+        .join("state")
+        .join("progress.json")
 }
 
 fn ready_marker_path(db: &Path) -> PathBuf {
