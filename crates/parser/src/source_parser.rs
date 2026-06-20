@@ -556,6 +556,62 @@ mod tests {
         assert_eq!(second.summary_source, ChunkSummarySource::Empty);
         assert!(second.summary.is_empty());
     }
+
+    #[test]
+    fn typescript_jsdoc_does_not_leak_from_unrelated_function_above() {
+        // Regression: an undocumented function must NOT inherit the JSDoc of a
+        // different function that happens to sit above it in the same file.
+        let source = "/**\n * Fetches a token from the remote endpoint.\n */\nexport function fetchToken(): string {\n  return 'token';\n}\n\nexport function undocumented(): number {\n  return 42;\n}\n";
+        let lines: Vec<&str> = source.lines().collect();
+        let symbols = super::parse_symbols("client.ts", "typescript", source, &lines);
+        if symbols.is_empty() {
+            return; // tree-sitter unavailable
+        }
+        let chunks = build_code_chunks("client.ts", "typescript", &lines, &symbols, "hash");
+        let fetch = chunks
+            .iter()
+            .find(|c| c.symbol.as_deref() == Some("fetchToken"))
+            .expect("fetchToken chunk should exist");
+        assert_eq!(fetch.summary_source, ChunkSummarySource::DocComment);
+        assert!(
+            fetch
+                .summary
+                .contains("Fetches a token from the remote endpoint")
+        );
+        let undocumented = chunks
+            .iter()
+            .find(|c| c.symbol.as_deref() == Some("undocumented"))
+            .expect("undocumented chunk should exist");
+        assert_eq!(
+            undocumented.summary_source,
+            ChunkSummarySource::Empty,
+            "undocumented function must not inherit the JSDoc above"
+        );
+        assert!(undocumented.summary.is_empty());
+        assert!(
+            undocumented.doc_summary.is_none(),
+            "doc_summary must be None for undocumented function"
+        );
+    }
+
+    #[test]
+    fn typescript_jsdoc_separated_by_blank_line_is_not_attached() {
+        // A blank line between the JSDoc and the symbol means the doc is not
+        // contiguous and should not be attached.
+        let source = "/**\n * Does the thing.\n */\n\nexport function thing(): void {}\n";
+        let lines: Vec<&str> = source.lines().collect();
+        let symbols = super::parse_symbols("t.ts", "typescript", source, &lines);
+        if symbols.is_empty() {
+            return;
+        }
+        let chunks = build_code_chunks("t.ts", "typescript", &lines, &symbols, "hash");
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(
+            chunks[0].summary_source,
+            ChunkSummarySource::Empty,
+            "JSDoc separated by a blank line must not be attached"
+        );
+    }
 }
 
 fn parse_typescript_import(line: &str) -> Option<(String, Vec<String>)> {
