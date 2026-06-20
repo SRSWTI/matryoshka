@@ -6,7 +6,10 @@ use matryoshka_core_ir::{
 };
 use matryoshka_embed_client::Embedder;
 use matryoshka_embed_client::{DeterministicEmbedder, EndpointEmbedder};
-use matryoshka_enricher::{CodeEnricher, HeuristicEnricher, MlxChatEnricher};
+use matryoshka_enricher::{
+    ChunkSummarizer, CodeEnricher, HeuristicChunkSummarizer, HeuristicEnricher, MlxChatEnricher,
+    MlxChunkSummarizer,
+};
 use matryoshka_indexer::{FullIndexer, SemanticRebuildSummary, UpdateSummary};
 use matryoshka_parser::ParserConfig;
 use matryoshka_read_api::{ReadApi, ReadBundle, ReadPackMode};
@@ -33,6 +36,8 @@ pub const DEFAULT_API_KEY: &str = "2508";
 pub const DEFAULT_EMBED_MODEL: &str = "mlx-community--embeddinggemma-300m-bf16";
 pub const DEFAULT_CHAT_MODEL: &str = "MercuriusDream--Qwen3.5-4B-MLX-mxfp8";
 pub const DEFAULT_OMLX_RERANK_MODEL: &str = "mlx-community--Qwen3-Reranker-0.6B-mxfp8";
+pub const DEFAULT_CHUNK_SUMMARY_MODEL: &str = "srswti--bodega-raptor-90m";
+pub const DEFAULT_CHUNK_SUMMARY_CONCURRENCY: usize = 6;
 pub const MATRYOSHKA_DIR: &str = ".matryoshka";
 pub const DEFAULT_DB_FILE: &str = "matryoshka.db";
 pub const READY_MARKER_FILE: &str = ".jesco-prewarm-complete";
@@ -80,6 +85,9 @@ pub struct MatryoshkaConfig {
     pub chat_model: String,
     pub ignore: Vec<String>,
     pub late_interaction: bool,
+    pub chunk_summary_enabled: bool,
+    pub chunk_summary_model: String,
+    pub chunk_summary_concurrency: usize,
 }
 
 impl MatryoshkaConfig {
@@ -96,6 +104,9 @@ impl MatryoshkaConfig {
             chat_model: DEFAULT_CHAT_MODEL.into(),
             ignore: Vec::new(),
             late_interaction: true,
+            chunk_summary_enabled: true,
+            chunk_summary_model: DEFAULT_CHUNK_SUMMARY_MODEL.into(),
+            chunk_summary_concurrency: DEFAULT_CHUNK_SUMMARY_CONCURRENCY,
         }
     }
 
@@ -139,6 +150,21 @@ impl MatryoshkaConfig {
 
     pub fn with_late_interaction(mut self, enabled: bool) -> Self {
         self.late_interaction = enabled;
+        self
+    }
+
+    pub fn with_chunk_summary_enabled(mut self, enabled: bool) -> Self {
+        self.chunk_summary_enabled = enabled;
+        self
+    }
+
+    pub fn with_chunk_summary_model(mut self, model: impl Into<String>) -> Self {
+        self.chunk_summary_model = model.into();
+        self
+    }
+
+    pub fn with_chunk_summary_concurrency(mut self, concurrency: usize) -> Self {
+        self.chunk_summary_concurrency = concurrency.max(1);
         self
     }
 }
@@ -893,6 +919,7 @@ impl Matryoshka {
                 store,
                 CancellableEnricher::new(HeuristicEnricher, cancel_token.clone()),
                 CancellableEmbedder::new(DeterministicEmbedder::default(), cancel_token.clone()),
+                HeuristicChunkSummarizer,
             )
             .with_parser_config(parser_config)
             .update_repo_with_progress(&self.config.repo_root, &mut progress)?
@@ -904,12 +931,17 @@ impl Matryoshka {
                 &self.config.api_key,
                 self.config.embedding_model.clone(),
             );
+            let chunk_summarizer =
+                MlxChunkSummarizer::new(&self.config.base_url, &self.config.api_key)
+                    .with_model(&self.config.chunk_summary_model);
             FullIndexer::new(
                 store,
                 CancellableEnricher::new(enricher, cancel_token.clone()),
                 CancellableEmbedder::new(embedder, cancel_token.clone()),
+                chunk_summarizer,
             )
             .with_parser_config(parser_config)
+            .with_chunk_summary_enabled(self.config.chunk_summary_enabled)
             .update_repo_with_progress(&self.config.repo_root, &mut progress)?
         };
         cancel_token.check()?;
@@ -943,6 +975,7 @@ impl Matryoshka {
                 store,
                 CancellableEnricher::new(HeuristicEnricher, cancel_token.clone()),
                 CancellableEmbedder::new(DeterministicEmbedder::default(), cancel_token.clone()),
+                HeuristicChunkSummarizer,
             )
             .rebuild_semantic_index_with_progress(&self.config.repo_root, &mut progress)?
         } else {
@@ -957,6 +990,7 @@ impl Matryoshka {
                     ),
                     cancel_token.clone(),
                 ),
+                HeuristicChunkSummarizer,
             )
             .rebuild_semantic_index_with_progress(&self.config.repo_root, &mut progress)?
         };
