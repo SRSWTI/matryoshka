@@ -5,17 +5,18 @@ use matryoshka_enricher::{
     HeuristicChunkSummarizer, HeuristicEnricher, MlxChatEnricher, MlxChunkSummarizer,
 };
 use matryoshka_indexer::{
-    ArtifactQualityReport, FullIndexer, IndexSummary, MatryoshkaProgressEvent,
-    RetrievalIndexReport, SemanticRebuildSummary, UpdateSummary,
+    ArtifactQualityReport, FullIndexer, IndexSummary, MatryoshkaProgressEvent, RetrievalConfig,
+    RetrievalIndexReport, RetrievalPrimary, SemanticRebuildSummary, UpdateSummary,
 };
 use matryoshka_parser::{ParserConfig, SourceParser};
 use matryoshka_read_api::{ReadApi, ReadPackMode};
 use matryoshka_search::{
-    EndpointReranker, OmlxReranker, SearchEngine, SearchPrewarmSummary, default_prewarm_queries,
+    EndpointReranker, OmlxReranker, SearchEngine, SearchPrewarmSummary, SearchResultGranularity,
+    default_prewarm_queries,
 };
 use matryoshka_store_sqlite::{CardSummaryRow, MatryoshkaStore, RetrievalIndexStats};
 use matryoshka_watcher::RepoWatcher;
-use serde_json::json;
+use serde_json::{Value, json};
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 #[cfg(unix)]
@@ -77,6 +78,20 @@ enum Command {
         chunk_summary_concurrency: usize,
         #[arg(long, default_value_t = false)]
         no_chunk_summaries: bool,
+        #[arg(long = "retrieval-primary", value_enum, default_value_t = CliRetrievalPrimary::Hybrid)]
+        retrieval_primary: CliRetrievalPrimary,
+        #[arg(long = "enable-dense", default_value_t = false)]
+        enable_dense: bool,
+        #[arg(
+            long = "disable-dense",
+            visible_alias = "no-dense-embeddings",
+            default_value_t = false
+        )]
+        disable_dense: bool,
+        #[arg(long = "dense-fallback", default_value_t = false)]
+        dense_fallback: bool,
+        #[arg(long = "no-dense-fallback", default_value_t = false)]
+        no_dense_fallback: bool,
     },
     Index {
         repo_root: PathBuf,
@@ -106,6 +121,20 @@ enum Command {
         chunk_summary_concurrency: usize,
         #[arg(long, default_value_t = false)]
         no_chunk_summaries: bool,
+        #[arg(long = "retrieval-primary", value_enum, default_value_t = CliRetrievalPrimary::Hybrid)]
+        retrieval_primary: CliRetrievalPrimary,
+        #[arg(long = "enable-dense", default_value_t = false)]
+        enable_dense: bool,
+        #[arg(
+            long = "disable-dense",
+            visible_alias = "no-dense-embeddings",
+            default_value_t = false
+        )]
+        disable_dense: bool,
+        #[arg(long = "dense-fallback", default_value_t = false)]
+        dense_fallback: bool,
+        #[arg(long = "no-dense-fallback", default_value_t = false)]
+        no_dense_fallback: bool,
     },
     Update {
         repo_root: PathBuf,
@@ -131,6 +160,20 @@ enum Command {
         chunk_summary_concurrency: usize,
         #[arg(long, default_value_t = false)]
         no_chunk_summaries: bool,
+        #[arg(long = "retrieval-primary", value_enum, default_value_t = CliRetrievalPrimary::Hybrid)]
+        retrieval_primary: CliRetrievalPrimary,
+        #[arg(long = "enable-dense", default_value_t = false)]
+        enable_dense: bool,
+        #[arg(
+            long = "disable-dense",
+            visible_alias = "no-dense-embeddings",
+            default_value_t = false
+        )]
+        disable_dense: bool,
+        #[arg(long = "dense-fallback", default_value_t = false)]
+        dense_fallback: bool,
+        #[arg(long = "no-dense-fallback", default_value_t = false)]
+        no_dense_fallback: bool,
     },
     Watch {
         repo_root: PathBuf,
@@ -156,6 +199,20 @@ enum Command {
         daemon: bool,
         #[arg(long, default_value_t = false)]
         skip_startup_update: bool,
+        #[arg(long = "retrieval-primary", value_enum, default_value_t = CliRetrievalPrimary::Hybrid)]
+        retrieval_primary: CliRetrievalPrimary,
+        #[arg(long = "enable-dense", default_value_t = false)]
+        enable_dense: bool,
+        #[arg(
+            long = "disable-dense",
+            visible_alias = "no-dense-embeddings",
+            default_value_t = false
+        )]
+        disable_dense: bool,
+        #[arg(long = "dense-fallback", default_value_t = false)]
+        dense_fallback: bool,
+        #[arg(long = "no-dense-fallback", default_value_t = false)]
+        no_dense_fallback: bool,
     },
     RebuildSemantic {
         repo_root: PathBuf,
@@ -171,6 +228,20 @@ enum Command {
         embed_model: String,
         #[arg(long, default_value_t = false)]
         progress_jsonl: bool,
+        #[arg(long = "retrieval-primary", value_enum, default_value_t = CliRetrievalPrimary::Hybrid)]
+        retrieval_primary: CliRetrievalPrimary,
+        #[arg(long = "enable-dense", default_value_t = false)]
+        enable_dense: bool,
+        #[arg(
+            long = "disable-dense",
+            visible_alias = "no-dense-embeddings",
+            default_value_t = false
+        )]
+        disable_dense: bool,
+        #[arg(long = "dense-fallback", default_value_t = false)]
+        dense_fallback: bool,
+        #[arg(long = "no-dense-fallback", default_value_t = false)]
+        no_dense_fallback: bool,
     },
     Search {
         #[arg(long)]
@@ -198,6 +269,31 @@ enum Command {
         omlx_rerank_candidates: usize,
         #[arg(long, default_value_t = false)]
         no_late_interaction: bool,
+        #[arg(long = "retrieval-primary", value_enum, default_value_t = CliRetrievalPrimary::Hybrid)]
+        retrieval_primary: CliRetrievalPrimary,
+        #[arg(long = "enable-dense", default_value_t = false)]
+        enable_dense: bool,
+        #[arg(
+            long = "disable-dense",
+            visible_alias = "no-dense-embeddings",
+            default_value_t = false
+        )]
+        disable_dense: bool,
+        #[arg(long = "dense-fallback", default_value_t = false)]
+        dense_fallback: bool,
+        #[arg(long = "no-dense-fallback", default_value_t = false)]
+        no_dense_fallback: bool,
+        #[arg(long = "result-granularity", value_enum, default_value_t = CliSearchResultGranularity::File)]
+        result_granularity: CliSearchResultGranularity,
+        #[arg(long = "no-collapse", default_value_t = false)]
+        no_collapse: bool,
+        #[arg(
+            long = "compact",
+            visible_alias = "hide-match-details",
+            visible_alias = "no-match-details",
+            default_value_t = false
+        )]
+        compact: bool,
     },
     Op {
         #[arg(long)]
@@ -227,6 +323,31 @@ enum Command {
         omlx_rerank_candidates: usize,
         #[arg(long, default_value_t = false)]
         no_late_interaction: bool,
+        #[arg(long = "retrieval-primary", value_enum, default_value_t = CliRetrievalPrimary::Hybrid)]
+        retrieval_primary: CliRetrievalPrimary,
+        #[arg(long = "enable-dense", default_value_t = false)]
+        enable_dense: bool,
+        #[arg(
+            long = "disable-dense",
+            visible_alias = "no-dense-embeddings",
+            default_value_t = false
+        )]
+        disable_dense: bool,
+        #[arg(long = "dense-fallback", default_value_t = false)]
+        dense_fallback: bool,
+        #[arg(long = "no-dense-fallback", default_value_t = false)]
+        no_dense_fallback: bool,
+        #[arg(long = "result-granularity", value_enum, default_value_t = CliSearchResultGranularity::File)]
+        result_granularity: CliSearchResultGranularity,
+        #[arg(long = "no-collapse", default_value_t = false)]
+        no_collapse: bool,
+        #[arg(
+            long = "compact",
+            visible_alias = "hide-match-details",
+            visible_alias = "no-match-details",
+            default_value_t = false
+        )]
+        compact: bool,
     },
     Prewarm {
         #[arg(long)]
@@ -253,6 +374,20 @@ enum Command {
         watch: bool,
         #[arg(long, default_value_t = false)]
         watch_daemon: bool,
+        #[arg(long = "retrieval-primary", value_enum, default_value_t = CliRetrievalPrimary::Hybrid)]
+        retrieval_primary: CliRetrievalPrimary,
+        #[arg(long = "enable-dense", default_value_t = false)]
+        enable_dense: bool,
+        #[arg(
+            long = "disable-dense",
+            visible_alias = "no-dense-embeddings",
+            default_value_t = false
+        )]
+        disable_dense: bool,
+        #[arg(long = "dense-fallback", default_value_t = false)]
+        dense_fallback: bool,
+        #[arg(long = "no-dense-fallback", default_value_t = false)]
+        no_dense_fallback: bool,
     },
     Read {
         #[arg(long)]
@@ -293,6 +428,20 @@ enum Command {
         omlx_rerank_candidates: usize,
         #[arg(long, default_value_t = false)]
         no_late_interaction: bool,
+        #[arg(long = "retrieval-primary", value_enum, default_value_t = CliRetrievalPrimary::Hybrid)]
+        retrieval_primary: CliRetrievalPrimary,
+        #[arg(long = "enable-dense", default_value_t = false)]
+        enable_dense: bool,
+        #[arg(
+            long = "disable-dense",
+            visible_alias = "no-dense-embeddings",
+            default_value_t = false
+        )]
+        disable_dense: bool,
+        #[arg(long = "dense-fallback", default_value_t = false)]
+        dense_fallback: bool,
+        #[arg(long = "no-dense-fallback", default_value_t = false)]
+        no_dense_fallback: bool,
     },
     Cards {
         #[arg(long)]
@@ -340,6 +489,65 @@ enum CliReadPackMode {
     Flow,
 }
 
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum CliRetrievalPrimary {
+    Fts,
+    Splade,
+    Dense,
+    Hybrid,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum CliSearchResultGranularity {
+    File,
+    Record,
+    Symbol,
+    Chunk,
+}
+
+impl From<CliSearchResultGranularity> for SearchResultGranularity {
+    fn from(value: CliSearchResultGranularity) -> Self {
+        match value {
+            CliSearchResultGranularity::File => SearchResultGranularity::File,
+            CliSearchResultGranularity::Record => SearchResultGranularity::Record,
+            CliSearchResultGranularity::Symbol => SearchResultGranularity::Symbol,
+            CliSearchResultGranularity::Chunk => SearchResultGranularity::Chunk,
+        }
+    }
+}
+
+impl From<CliRetrievalPrimary> for RetrievalPrimary {
+    fn from(value: CliRetrievalPrimary) -> Self {
+        match value {
+            CliRetrievalPrimary::Fts => RetrievalPrimary::Fts,
+            CliRetrievalPrimary::Splade => RetrievalPrimary::Splade,
+            CliRetrievalPrimary::Dense => RetrievalPrimary::Dense,
+            CliRetrievalPrimary::Hybrid => RetrievalPrimary::Hybrid,
+        }
+    }
+}
+
+fn resolve_search_result_granularity(
+    granularity: CliSearchResultGranularity,
+    no_collapse: bool,
+) -> Result<SearchResultGranularity> {
+    if no_collapse
+        && !matches!(
+            granularity,
+            CliSearchResultGranularity::File | CliSearchResultGranularity::Record
+        )
+    {
+        anyhow::bail!(
+            "--no-collapse conflicts with --result-granularity {granularity:?}; use one result granularity selector"
+        );
+    }
+    if no_collapse {
+        Ok(SearchResultGranularity::Record)
+    } else {
+        Ok(granularity.into())
+    }
+}
+
 impl From<CliReadPackMode> for ReadPackMode {
     fn from(value: CliReadPackMode) -> Self {
         match value {
@@ -348,6 +556,53 @@ impl From<CliReadPackMode> for ReadPackMode {
             CliReadPackMode::Flow => ReadPackMode::Flow,
         }
     }
+}
+
+fn resolve_retrieval_config(
+    primary: CliRetrievalPrimary,
+    enable_dense: bool,
+    disable_dense: bool,
+    dense_fallback: bool,
+    no_dense_fallback: bool,
+) -> Result<RetrievalConfig> {
+    if enable_dense && disable_dense {
+        anyhow::bail!("choose either --enable-dense or --disable-dense, not both");
+    }
+    if dense_fallback && no_dense_fallback {
+        anyhow::bail!("choose either --dense-fallback or --no-dense-fallback, not both");
+    }
+    if disable_dense && dense_fallback {
+        anyhow::bail!(
+            "--dense-fallback requires dense embeddings; remove --disable-dense or use --no-dense-fallback"
+        );
+    }
+
+    let primary = RetrievalPrimary::from(primary);
+    if matches!(primary, RetrievalPrimary::Dense) && disable_dense {
+        anyhow::bail!(
+            "--retrieval-primary dense requires dense embeddings; remove --disable-dense or choose another primary"
+        );
+    }
+    let dense_enabled = if disable_dense {
+        false
+    } else if enable_dense || dense_fallback {
+        true
+    } else {
+        !matches!(primary, RetrievalPrimary::Fts)
+    };
+    let dense_fallback_enabled = if no_dense_fallback || !dense_enabled {
+        false
+    } else if dense_fallback {
+        true
+    } else {
+        dense_enabled
+    };
+
+    Ok(RetrievalConfig {
+        primary,
+        dense_enabled,
+        dense_fallback_enabled,
+    })
 }
 
 fn main() -> Result<()> {
@@ -369,7 +624,19 @@ fn main() -> Result<()> {
             chunk_summary_model,
             chunk_summary_concurrency,
             no_chunk_summaries,
+            retrieval_primary,
+            enable_dense,
+            disable_dense,
+            dense_fallback,
+            no_dense_fallback,
         } => {
+            let retrieval_config = resolve_retrieval_config(
+                retrieval_primary,
+                enable_dense,
+                disable_dense,
+                dense_fallback,
+                no_dense_fallback,
+            )?;
             let db = resolve_db_path(db, Some(&repo_root))?;
             ensure_matryoshka_layout(&db)?;
             let summary = run_prepare(PrepareOptions {
@@ -384,6 +651,7 @@ fn main() -> Result<()> {
                 limit,
                 queries,
                 late_interaction: !no_late_interaction,
+                retrieval_config,
                 chunk_summary_model,
                 chunk_summary_concurrency,
                 no_chunk_summaries,
@@ -412,7 +680,19 @@ fn main() -> Result<()> {
             chunk_summary_model,
             chunk_summary_concurrency,
             no_chunk_summaries,
+            retrieval_primary,
+            enable_dense,
+            disable_dense,
+            dense_fallback,
+            no_dense_fallback,
         } => {
+            let retrieval_config = resolve_retrieval_config(
+                retrieval_primary,
+                enable_dense,
+                disable_dense,
+                dense_fallback,
+                no_dense_fallback,
+            )?;
             let db = resolve_db_path(db, Some(&repo_root))?;
             ensure_matryoshka_layout(&db)?;
             let mut command_log = CommandLog::open(&db, "index")?;
@@ -435,7 +715,9 @@ fn main() -> Result<()> {
                     DeterministicEmbedder::default(),
                     HeuristicChunkSummarizer,
                 )
-                .with_parser_config(parser_config);
+                .with_parser_config(parser_config)
+                .with_retrieval_config(retrieval_config)
+                .with_chunk_summary_enabled(!no_chunk_summaries);
                 let summary = if progress_jsonl {
                     indexer.index_repo_with_progress(&repo_root, print_progress_jsonl)?
                 } else {
@@ -454,6 +736,7 @@ fn main() -> Result<()> {
                     .with_concurrency(chunk_summary_concurrency);
                 let indexer = FullIndexer::new(store, enricher, embedder, chunk_summarizer)
                     .with_parser_config(parser_config)
+                    .with_retrieval_config(retrieval_config)
                     .with_chunk_summary_enabled(!no_chunk_summaries);
                 let summary = if progress_jsonl {
                     indexer.index_repo_with_progress(&repo_root, print_progress_jsonl)?
@@ -474,6 +757,7 @@ fn main() -> Result<()> {
                     &api_key,
                     &embed_model,
                     &chat_model,
+                    retrieval_config,
                     watch_daemon,
                 )?;
             }
@@ -491,7 +775,19 @@ fn main() -> Result<()> {
             chunk_summary_model,
             chunk_summary_concurrency,
             no_chunk_summaries,
+            retrieval_primary,
+            enable_dense,
+            disable_dense,
+            dense_fallback,
+            no_dense_fallback,
         } => {
+            let retrieval_config = resolve_retrieval_config(
+                retrieval_primary,
+                enable_dense,
+                disable_dense,
+                dense_fallback,
+                no_dense_fallback,
+            )?;
             let db = resolve_db_path(db, Some(&repo_root))?;
             ensure_matryoshka_layout(&db)?;
             let mut command_log = CommandLog::open(&db, "update")?;
@@ -514,7 +810,9 @@ fn main() -> Result<()> {
                     DeterministicEmbedder::default(),
                     HeuristicChunkSummarizer,
                 )
-                .with_parser_config(parser_config);
+                .with_parser_config(parser_config)
+                .with_retrieval_config(retrieval_config)
+                .with_chunk_summary_enabled(!no_chunk_summaries);
                 let summary = if progress_jsonl {
                     indexer.update_repo_with_progress(repo_root, print_progress_jsonl)?
                 } else {
@@ -532,6 +830,7 @@ fn main() -> Result<()> {
                     .with_concurrency(chunk_summary_concurrency);
                 let indexer = FullIndexer::new(store, enricher, embedder, chunk_summarizer)
                     .with_parser_config(parser_config)
+                    .with_retrieval_config(retrieval_config)
                     .with_chunk_summary_enabled(!no_chunk_summaries);
                 let summary = if progress_jsonl {
                     indexer.update_repo_with_progress(repo_root, print_progress_jsonl)?
@@ -557,7 +856,19 @@ fn main() -> Result<()> {
             ignore,
             daemon,
             skip_startup_update,
+            retrieval_primary,
+            enable_dense,
+            disable_dense,
+            dense_fallback,
+            no_dense_fallback,
         } => {
+            let retrieval_config = resolve_retrieval_config(
+                retrieval_primary,
+                enable_dense,
+                disable_dense,
+                dense_fallback,
+                no_dense_fallback,
+            )?;
             let db = resolve_db_path(db, Some(&repo_root))?;
             ensure_matryoshka_layout(&db)?;
             let options = WatchLoopOptions {
@@ -572,6 +883,7 @@ fn main() -> Result<()> {
                 debounce_ms,
                 ignore,
                 skip_startup_update,
+                retrieval_config,
             };
             if daemon {
                 spawn_watch_daemon(&options)?;
@@ -593,7 +905,24 @@ fn main() -> Result<()> {
             omlx_rerank_model,
             omlx_rerank_candidates,
             no_late_interaction,
+            retrieval_primary,
+            enable_dense,
+            disable_dense,
+            dense_fallback,
+            no_dense_fallback,
+            result_granularity,
+            no_collapse,
+            compact,
         } => {
+            let result_granularity =
+                resolve_search_result_granularity(result_granularity, no_collapse)?;
+            let retrieval_config = resolve_retrieval_config(
+                retrieval_primary,
+                enable_dense,
+                disable_dense,
+                dense_fallback,
+                no_dense_fallback,
+            )?;
             let db = resolve_db_path(db, None)?;
             ensure_matryoshka_layout(&db)?;
             ensure_single_reranker(rerank, omlx_rerank)?;
@@ -601,7 +930,9 @@ fn main() -> Result<()> {
             let late_interaction = !no_late_interaction;
             let hits = if offline && omlx_rerank {
                 SearchEngine::new(store, DeterministicEmbedder::default())
+                    .with_dense(retrieval_config.dense_enabled)
                     .with_late_interaction(late_interaction)
+                    .with_result_granularity(result_granularity)
                     .with_reranker(
                         OmlxReranker::new(base_url, api_key, omlx_rerank_model)
                             .with_max_candidates(omlx_rerank_candidates),
@@ -609,14 +940,18 @@ fn main() -> Result<()> {
                     .search(&query, limit)?
             } else if offline {
                 SearchEngine::new(store, DeterministicEmbedder::default())
+                    .with_dense(retrieval_config.dense_enabled)
                     .with_late_interaction(late_interaction)
+                    .with_result_granularity(result_granularity)
                     .search(&query, limit)?
             } else if omlx_rerank {
                 SearchEngine::new(
                     store,
                     EndpointEmbedder::new(base_url.clone(), api_key.clone(), embed_model),
                 )
+                .with_dense(retrieval_config.dense_enabled)
                 .with_late_interaction(late_interaction)
+                .with_result_granularity(result_granularity)
                 .with_reranker(
                     OmlxReranker::new(base_url, api_key, omlx_rerank_model)
                         .with_max_candidates(omlx_rerank_candidates),
@@ -627,15 +962,19 @@ fn main() -> Result<()> {
                     store,
                     EndpointEmbedder::new(base_url.clone(), api_key.clone(), embed_model),
                 )
+                .with_dense(retrieval_config.dense_enabled)
                 .with_late_interaction(late_interaction)
+                .with_result_granularity(result_granularity)
                 .with_reranker(EndpointReranker::new(base_url, api_key, rerank_model))
                 .search(&query, limit)?
             } else {
                 SearchEngine::new(store, EndpointEmbedder::new(base_url, api_key, embed_model))
+                    .with_dense(retrieval_config.dense_enabled)
                     .with_late_interaction(late_interaction)
+                    .with_result_granularity(result_granularity)
                     .search(&query, limit)?
             };
-            println!("{}", serde_json::to_string_pretty(&hits)?);
+            print_search_hits(serde_json::to_value(&hits)?, compact)?;
         }
         Command::Op {
             db,
@@ -652,7 +991,24 @@ fn main() -> Result<()> {
             omlx_rerank_model,
             omlx_rerank_candidates,
             no_late_interaction,
+            retrieval_primary,
+            enable_dense,
+            disable_dense,
+            dense_fallback,
+            no_dense_fallback,
+            result_granularity,
+            no_collapse,
+            compact,
         } => {
+            let result_granularity =
+                resolve_search_result_granularity(result_granularity, no_collapse)?;
+            let retrieval_config = resolve_retrieval_config(
+                retrieval_primary,
+                enable_dense,
+                disable_dense,
+                dense_fallback,
+                no_dense_fallback,
+            )?;
             let db = resolve_db_path(db, None)?;
             ensure_matryoshka_layout(&db)?;
             ensure_single_reranker(rerank, omlx_rerank)?;
@@ -661,7 +1017,9 @@ fn main() -> Result<()> {
             let late_interaction = !no_late_interaction;
             let hits = if offline && omlx_rerank {
                 SearchEngine::new(store, DeterministicEmbedder::default())
+                    .with_dense(retrieval_config.dense_enabled)
                     .with_late_interaction(late_interaction)
+                    .with_result_granularity(result_granularity)
                     .with_reranker(
                         OmlxReranker::new(base_url, api_key, omlx_rerank_model)
                             .with_max_candidates(omlx_rerank_candidates),
@@ -669,14 +1027,18 @@ fn main() -> Result<()> {
                     .search(&task_query, limit)?
             } else if offline {
                 SearchEngine::new(store, DeterministicEmbedder::default())
+                    .with_dense(retrieval_config.dense_enabled)
                     .with_late_interaction(late_interaction)
+                    .with_result_granularity(result_granularity)
                     .search(&task_query, limit)?
             } else if omlx_rerank {
                 SearchEngine::new(
                     store,
                     EndpointEmbedder::new(base_url.clone(), api_key.clone(), embed_model),
                 )
+                .with_dense(retrieval_config.dense_enabled)
                 .with_late_interaction(late_interaction)
+                .with_result_granularity(result_granularity)
                 .with_reranker(
                     OmlxReranker::new(base_url, api_key, omlx_rerank_model)
                         .with_max_candidates(omlx_rerank_candidates),
@@ -687,15 +1049,19 @@ fn main() -> Result<()> {
                     store,
                     EndpointEmbedder::new(base_url.clone(), api_key.clone(), embed_model),
                 )
+                .with_dense(retrieval_config.dense_enabled)
                 .with_late_interaction(late_interaction)
+                .with_result_granularity(result_granularity)
                 .with_reranker(EndpointReranker::new(base_url, api_key, rerank_model))
                 .search(&task_query, limit)?
             } else {
                 SearchEngine::new(store, EndpointEmbedder::new(base_url, api_key, embed_model))
+                    .with_dense(retrieval_config.dense_enabled)
                     .with_late_interaction(late_interaction)
+                    .with_result_granularity(result_granularity)
                     .search(&task_query, limit)?
             };
-            println!("{}", serde_json::to_string_pretty(&hits)?);
+            print_search_hits(serde_json::to_value(&hits)?, compact)?;
         }
         Command::Prewarm {
             db,
@@ -710,7 +1076,19 @@ fn main() -> Result<()> {
             ensure_fresh,
             watch,
             watch_daemon,
+            retrieval_primary,
+            enable_dense,
+            disable_dense,
+            dense_fallback,
+            no_dense_fallback,
         } => {
+            let retrieval_config = resolve_retrieval_config(
+                retrieval_primary,
+                enable_dense,
+                disable_dense,
+                dense_fallback,
+                no_dense_fallback,
+            )?;
             let repo_root = resolve_optional_repo_root(repo_root)?;
             let db = resolve_db_path(db, Some(&repo_root))?;
             ensure_matryoshka_layout(&db)?;
@@ -739,6 +1117,7 @@ fn main() -> Result<()> {
                     DEFAULT_CHUNK_SUMMARY_MODEL,
                     DEFAULT_CHUNK_SUMMARY_CONCURRENCY,
                     true,
+                    retrieval_config,
                     Some(&mut command_log),
                 )?;
                 print_update_summary(summary);
@@ -752,6 +1131,7 @@ fn main() -> Result<()> {
             let late_interaction = !no_late_interaction;
             let summary = if offline {
                 SearchEngine::new(store, DeterministicEmbedder::default())
+                    .with_dense(retrieval_config.dense_enabled)
                     .with_late_interaction(late_interaction)
                     .prewarm(&queries, limit)?
             } else {
@@ -759,6 +1139,7 @@ fn main() -> Result<()> {
                     store,
                     EndpointEmbedder::new(base_url.clone(), api_key.clone(), embed_model.clone()),
                 )
+                .with_dense(retrieval_config.dense_enabled)
                 .with_late_interaction(late_interaction)
                 .prewarm(&queries, limit)?
             };
@@ -796,6 +1177,7 @@ fn main() -> Result<()> {
                     &api_key,
                     &embed_model,
                     DEFAULT_CHAT_MODEL,
+                    retrieval_config,
                     watch_daemon,
                 )?;
             }
@@ -808,7 +1190,19 @@ fn main() -> Result<()> {
             api_key,
             embed_model,
             progress_jsonl,
+            retrieval_primary,
+            enable_dense,
+            disable_dense,
+            dense_fallback,
+            no_dense_fallback,
         } => {
+            let retrieval_config = resolve_retrieval_config(
+                retrieval_primary,
+                enable_dense,
+                disable_dense,
+                dense_fallback,
+                no_dense_fallback,
+            )?;
             let db = resolve_db_path(db, Some(&repo_root))?;
             ensure_matryoshka_layout(&db)?;
             let mut command_log = CommandLog::open(&db, "semantic-rebuild")?;
@@ -828,7 +1222,8 @@ fn main() -> Result<()> {
                     HeuristicEnricher,
                     DeterministicEmbedder::default(),
                     HeuristicChunkSummarizer,
-                );
+                )
+                .with_retrieval_config(retrieval_config);
                 if progress_jsonl {
                     indexer.rebuild_semantic_index_with_progress(repo_root, print_progress_jsonl)?
                 } else {
@@ -840,7 +1235,8 @@ fn main() -> Result<()> {
                     HeuristicEnricher,
                     EndpointEmbedder::new(base_url, api_key, embed_model),
                     HeuristicChunkSummarizer,
-                );
+                )
+                .with_retrieval_config(retrieval_config);
                 if progress_jsonl {
                     indexer.rebuild_semantic_index_with_progress(repo_root, print_progress_jsonl)?
                 } else {
@@ -883,7 +1279,19 @@ fn main() -> Result<()> {
             omlx_rerank_model,
             omlx_rerank_candidates,
             no_late_interaction,
+            retrieval_primary,
+            enable_dense,
+            disable_dense,
+            dense_fallback,
+            no_dense_fallback,
         } => {
+            let retrieval_config = resolve_retrieval_config(
+                retrieval_primary,
+                enable_dense,
+                disable_dense,
+                dense_fallback,
+                no_dense_fallback,
+            )?;
             let repo_root = resolve_optional_repo_root(repo_root)?;
             let db = resolve_db_path(db, Some(&repo_root))?;
             ensure_matryoshka_layout(&db)?;
@@ -892,6 +1300,7 @@ fn main() -> Result<()> {
             let late_interaction = !no_late_interaction;
             let hits = if offline && omlx_rerank {
                 SearchEngine::new(store.clone(), DeterministicEmbedder::default())
+                    .with_dense(retrieval_config.dense_enabled)
                     .with_late_interaction(late_interaction)
                     .with_reranker(
                         OmlxReranker::new(base_url, api_key, omlx_rerank_model)
@@ -900,6 +1309,7 @@ fn main() -> Result<()> {
                     .search(&task_query(AgentTask::ReadNext, &query), limit)?
             } else if offline {
                 SearchEngine::new(store.clone(), DeterministicEmbedder::default())
+                    .with_dense(retrieval_config.dense_enabled)
                     .with_late_interaction(late_interaction)
                     .search(&task_query(AgentTask::ReadNext, &query), limit)?
             } else if omlx_rerank {
@@ -907,6 +1317,7 @@ fn main() -> Result<()> {
                     store.clone(),
                     EndpointEmbedder::new(base_url.clone(), api_key.clone(), embed_model),
                 )
+                .with_dense(retrieval_config.dense_enabled)
                 .with_late_interaction(late_interaction)
                 .with_reranker(
                     OmlxReranker::new(base_url, api_key, omlx_rerank_model)
@@ -918,6 +1329,7 @@ fn main() -> Result<()> {
                     store.clone(),
                     EndpointEmbedder::new(base_url.clone(), api_key.clone(), embed_model),
                 )
+                .with_dense(retrieval_config.dense_enabled)
                 .with_late_interaction(late_interaction)
                 .with_reranker(EndpointReranker::new(base_url, api_key, rerank_model))
                 .search(&task_query(AgentTask::ReadNext, &query), limit)?
@@ -926,6 +1338,7 @@ fn main() -> Result<()> {
                     store.clone(),
                     EndpointEmbedder::new(base_url, api_key, embed_model),
                 )
+                .with_dense(retrieval_config.dense_enabled)
                 .with_late_interaction(late_interaction)
                 .search(&task_query(AgentTask::ReadNext, &query), limit)?
             };
@@ -1056,6 +1469,7 @@ struct PrepareOptions {
     limit: usize,
     queries: Vec<String>,
     late_interaction: bool,
+    retrieval_config: RetrievalConfig,
     chunk_summary_model: String,
     chunk_summary_concurrency: usize,
     no_chunk_summaries: bool,
@@ -1096,6 +1510,7 @@ struct WatchLoopOptions {
     debounce_ms: u64,
     ignore: Vec<String>,
     skip_startup_update: bool,
+    retrieval_config: RetrievalConfig,
 }
 
 struct CommandLog {
@@ -1133,8 +1548,12 @@ fn run_prepare(options: PrepareOptions) -> Result<PrepareSummary> {
     let parser_config = parser_config(options.ignore.clone());
     let existing_file_count = indexed_file_count(&options.db).unwrap_or(0);
     let existing_gap_count = existing_card_gap_count(&options.db).unwrap_or(0);
-    let existing_search_missing =
-        existing_retrieval_needs_rebuild(&options.db, options.late_interaction).unwrap_or(false);
+    let existing_search_missing = existing_retrieval_needs_rebuild(
+        &options.db,
+        options.retrieval_config,
+        options.late_interaction,
+    )
+    .unwrap_or(false);
     let ready_marker_exists = ready_marker.exists();
     let mut actions_taken = Vec::new();
 
@@ -1191,6 +1610,7 @@ fn run_prepare(options: PrepareOptions) -> Result<PrepareSummary> {
         &options.chunk_summary_model,
         options.chunk_summary_concurrency,
         !options.no_chunk_summaries,
+        options.retrieval_config,
         Some(&mut log),
     )?;
     actions_taken.push(first_action.to_string());
@@ -1216,6 +1636,7 @@ fn run_prepare(options: PrepareOptions) -> Result<PrepareSummary> {
             &options.chunk_summary_model,
             options.chunk_summary_concurrency,
             !options.no_chunk_summaries,
+            options.retrieval_config,
             Some(&mut log),
         )?;
         actions_taken.push("repair".to_string());
@@ -1223,7 +1644,7 @@ fn run_prepare(options: PrepareOptions) -> Result<PrepareSummary> {
 
     let mut artifact_quality = update.artifact_quality.clone();
     let mut retrieval_index = update.retrieval_index.clone();
-    if retrieval_needs_rebuild(&retrieval_index, options.late_interaction) {
+    if retrieval_needs_rebuild(&retrieval_index) {
         log.event(
             "prepare_decision",
             json!({
@@ -1242,6 +1663,7 @@ fn run_prepare(options: PrepareOptions) -> Result<PrepareSummary> {
             &options.chunk_summary_model,
             options.chunk_summary_concurrency,
             !options.no_chunk_summaries,
+            options.retrieval_config,
             Some(&mut log),
         )?;
         artifact_quality = rebuild.artifact_quality;
@@ -1276,16 +1698,17 @@ fn run_prepare(options: PrepareOptions) -> Result<PrepareSummary> {
         &queries,
         options.limit,
         options.late_interaction,
+        options.retrieval_config,
         Some(&mut log),
     )?;
     actions_taken.push("prepare_results".to_string());
 
     retrieval_index = retrieval_report_from_stats(
         MatryoshkaStore::open(&options.db)?.retrieval_index_stats()?,
+        options.retrieval_config,
         options.late_interaction,
     );
-    let ready = artifact_gap_count(&artifact_quality) == 0
-        && retrieval_is_ready(&retrieval_index, options.late_interaction);
+    let ready = artifact_gap_count(&artifact_quality) == 0 && retrieval_is_ready(&retrieval_index);
     let status = if ready { "ready" } else { "needs_attention" }.to_string();
 
     let summary = PrepareSummary {
@@ -1372,6 +1795,7 @@ fn start_watch_after_index(
     api_key: &str,
     embed_model: &str,
     chat_model: &str,
+    retrieval_config: RetrievalConfig,
     daemon: bool,
 ) -> Result<()> {
     let options = WatchLoopOptions {
@@ -1386,11 +1810,32 @@ fn start_watch_after_index(
         debounce_ms: 3_000,
         ignore: Vec::new(),
         skip_startup_update: false,
+        retrieval_config,
     };
     if daemon {
         spawn_watch_daemon(&options)
     } else {
         run_watch_loop(options)
+    }
+}
+
+fn append_retrieval_args(command: &mut ProcessCommand, config: RetrievalConfig) {
+    let primary = match config.primary {
+        RetrievalPrimary::Fts => "fts",
+        RetrievalPrimary::Splade => "splade",
+        RetrievalPrimary::Dense => "dense",
+        RetrievalPrimary::Hybrid => "hybrid",
+    };
+    command.arg("--retrieval-primary").arg(primary);
+    if config.dense_enabled {
+        command.arg("--enable-dense");
+    } else {
+        command.arg("--disable-dense");
+    }
+    if config.dense_fallback_enabled {
+        command.arg("--dense-fallback");
+    } else {
+        command.arg("--no-dense-fallback");
     }
 }
 
@@ -1430,6 +1875,7 @@ fn spawn_watch_daemon(options: &WatchLoopOptions) -> Result<()> {
     if options.offline {
         command.arg("--offline");
     }
+    append_retrieval_args(&mut command, options.retrieval_config);
     if options.skip_startup_update {
         command.arg("--skip-startup-update");
     }
@@ -1475,6 +1921,7 @@ fn run_watch_loop(options: WatchLoopOptions) -> Result<()> {
             DEFAULT_CHUNK_SUMMARY_MODEL,
             DEFAULT_CHUNK_SUMMARY_CONCURRENCY,
             true,
+            options.retrieval_config,
             Some(&mut log),
         )?;
         print_update_summary(summary);
@@ -1531,6 +1978,7 @@ fn run_watch_loop(options: WatchLoopOptions) -> Result<()> {
                 DEFAULT_CHUNK_SUMMARY_MODEL,
                 DEFAULT_CHUNK_SUMMARY_CONCURRENCY,
                 true,
+                options.retrieval_config,
                 Some(&mut log),
             )?;
             print_update_summary(summary);
@@ -1552,6 +2000,7 @@ fn run_update_once(
     chunk_summary_model: &str,
     chunk_summary_concurrency: usize,
     chunk_summary_enabled: bool,
+    retrieval_config: RetrievalConfig,
     mut log: Option<&mut CommandLog>,
 ) -> Result<UpdateSummary> {
     if let Some(log) = log.as_deref_mut() {
@@ -1574,6 +2023,8 @@ fn run_update_once(
             HeuristicChunkSummarizer,
         )
         .with_parser_config(parser_config)
+        .with_retrieval_config(retrieval_config)
+        .with_chunk_summary_enabled(chunk_summary_enabled)
         .update_repo(repo_root)?
     } else {
         let enricher = MlxChatEnricher::new(base_url, api_key).with_model(chat_model.to_string());
@@ -1583,6 +2034,7 @@ fn run_update_once(
             .with_concurrency(chunk_summary_concurrency);
         FullIndexer::new(store, enricher, embedder, chunk_summarizer)
             .with_parser_config(parser_config)
+            .with_retrieval_config(retrieval_config)
             .with_chunk_summary_enabled(chunk_summary_enabled)
             .update_repo(repo_root)?
     };
@@ -1617,6 +2069,7 @@ fn run_rebuild_semantic_once(
     chunk_summary_model: &str,
     chunk_summary_concurrency: usize,
     chunk_summary_enabled: bool,
+    retrieval_config: RetrievalConfig,
     mut log: Option<&mut CommandLog>,
 ) -> Result<SemanticRebuildSummary> {
     if let Some(log) = log.as_deref_mut() {
@@ -1638,6 +2091,8 @@ fn run_rebuild_semantic_once(
             DeterministicEmbedder::default(),
             HeuristicChunkSummarizer,
         )
+        .with_retrieval_config(retrieval_config)
+        .with_chunk_summary_enabled(chunk_summary_enabled)
         .rebuild_semantic_index(repo_root)?
     } else {
         let chunk_summarizer = MlxChunkSummarizer::new(base_url, api_key)
@@ -1649,6 +2104,7 @@ fn run_rebuild_semantic_once(
             EndpointEmbedder::new(base_url, api_key, embed_model.to_string()),
             chunk_summarizer,
         )
+        .with_retrieval_config(retrieval_config)
         .with_chunk_summary_enabled(chunk_summary_enabled)
         .rebuild_semantic_index(repo_root)?
     };
@@ -1671,6 +2127,7 @@ fn run_prewarm_once(
     queries: &[String],
     limit: usize,
     late_interaction: bool,
+    retrieval_config: RetrievalConfig,
     mut log: Option<&mut CommandLog>,
 ) -> Result<SearchPrewarmSummary> {
     if let Some(log) = log.as_deref_mut() {
@@ -1689,6 +2146,7 @@ fn run_prewarm_once(
     let store = MatryoshkaStore::open(db)?;
     let summary = if offline {
         SearchEngine::new(store, DeterministicEmbedder::default())
+            .with_dense(retrieval_config.dense_enabled)
             .with_late_interaction(late_interaction)
             .prewarm(queries, limit)?
     } else {
@@ -1696,6 +2154,7 @@ fn run_prewarm_once(
             store,
             EndpointEmbedder::new(base_url, api_key, embed_model.to_string()),
         )
+        .with_dense(retrieval_config.dense_enabled)
         .with_late_interaction(late_interaction)
         .prewarm(queries, limit)?
     };
@@ -1726,14 +2185,16 @@ fn existing_card_gap_count(db: &Path) -> Result<usize> {
         .count())
 }
 
-fn existing_retrieval_needs_rebuild(db: &Path, late_interaction: bool) -> Result<bool> {
-    Ok(retrieval_needs_rebuild(
-        &retrieval_report_from_stats(
-            MatryoshkaStore::open(db)?.retrieval_index_stats()?,
-            late_interaction,
-        ),
+fn existing_retrieval_needs_rebuild(
+    db: &Path,
+    retrieval_config: RetrievalConfig,
+    late_interaction: bool,
+) -> Result<bool> {
+    Ok(retrieval_needs_rebuild(&retrieval_report_from_stats(
+        MatryoshkaStore::open(db)?.retrieval_index_stats()?,
+        retrieval_config,
         late_interaction,
-    ))
+    )))
 }
 
 fn artifact_gap_count(report: &ArtifactQualityReport) -> usize {
@@ -1742,19 +2203,22 @@ fn artifact_gap_count(report: &ArtifactQualityReport) -> usize {
         + usize::from(!report.repo_card_has_summary)
 }
 
-fn retrieval_needs_rebuild(report: &RetrievalIndexReport, late_interaction: bool) -> bool {
-    !retrieval_is_ready(report, late_interaction)
+fn retrieval_needs_rebuild(report: &RetrievalIndexReport) -> bool {
+    !retrieval_is_ready(report)
 }
 
-fn retrieval_is_ready(report: &RetrievalIndexReport, late_interaction: bool) -> bool {
+fn retrieval_is_ready(report: &RetrievalIndexReport) -> bool {
     report.semantic_records > 0
-        && report.embedded_records > 0
         && report.fts_records > 0
-        && (!late_interaction || report.records_with_late_vectors > 0)
+        && (!report.dense_enabled || report.embedded_records > 0)
+        && (!report.dense_enabled
+            || !report.late_interaction_enabled
+            || report.records_with_late_vectors > 0)
 }
 
 fn retrieval_report_from_stats(
     stats: RetrievalIndexStats,
+    retrieval_config: RetrievalConfig,
     late_interaction: bool,
 ) -> RetrievalIndexReport {
     RetrievalIndexReport {
@@ -1763,7 +2227,10 @@ fn retrieval_report_from_stats(
         fts_records: stats.fts_records,
         late_vector_rows: stats.late_vector_rows,
         records_with_late_vectors: stats.records_with_late_vectors,
-        late_interaction_enabled: late_interaction,
+        retrieval_primary: retrieval_config.primary,
+        dense_enabled: retrieval_config.dense_enabled,
+        dense_fallback_enabled: retrieval_config.dense_fallback_enabled,
+        late_interaction_enabled: retrieval_config.dense_enabled && late_interaction,
     }
 }
 
@@ -1911,6 +2378,33 @@ fn truncate_str(s: &str, max: usize) -> String {
     }
 }
 
+fn print_search_hits(mut value: Value, compact: bool) -> Result<()> {
+    if compact {
+        strip_search_match_details(&mut value);
+    }
+    println!("{}", serde_json::to_string_pretty(&value)?);
+    Ok(())
+}
+
+fn strip_search_match_details(value: &mut Value) {
+    match value {
+        Value::Array(items) => {
+            for item in items {
+                strip_search_match_details(item);
+            }
+        }
+        Value::Object(map) => {
+            map.remove("matched_terms");
+            map.remove("total_matched_symbols");
+            map.remove("why_matched");
+            for item in map.values_mut() {
+                strip_search_match_details(item);
+            }
+        }
+        _ => {}
+    }
+}
+
 fn print_prepare_summary(summary: &PrepareSummary) {
     if summary.status == "ready" {
         println!("Jesco is ready.");
@@ -1928,10 +2422,7 @@ fn print_prepare_summary(summary: &PrepareSummary) {
     );
     println!(
         "search: {}",
-        if retrieval_is_ready(
-            &summary.retrieval_index,
-            summary.retrieval_index.late_interaction_enabled
-        ) {
+        if retrieval_is_ready(&summary.retrieval_index) {
             "ready"
         } else {
             "needs_refresh"
@@ -2130,10 +2621,7 @@ fn prepare_summary_json(summary: &PrepareSummary) -> serde_json::Value {
             },
         },
         "search": {
-            "status": if retrieval_is_ready(
-                &summary.retrieval_index,
-                summary.retrieval_index.late_interaction_enabled,
-            ) {
+            "status": if retrieval_is_ready(&summary.retrieval_index) {
                 "ready"
             } else {
                 "needs_refresh"

@@ -57,6 +57,7 @@ fn real_omlx_prepare_search_read_lifecycle_work_through_rust_api() {
                     model: rerank_model(),
                     candidates: 8,
                 },
+                ..SearchOptions::default()
             },
         )
         .unwrap();

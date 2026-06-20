@@ -95,6 +95,7 @@ fn test_repo_live_prepare_search_read_and_progress_work_through_rust_api() {
                     model: rerank_model(),
                     candidates: 20,
                 },
+                ..SearchOptions::default()
             },
         )
         .unwrap();
