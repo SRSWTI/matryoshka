@@ -401,6 +401,7 @@ pub enum MatryoshkaEvent {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ProgressState {
     pub operation: String,
+    pub action: Option<String>,
     pub status: String,
     pub phase: String,
     pub message: String,
@@ -408,7 +409,61 @@ pub struct ProgressState {
     pub current_file: Option<String>,
     pub files_done: Option<usize>,
     pub files_total: Option<usize>,
+    pub items_done: Option<usize>,
+    pub items_total: Option<usize>,
+    pub item_label: Option<String>,
     pub updated_at_unix_ms: u128,
+}
+
+impl ProgressState {
+    fn new(
+        operation: &str,
+        action: Option<&str>,
+        status: &str,
+        phase: &str,
+        message: &str,
+        percent: f32,
+    ) -> Self {
+        Self {
+            operation: operation.into(),
+            action: action.map(Into::into),
+            status: status.into(),
+            phase: phase.into(),
+            message: message.into(),
+            percent: percent.clamp(0.0, 1.0),
+            current_file: None,
+            files_done: None,
+            files_total: None,
+            items_done: None,
+            items_total: None,
+            item_label: None,
+            updated_at_unix_ms: unix_millis(),
+        }
+    }
+
+    fn with_file_progress(
+        mut self,
+        current_file: Option<String>,
+        files_done: Option<usize>,
+        files_total: Option<usize>,
+    ) -> Self {
+        self.current_file = current_file;
+        self.files_done = files_done;
+        self.files_total = files_total;
+        self
+    }
+
+    fn with_item_progress(
+        mut self,
+        items_done: Option<usize>,
+        items_total: Option<usize>,
+        item_label: &str,
+    ) -> Self {
+        self.items_done = items_done;
+        self.items_total = items_total;
+        self.item_label = Some(item_label.into());
+        self
+    }
 }
 
 struct CancellableEnricher<E> {
