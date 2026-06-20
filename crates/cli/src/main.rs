@@ -919,11 +919,14 @@ fn main() -> Result<()> {
             let parser_config = parser_config(ignore);
             let parser = SourceParser::new(parser_config);
             let parsed = parser.parse_repo(&repo_root)?;
-            let source_filter = source.trim().to_ascii_lowercase();
+            let source_filter = source.trim().to_ascii_lowercase().replace('_', "");
             let mut chunks = parsed.code_chunks;
-            if source_filter != "all" {
+            if !source_filter.is_empty() && source_filter != "all" {
                 chunks.retain(|chunk| {
-                    format!("{:?}", chunk.summary_source).to_ascii_lowercase() == source_filter
+                    format!("{:?}", chunk.summary_source)
+                        .to_ascii_lowercase()
+                        .replace('_', "")
+                        == source_filter
                 });
             }
 
