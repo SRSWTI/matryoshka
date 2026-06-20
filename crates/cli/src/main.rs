@@ -736,6 +736,9 @@ fn main() -> Result<()> {
                     &embed_model,
                     DEFAULT_CHAT_MODEL,
                     ParserConfig::default(),
+                    DEFAULT_CHUNK_SUMMARY_MODEL,
+                    DEFAULT_CHUNK_SUMMARY_CONCURRENCY,
+                    true,
                     Some(&mut command_log),
                 )?;
                 print_update_summary(summary);
