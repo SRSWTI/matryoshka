@@ -509,6 +509,29 @@ mod tests {
     }
 
     #[test]
+    fn typescript_prompt_string_containing_function_is_not_chunked() {
+        let source = "const SUMMARIZATION_PROMPT = `Explain this function in detail.`;\nconst handler = () => 1;\n";
+        let lines: Vec<&str> = source.lines().collect();
+        let symbols = super::parse_symbols("prompt.ts", "typescript", source, &lines);
+        if symbols.is_empty() {
+            return;
+        }
+        let chunks = build_code_chunks("prompt.ts", "typescript", &lines, &symbols, "hash");
+        assert!(
+            chunks
+                .iter()
+                .all(|chunk| chunk.symbol.as_deref() != Some("SUMMARIZATION_PROMPT")),
+            "plain string constants must not become code chunks"
+        );
+        assert!(
+            chunks
+                .iter()
+                .any(|chunk| chunk.symbol.as_deref() == Some("handler")),
+            "arrow function constants should still become code chunks"
+        );
+    }
+
+    #[test]
     fn generic_docstrings_are_treated_as_empty() {
         let source = "/// TODO\npub fn placeholder() {}\n";
         let lines: Vec<&str> = source.lines().collect();
@@ -836,9 +859,7 @@ fn tree_sitter_symbol_kind_and_name(
             "interface_declaration" => Some((SymbolKind::Interface, name.clone(), Some(name))),
             "type_alias_declaration" => Some((SymbolKind::TypeAlias, name, None)),
             "lexical_declaration" | "variable_declaration" => {
-                if node_text(source, node).contains("=>")
-                    || node_text(source, node).contains("function")
-                {
+                if typescript_variable_initializer_is_function_like(node_text(source, node)) {
                     Some((SymbolKind::Function, name, None))
                 } else {
                     Some((SymbolKind::Constant, name, None))
@@ -1019,13 +1040,26 @@ fn parse_typescript_symbol(line: &str) -> Option<(SymbolKind, String, String)> {
     }
     for prefix in ["const ", "let ", "var "] {
         if let Some(rest) = cleaned.strip_prefix(prefix) {
-            if rest.contains("=>") || rest.contains("function") {
+            if typescript_variable_initializer_is_function_like(rest) {
                 let name = rest.split([':', '=', ' ']).next()?.trim().to_string();
                 return Some((SymbolKind::Function, name, cleaned.to_string()));
             }
         }
     }
     None
+}
+
+fn typescript_variable_initializer_is_function_like(declaration_text: &str) -> bool {
+    let Some((_, initializer)) = declaration_text.split_once('=') else {
+        return false;
+    };
+    let initializer = initializer.trim_start();
+    if initializer.starts_with(['`', '"', '\'']) {
+        return false;
+    }
+    initializer.starts_with("function")
+        || initializer.starts_with("async function")
+        || initializer.contains("=>")
 }
 
 fn parse_rust_symbol(line: &str) -> Option<(SymbolKind, String, String)> {
@@ -1157,6 +1191,9 @@ fn build_code_chunks(
         .iter()
         .filter_map(|symbol| {
             let chunk_kind = chunk_kind_for_symbol(symbol.kind);
+            if chunk_kind == CodeChunkKind::Unknown {
+                return None;
+            }
             let start = symbol.start_line.saturating_sub(1);
             let end = symbol.end_line.min(lines.len());
             if end <= start {

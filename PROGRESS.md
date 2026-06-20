@@ -204,7 +204,7 @@ Also:
 
 ### Validation
 
-- `cargo test --workspace` — all pass (15 parser tests incl. 9 new, 11 indexer integration tests, plus all search/store/api/watcher tests).
+- `cargo test --workspace` — all pass (16 parser tests incl. parser regression tests, 11 indexer integration tests, plus all search/store/api/watcher tests).
 - Tested against generated sample repo (Rust + Python + TS) — 16 chunks, correct doc extraction.
 - Tested against `/Users/rohit/pi` (real repo) — 24,695 chunks (2,363 `doc_comment`, 22,332 `empty`).
 - Cross-verified two documented chunks (`isContextOverflow`, `sanitizeSurrogates`) against actual source — summaries match the JSDoc exactly.
@@ -224,6 +224,31 @@ Two regression tests added:
 
 After the fix, `/Users/rohit/pi` `doc_comment` count dropped 2719 → 2363
 (356 false positives removed), and 0 empty chunks have a non-empty summary.
+
+**TypeScript prompt string / unknown chunk over-inclusion.** A real DB check on
+`/Users/rohit/pi/packages/agent/src` showed one `empty` function chunk for
+`SUMMARIZATION_PROMPT` because the TS fallback classified a string constant as a
+function when its text contained the word `function`. It also showed many
+`Unknown` chunks from constants/type aliases/local declarations being sent to
+chunk summarization, which is too noisy for the function/class/method chunking
+model.
+
+Fixed by:
+1. Detecting TS variable function-ness from the initializer (`= ...`) instead of
+   searching the whole declaration text for `function`.
+2. Rejecting string/template literal initializers before checking `=>` or
+   function expressions.
+3. Skipping `CodeChunkKind::Unknown` in `build_code_chunks`, preserving exact
+   symbols while keeping embedding chunks focused on functions/classes/methods
+   and related structural declarations.
+
+Regression test added:
+`typescript_prompt_string_containing_function_is_not_chunked`.
+
+Parser-only verification on `/Users/rohit/pi/packages/agent/src` after the fix:
+`547` chunks total, `0 Unknown`; kinds are `185 Function`, `235 Method`,
+`16 Class`, `111 Interface`; sources are `29 DocComment`, `518 Empty` before
+LLM fallback.
 
 ### Test script
 
@@ -296,10 +321,12 @@ target template and persist them so search can use them.
   - Incremental: only summarizes chunks in `affected_file_ids`.
   - `code_chunk_semantic_records()` helper builds records in the target template.
   - Chunk records added to `raw_records` so they get embedded + FTS-indexed.
-- `crates/core-ir/src/models.rs`: added `EnrichingChunks`/`EnrichedChunks` progress events.
-- `crates/api/src/lib.rs`: `MatryoshkaConfig` gains `chunk_summary_enabled`, `chunk_summary_model`, `chunk_summary_concurrency` + builders; `indexer_progress_state` handles new events.
-- `crates/cli/src/main.rs`: `--chunk-summary-model`, `--chunk-summary-concurrency`, `--no-chunk-summaries` flags on `index` and `update`; offline uses `HeuristicChunkSummarizer`, online uses `MlxChunkSummarizer`.
-- All call sites updated to pass a chunk summarizer (tests, CLI, API).
+- `crates/core-ir/src/models.rs`: added `EnrichingChunks`/`EnrichedChunks` progress events plus `EnrichingChunkBatch`/`EnrichedChunkBatch` for batch-level progress.
+- `crates/api/src/lib.rs`: `MatryoshkaConfig` gains `chunk_summary_enabled`, `chunk_summary_model`, `chunk_summary_concurrency` + builders; `indexer_progress_state` handles all new events; `run_update_once_with_progress` passes concurrency to `MlxChunkSummarizer`.
+- `crates/cli/src/main.rs`: `--chunk-summary-model`, `--chunk-summary-concurrency`, `--no-chunk-summaries` flags on `prepare`, `index`, and `update`; offline uses `HeuristicChunkSummarizer`, online uses `MlxChunkSummarizer`; `run_update_once`/`run_rebuild_semantic_once` helpers accept and forward chunk summary config.
+- `crates/enricher/src/lib.rs`: `ChunkSummarizer` trait gains `summarize_chunks_with_progress` with a per-batch callback.
+- `crates/enricher/src/mlx_chat.rs`: `MlxChunkSummarizer` implements `summarize_chunks_with_progress` with 32-chunk batches, emitting progress per batch.
+- All call sites updated to pass a chunk summarizer (tests, CLI, API, prepare, watch loop, prewarm).
 
 #### Live end-to-end test
 
@@ -308,6 +335,14 @@ Indexed a 2-function Rust file (1 documented, 1 undocumented) against `http://12
 - `undocumented_function` → `llm`, summary: `"The undocumented function takes two i32 parameters, sums them, and multiplies them, returning the sum."`
 - Chunk semantic record built in target template (path/symbol/kind/signature/summary/code).
 - `enriching_chunks`/`enriched_chunks` progress events emitted correctly.
+
+Additional DB verification on `/Users/rohit/pi/packages/agent/src/.matryoshka/matryoshka.db` before the TS over-inclusion fix:
+- `code_chunks` existed and was populated: `47 doc_comment`, `1137 llm`, `1 empty`.
+- Doc-comment chunks had `doc_summary` and no `generated_summary`; LLM chunks had `generated_summary` and no `doc_summary`.
+- `agentLoop`, `agentLoopContinue`, and `runLoop` correctly preserved source docs as `doc_comment`; undocumented chunks like `AgentEventSink` used `llm` fallback.
+- `CodeChunk` semantic records used the target template (`path`, `symbol`, `kind`, `signature`, `summary`, `code`).
+- The one missing `CodeChunk` semantic record was the empty/no-summary `SUMMARIZATION_PROMPT` false-positive fixed in M1 parser cleanup above.
+- `embedding_batch` / `embedded_batch` events are still from the existing dense embedding pipeline and will become configurable in M3.
 
 ### LLM call shape (one chunk per request)
 
