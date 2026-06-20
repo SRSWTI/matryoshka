@@ -835,6 +835,7 @@ version = "0.1.6"
 dependencies = [
  "anyhow",
  "clap",
+ "matryoshka-api",
  "matryoshka-embed-client",
  "matryoshka-enricher",
  "matryoshka-indexer",

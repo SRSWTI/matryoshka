@@ -408,6 +408,8 @@ pub struct ReadCard {
     pub folder: Option<ReadFolderOverview>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub symbols: Vec<ReadSymbol>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub chunks: Vec<ReadCodeChunk>,
     pub imports: ReadImports,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub dependents: Vec<ReadDependency>,
@@ -448,6 +450,24 @@ pub struct ReadSymbol {
     pub doc: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub behavior: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReadCodeChunk {
+    pub chunk_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub symbol: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub qualified_name: Option<String>,
+    pub kind: CodeChunkKind,
+    pub signature: String,
+    pub lines: String,
+    pub summary_source: ChunkSummarySource,
+    pub summary: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub doc_summary: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub generated_summary: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

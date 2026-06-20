@@ -1,8 +1,8 @@
 use anyhow::{Result, anyhow};
 use matryoshka_core_ir::{
-    DependencyInterpretation, EdgeFact, EdgeKind, FileCard, FileFact, FolderCard, ImportFact,
-    ReadCard, ReadDependency, ReadFileOverview, ReadFolderOverview, ReadImports,
-    ReadInternalImport, ReadSymbol, SymbolBehavior, SymbolFact,
+    CodeChunkFact, DependencyInterpretation, EdgeFact, EdgeKind, FileCard, FileFact, FolderCard,
+    ImportFact, ReadCard, ReadCodeChunk, ReadDependency, ReadFileOverview, ReadFolderOverview,
+    ReadImports, ReadInternalImport, ReadSymbol, SymbolBehavior, SymbolFact,
 };
 use matryoshka_store_sqlite::MatryoshkaStore;
 use serde::{Deserialize, Serialize};
@@ -61,6 +61,14 @@ impl ReadApi {
     }
 
     pub fn read(&self, file_id: &str) -> Result<ReadCard> {
+        self.read_inner(file_id, false)
+    }
+
+    pub fn read_with_chunks(&self, file_id: &str) -> Result<ReadCard> {
+        self.read_inner(file_id, true)
+    }
+
+    fn read_inner(&self, file_id: &str, include_chunks: bool) -> Result<ReadCard> {
         let file = self
             .store
             .load_file(file_id)?
@@ -70,6 +78,11 @@ impl ReadApi {
         let mut symbols = self.store.load_symbols_for_file(file_id)?;
         symbols.sort_by_key(|symbol| symbol.start_line);
         let (incoming_edges, outgoing_edges) = self.store.load_edges_for_entity(file_id)?;
+        let chunks = if include_chunks {
+            read_chunks(&self.store.load_code_chunks_for_file(file_id)?)
+        } else {
+            Vec::new()
+        };
         let source_lines = read_lines(&self.repo_root.join(&file.path)).unwrap_or_default();
         let module_docs = module_docs(&source_lines, &file.language);
         let card_is_heuristic = file_card
@@ -89,6 +102,7 @@ impl ReadApi {
                 .filter(|_| !folder_card_is_heuristic)
                 .map(folder_overview),
             symbols: read_symbols(&symbols, file_card.as_ref(), &source_lines),
+            chunks,
             imports: read_imports(
                 &file.imports,
                 file_card.as_ref().filter(|_| !card_is_heuristic),
@@ -275,6 +289,24 @@ fn read_symbols(
                 doc: symbol_doc(source_lines, symbol.start_line),
                 behavior: symbol_behavior,
             }
+        })
+        .collect()
+}
+
+fn read_chunks(chunks: &[CodeChunkFact]) -> Vec<ReadCodeChunk> {
+    chunks
+        .iter()
+        .map(|chunk| ReadCodeChunk {
+            chunk_id: chunk.chunk_id.clone(),
+            symbol: chunk.symbol.clone(),
+            qualified_name: chunk.qualified_name.clone(),
+            kind: chunk.kind,
+            signature: chunk.signature.clone(),
+            lines: format!("{}-{}", chunk.start_line, chunk.end_line),
+            summary_source: chunk.summary_source,
+            summary: chunk.summary.clone(),
+            doc_summary: chunk.doc_summary.clone(),
+            generated_summary: chunk.generated_summary.clone(),
         })
         .collect()
 }

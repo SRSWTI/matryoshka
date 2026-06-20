@@ -400,6 +400,12 @@ enum Command {
         db: Option<PathBuf>,
         #[arg(long)]
         repo_root: Option<PathBuf>,
+        #[arg(
+            long = "chunks",
+            visible_alias = "include-chunks",
+            default_value_t = false
+        )]
+        chunks: bool,
         file: String,
     },
     ReadBundle {
@@ -1257,13 +1263,19 @@ fn main() -> Result<()> {
         Command::Read {
             db,
             repo_root,
+            chunks,
             file,
         } => {
             let repo_root = resolve_optional_repo_root(repo_root)?;
             let db = resolve_db_path(db, Some(&repo_root))?;
             ensure_matryoshka_layout(&db)?;
             let read = ReadApi::new(MatryoshkaStore::open(&db)?, repo_root);
-            println!("{}", serde_json::to_string_pretty(&read.read(&file)?)?);
+            let card = if chunks {
+                read.read_with_chunks(&file)?
+            } else {
+                read.read(&file)?
+            };
+            println!("{}", serde_json::to_string_pretty(&card)?);
         }
         Command::ReadBundle {
             db,
