@@ -127,6 +127,70 @@ fn prepare_search_read_and_repair_lifecycle_work_through_rust_api() {
 }
 
 #[test]
+fn prepare_with_dense_disabled_reaches_ready_without_embeddings() {
+    let fixture = Fixture::new();
+    let repo = fixture.repo();
+    let db = repo.join(".matryoshka/matryoshka-api-dense-off.db");
+    let api = Matryoshka::new(
+        MatryoshkaConfig::new(&repo)
+            .with_db(&db)
+            .offline(true)
+            .with_ignored_paths([".matryoshka", "target"])
+            .with_dense_enabled(false)
+            .with_dense_fallback_enabled(false),
+    );
+
+    let events = run_prepare(&api);
+    let summary = completed_summary(&events);
+
+    assert_eq!(summary.status, PrepareStatus::Ready);
+    assert_eq!(summary.actions_taken, vec!["index", "prepare_results"]);
+    assert!(summary.retrieval_index.semantic_records > 0);
+    assert!(summary.retrieval_index.fts_records > 0);
+    assert_eq!(summary.retrieval_index.embedded_records, 0);
+    assert_eq!(summary.retrieval_index.late_vector_rows, 0);
+    assert_eq!(summary.retrieval_index.records_with_late_vectors, 0);
+    assert!(!summary.retrieval_index.dense_enabled);
+    assert!(!summary.retrieval_index.dense_fallback_enabled);
+    assert!(!summary.retrieval_index.late_interaction_enabled);
+    assert!(summary.prewarm.warmed_hit_count > 0);
+    assert!(events.iter().any(|event| matches!(
+        event,
+        MatryoshkaEvent::IndexerProgress {
+            progress: MatryoshkaProgressEvent::EmbeddingSkipped { record_count, reason },
+            ..
+        } if *record_count > 0 && reason == "dense embeddings disabled"
+    )));
+    assert!(!events.iter().any(|event| matches!(
+        event,
+        MatryoshkaEvent::IndexerProgress {
+            progress: MatryoshkaProgressEvent::EmbeddingBatch { .. }
+                | MatryoshkaProgressEvent::EmbeddedBatch { .. },
+            ..
+        }
+    )));
+    assert_eq!(count_all_late_vectors(&db), 0);
+
+    let hits = api
+        .search(
+            "watcher debounce changed removed paths",
+            SearchOptions::default(),
+        )
+        .unwrap();
+    assert!(!hits.is_empty());
+    assert!(
+        hits.iter().any(|hit| hit.path == "src/watcher.rs"),
+        "{hits:?}"
+    );
+    assert!(hits.iter().all(|hit| {
+        !hit.why_matched
+            .iter()
+            .any(|why| why.contains("Late-interaction MaxSim"))
+    }));
+    assert_ready_progress_state(&db);
+}
+
+#[test]
 fn prepare_cancellation_before_start_emits_cancelled_state() {
     let fixture = Fixture::new();
     let repo = fixture.repo();
@@ -536,6 +600,14 @@ fn count_late_vectors_for_path(db: &Path, path: &str) -> i64 {
             [path],
             |row| row.get(0),
         )
+        .unwrap()
+}
+
+fn count_all_late_vectors(db: &Path) -> i64 {
+    conn(db)
+        .query_row("select count(*) from semantic_late_vectors", [], |row| {
+            row.get(0)
+        })
         .unwrap()
 }
 

@@ -2,7 +2,7 @@ use anyhow::Result;
 use matryoshka_core_ir::{
     ArtifactQualityReport, ChunkSummarySource, CodeChunkFact, FileCard, FileEnrichmentContext,
     FileFact, FolderCard, FolderEnrichmentContext, ImportContext, LateInteractionVector,
-    MatryoshkaProgressEvent, RelatedFileContext, RepoCard, RepositorySnapshot,
+    MatryoshkaProgressEvent, RelatedFileContext, RepoCard, RepositorySnapshot, RetrievalConfig,
     RetrievalIndexReport, SemanticEntityType, SemanticRecord,
 };
 use matryoshka_embed_client::Embedder;
@@ -24,6 +24,7 @@ pub struct FullIndexer<E, M, S = HeuristicChunkSummarizer> {
     chunk_summarizer: S,
     parser_config: ParserConfig,
     chunk_summary_enabled: bool,
+    retrieval_config: RetrievalConfig,
 }
 
 impl<E, M, S> FullIndexer<E, M, S>
@@ -40,6 +41,7 @@ where
             chunk_summarizer,
             parser_config: ParserConfig::default(),
             chunk_summary_enabled: true,
+            retrieval_config: RetrievalConfig::default(),
         }
     }
 
@@ -50,6 +52,19 @@ where
 
     pub fn with_chunk_summary_enabled(mut self, enabled: bool) -> Self {
         self.chunk_summary_enabled = enabled;
+        self
+    }
+
+    pub fn with_retrieval_config(mut self, config: RetrievalConfig) -> Self {
+        self.retrieval_config = config;
+        self
+    }
+
+    pub fn with_dense_embeddings_enabled(mut self, enabled: bool) -> Self {
+        self.retrieval_config.dense_enabled = enabled;
+        if !enabled {
+            self.retrieval_config.dense_fallback_enabled = false;
+        }
         self
     }
 
@@ -331,41 +346,48 @@ where
         };
 
         let mut raw_records = raw_semantic_records(&snapshot);
-        let raw_batches = selected_batch_count(&raw_records, |record| {
-            matches!(
-                record.entity_type,
-                SemanticEntityType::Snippet | SemanticEntityType::Symbol
-            )
-        });
-
         let mut card_records =
             card_semantic_records(&file_cards, &folder_cards, repo_card.as_ref());
-        let card_batches = selected_batch_count(&card_records, |_| true);
-        let mut embedding_progress = EmbeddingProgress::new(raw_batches + card_batches);
 
-        if let Err(err) = embed_selected_records(
-            &self.embedder,
-            &mut raw_records,
-            |record| {
+        if self.retrieval_config.dense_enabled {
+            let raw_batches = selected_batch_count(&raw_records, |record| {
                 matches!(
                     record.entity_type,
                     SemanticEntityType::Snippet | SemanticEntityType::Symbol
                 )
-            },
-            Some(&mut progress),
-            Some(&mut embedding_progress),
-        ) {
-            return fail_with_progress("embedding_raw_records", err, &mut progress);
-        }
+            });
+            let card_batches = selected_batch_count(&card_records, |_| true);
+            let mut embedding_progress = EmbeddingProgress::new(raw_batches + card_batches);
 
-        if let Err(err) = embed_selected_records(
-            &self.embedder,
-            &mut card_records,
-            |_| true,
-            Some(&mut progress),
-            Some(&mut embedding_progress),
-        ) {
-            return fail_with_progress("embedding_card_records", err, &mut progress);
+            if let Err(err) = embed_selected_records(
+                &self.embedder,
+                &mut raw_records,
+                |record| {
+                    matches!(
+                        record.entity_type,
+                        SemanticEntityType::Snippet | SemanticEntityType::Symbol
+                    )
+                },
+                Some(&mut progress),
+                Some(&mut embedding_progress),
+            ) {
+                return fail_with_progress("embedding_raw_records", err, &mut progress);
+            }
+
+            if let Err(err) = embed_selected_records(
+                &self.embedder,
+                &mut card_records,
+                |_| true,
+                Some(&mut progress),
+                Some(&mut embedding_progress),
+            ) {
+                return fail_with_progress("embedding_card_records", err, &mut progress);
+            }
+        } else {
+            progress(MatryoshkaProgressEvent::EmbeddingSkipped {
+                record_count: raw_records.len() + card_records.len(),
+                reason: "dense embeddings disabled".into(),
+            });
         }
 
         let file_card_record_count = file_cards.len();
@@ -377,11 +399,15 @@ where
             .iter()
             .map(|record| record.record_id.clone())
             .collect::<Vec<_>>();
-        let late_vectors = match build_late_interaction_vectors(&self.embedder, &raw_records) {
-            Ok(vectors) => vectors,
-            Err(err) => {
-                return fail_with_progress("embedding_late_interaction", err, &mut progress);
+        let late_vectors = if self.retrieval_config.dense_enabled {
+            match build_late_interaction_vectors(&self.embedder, &raw_records) {
+                Ok(vectors) => vectors,
+                Err(err) => {
+                    return fail_with_progress("embedding_late_interaction", err, &mut progress);
+                }
             }
+        } else {
+            Vec::new()
         };
         progress(MatryoshkaProgressEvent::WritingDatabase {
             records_written: Some(raw_records.len()),
@@ -1486,26 +1512,41 @@ where
         raw_records.extend(chunk_records);
         let mut card_records =
             card_semantic_records(&file_cards, &folder_cards, repo_card.as_ref());
-        let raw_batches = selected_batch_count(&raw_records, |_| true);
-        let card_batches = selected_batch_count(&card_records, |_| true);
-        let mut embedding_progress = EmbeddingProgress::new(raw_batches + card_batches);
 
-        if let Err(err) = embed_selected_records(
-            &self.embedder,
-            &mut raw_records,
-            |_| true,
-            Some(progress),
-            Some(&mut embedding_progress),
-        ) {
-            return fail_with_progress("embedding_raw_records", err, progress);
+        let mut embedding_progress = if self.retrieval_config.dense_enabled {
+            let raw_batches = selected_batch_count(&raw_records, |_| true);
+            let card_batches = selected_batch_count(&card_records, |_| true);
+            Some(EmbeddingProgress::new(raw_batches + card_batches))
+        } else {
+            progress(MatryoshkaProgressEvent::EmbeddingSkipped {
+                record_count: raw_records.len() + card_records.len(),
+                reason: "dense embeddings disabled".into(),
+            });
+            None
+        };
+
+        if self.retrieval_config.dense_enabled {
+            if let Err(err) = embed_selected_records(
+                &self.embedder,
+                &mut raw_records,
+                |_| true,
+                Some(progress),
+                embedding_progress.as_mut(),
+            ) {
+                return fail_with_progress("embedding_raw_records", err, progress);
+            }
         }
         let raw_record_ids = raw_records
             .iter()
             .map(|record| record.record_id.clone())
             .collect::<Vec<_>>();
-        let raw_late_vectors = match build_late_interaction_vectors(&self.embedder, &raw_records) {
-            Ok(vectors) => vectors,
-            Err(err) => return fail_with_progress("embedding_late_interaction", err, progress),
+        let raw_late_vectors = if self.retrieval_config.dense_enabled {
+            match build_late_interaction_vectors(&self.embedder, &raw_records) {
+                Ok(vectors) => vectors,
+                Err(err) => return fail_with_progress("embedding_late_interaction", err, progress),
+            }
+        } else {
+            Vec::new()
         };
         progress(MatryoshkaProgressEvent::WritingDatabase {
             records_written: Some(raw_records.len()),
@@ -1520,23 +1561,28 @@ where
             return fail_with_progress("writing_late_interaction", err, progress);
         }
 
-        if let Err(err) = embed_selected_records(
-            &self.embedder,
-            &mut card_records,
-            |_| true,
-            Some(progress),
-            Some(&mut embedding_progress),
-        ) {
-            return fail_with_progress("embedding_card_records", err, progress);
+        if self.retrieval_config.dense_enabled {
+            if let Err(err) = embed_selected_records(
+                &self.embedder,
+                &mut card_records,
+                |_| true,
+                Some(progress),
+                embedding_progress.as_mut(),
+            ) {
+                return fail_with_progress("embedding_card_records", err, progress);
+            }
         }
         let card_record_ids = card_records
             .iter()
             .map(|record| record.record_id.clone())
             .collect::<Vec<_>>();
-        let card_late_vectors = match build_late_interaction_vectors(&self.embedder, &card_records)
-        {
-            Ok(vectors) => vectors,
-            Err(err) => return fail_with_progress("embedding_late_interaction", err, progress),
+        let card_late_vectors = if self.retrieval_config.dense_enabled {
+            match build_late_interaction_vectors(&self.embedder, &card_records) {
+                Ok(vectors) => vectors,
+                Err(err) => return fail_with_progress("embedding_late_interaction", err, progress),
+            }
+        } else {
+            Vec::new()
         };
         progress(MatryoshkaProgressEvent::WritingDatabase {
             records_written: Some(card_records.len()),
@@ -1603,7 +1649,11 @@ where
             fts_records: stats.fts_records,
             late_vector_rows: stats.late_vector_rows,
             records_with_late_vectors: stats.records_with_late_vectors,
-            late_interaction_enabled: late_interaction_enabled(),
+            retrieval_primary: self.retrieval_config.primary,
+            dense_enabled: self.retrieval_config.dense_enabled,
+            dense_fallback_enabled: self.retrieval_config.dense_fallback_enabled,
+            late_interaction_enabled: self.retrieval_config.dense_enabled
+                && late_interaction_enabled(),
         })
     }
 
@@ -1812,105 +1862,167 @@ where
         affected_file_ids: &BTreeSet<String>,
         progress: &mut dyn FnMut(MatryoshkaProgressEvent),
     ) -> Result<Vec<SemanticRecord>> {
+        let affected: BTreeSet<&str> = affected_file_ids.iter().map(String::as_str).collect();
+        let all_files_affected = affected_file_ids.is_empty();
+        let existing_chunks = self
+            .store
+            .load_all_code_chunks()?
+            .into_iter()
+            .map(|chunk| (chunk.chunk_id.clone(), chunk))
+            .collect::<BTreeMap<_, _>>();
+
+        let merged_chunks = snapshot
+            .code_chunks
+            .iter()
+            .map(|chunk| {
+                let is_affected = all_files_affected || affected.contains(chunk.file_id.as_str());
+                if !is_affected {
+                    return existing_chunks
+                        .get(&chunk.chunk_id)
+                        .cloned()
+                        .unwrap_or_else(|| chunk.clone());
+                }
+
+                if chunk.summary_source == ChunkSummarySource::Empty {
+                    if let Some(existing) = existing_chunks.get(&chunk.chunk_id) {
+                        if existing.source_hash == chunk.source_hash
+                            && matches!(
+                                existing.summary_source,
+                                ChunkSummarySource::Llm | ChunkSummarySource::Heuristic
+                            )
+                            && !existing.summary.trim().is_empty()
+                        {
+                            return existing.clone();
+                        }
+                    }
+                }
+
+                chunk.clone()
+            })
+            .collect::<Vec<_>>();
+
+        let affected_chunk_file_ids = if all_files_affected {
+            snapshot
+                .files
+                .iter()
+                .map(|file| file.file_id.clone())
+                .collect::<Vec<_>>()
+        } else {
+            affected_file_ids.iter().cloned().collect::<Vec<_>>()
+        };
+
         if !self.chunk_summary_enabled {
+            progress(MatryoshkaProgressEvent::WritingDatabase {
+                records_written: Some(merged_chunks.len()),
+            });
+            if let Err(err) = self
+                .store
+                .delete_code_chunks_for_files(&affected_chunk_file_ids)
+            {
+                return fail_with_progress("writing_code_chunks", err, progress);
+            }
+            if let Err(err) = self.store.upsert_code_chunks(&merged_chunks) {
+                return fail_with_progress("writing_code_chunks", err, progress);
+            }
             return Ok(Vec::new());
         }
 
         // Collect chunks that need summarization: affected files + Empty source.
-        let affected: BTreeSet<&str> = affected_file_ids.iter().map(String::as_str).collect();
-        let chunks_to_summarize: Vec<CodeChunkFact> = snapshot
-            .code_chunks
+        let chunks_to_summarize: Vec<CodeChunkFact> = merged_chunks
             .iter()
             .filter(|chunk| {
-                // Only summarize chunks in affected files (incremental).
-                if !affected_file_ids.is_empty() && !affected.contains(chunk.file_id.as_str()) {
-                    return false;
-                }
-                // Only summarize chunks that actually need a generated summary.
-                chunk.summary_source == ChunkSummarySource::Empty
+                let is_affected = all_files_affected || affected.contains(chunk.file_id.as_str());
+                is_affected && chunk.summary_source == ChunkSummarySource::Empty
             })
             .cloned()
             .collect();
 
-        if chunks_to_summarize.is_empty() {
-            // Still build semantic records for all chunks (docs + any previously
-            // generated summaries) so they're searchable.
-            return Ok(code_chunk_semantic_records(&snapshot.code_chunks));
-        }
+        let drafts = if chunks_to_summarize.is_empty() {
+            Vec::new()
+        } else {
+            progress(MatryoshkaProgressEvent::EnrichingChunks {
+                chunk_count: chunks_to_summarize.len(),
+            });
 
-        progress(MatryoshkaProgressEvent::EnrichingChunks {
-            chunk_count: chunks_to_summarize.len(),
-        });
-
-        let drafts = match self.chunk_summarizer.summarize_chunks_with_progress(
-            &chunks_to_summarize,
-            &mut |batch_index, total_batches, chunks_in_batch| {
-                progress(MatryoshkaProgressEvent::EnrichingChunkBatch {
-                    batch_index,
-                    total_batches,
-                    chunks_in_batch,
-                });
-                progress(MatryoshkaProgressEvent::EnrichedChunkBatch {
-                    batch_index,
-                    total_batches,
-                    chunks_in_batch,
-                });
-            },
-        ) {
-            Ok(drafts) => drafts,
-            Err(_err) => {
-                // If LLM summarization fails entirely, fall back to heuristic
-                // summaries so chunks still get a (grounded) summary record.
-                let fallback = matryoshka_enricher::HeuristicChunkSummarizer;
-                fallback
-                    .summarize_chunks(&chunks_to_summarize)?
-                    .into_iter()
-                    .map(|mut d| {
-                        // Mark as heuristic so we know it wasn't LLM-generated.
-                        d.summary = format!("[heuristic] {}", d.summary);
-                        d
-                    })
-                    .collect()
+            match self.chunk_summarizer.summarize_chunks_with_progress(
+                &chunks_to_summarize,
+                &mut |batch_index, total_batches, chunks_in_batch| {
+                    progress(MatryoshkaProgressEvent::EnrichingChunkBatch {
+                        batch_index,
+                        total_batches,
+                        chunks_in_batch,
+                    });
+                    progress(MatryoshkaProgressEvent::EnrichedChunkBatch {
+                        batch_index,
+                        total_batches,
+                        chunks_in_batch,
+                    });
+                },
+            ) {
+                Ok(drafts) => drafts,
+                Err(_err) => {
+                    // If LLM summarization fails entirely, fall back to heuristic
+                    // summaries so chunks still get a (grounded) summary record.
+                    let fallback = matryoshka_enricher::HeuristicChunkSummarizer;
+                    fallback
+                        .summarize_chunks(&chunks_to_summarize)?
+                        .into_iter()
+                        .map(|mut draft| {
+                            draft.summary = format!("[heuristic] {}", draft.summary);
+                            draft.source = ChunkSummarySource::Heuristic;
+                            draft
+                        })
+                        .collect()
+                }
             }
         };
 
         // Map drafts back onto chunks by chunk_id.
-        let drafts_by_id: BTreeMap<String, String> = drafts
+        let drafts_by_id = drafts
             .into_iter()
-            .map(|d| (d.chunk_id, d.summary))
-            .collect();
+            .map(|draft| (draft.chunk_id, (draft.summary, draft.source)))
+            .collect::<BTreeMap<_, _>>();
 
-        // Build the full updated chunk list: update summarized chunks, keep
-        // the rest as-is.
-        let updated_chunks: Vec<CodeChunkFact> = snapshot
-            .code_chunks
-            .iter()
+        // Build the full updated chunk list: update summarized chunks, preserve
+        // unchanged generated summaries, and keep newly parsed doc comments.
+        let updated_chunks: Vec<CodeChunkFact> = merged_chunks
+            .into_iter()
             .map(|chunk| {
-                if let Some(summary) = drafts_by_id.get(&chunk.chunk_id) {
+                if let Some((summary, source)) = drafts_by_id.get(&chunk.chunk_id) {
                     let mut updated = chunk.clone();
                     updated.generated_summary = Some(summary.clone());
                     updated.summary = summary.clone();
-                    updated.summary_source = ChunkSummarySource::Llm;
+                    updated.summary_source = *source;
                     updated
                 } else {
-                    chunk.clone()
+                    chunk
                 }
             })
             .collect();
 
-        // Persist updated chunks to the store.
+        // Persist all merged/updated chunks so doc-comment changes and preserved
+        // generated summaries are reflected in `code_chunks` even when no LLM call
+        // was needed for this update.
         progress(MatryoshkaProgressEvent::WritingDatabase {
             records_written: Some(updated_chunks.len()),
         });
+        if let Err(err) = self
+            .store
+            .delete_code_chunks_for_files(&affected_chunk_file_ids)
+        {
+            return fail_with_progress("writing_code_chunks", err, progress);
+        }
         if let Err(err) = self.store.upsert_code_chunks(&updated_chunks) {
             return fail_with_progress("writing_code_chunks", err, progress);
         }
 
-        progress(MatryoshkaProgressEvent::EnrichedChunks {
-            chunk_count: drafts_by_id.len(),
-        });
+        if !drafts_by_id.is_empty() {
+            progress(MatryoshkaProgressEvent::EnrichedChunks {
+                chunk_count: drafts_by_id.len(),
+            });
+        }
 
-        // Build semantic records for ALL chunks (docs + generated).
+        // Build semantic records for ALL non-empty chunks (docs + generated).
         Ok(code_chunk_semantic_records(&updated_chunks))
     }
 }
