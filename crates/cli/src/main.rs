@@ -94,6 +94,12 @@ enum Command {
         watch: bool,
         #[arg(long, default_value_t = false)]
         watch_daemon: bool,
+        #[arg(long = "chunk-summary-model", default_value = DEFAULT_CHUNK_SUMMARY_MODEL)]
+        chunk_summary_model: String,
+        #[arg(long = "chunk-summary-concurrency", default_value_t = DEFAULT_CHUNK_SUMMARY_CONCURRENCY)]
+        chunk_summary_concurrency: usize,
+        #[arg(long, default_value_t = false)]
+        no_chunk_summaries: bool,
     },
     Update {
         repo_root: PathBuf,
