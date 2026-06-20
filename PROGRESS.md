@@ -26,7 +26,7 @@ No useful docstring/doc comment
 | M1 — Code chunk extraction + doc extraction | ✅ Complete | Parser emits structural `CodeChunkFact`s with full body + docstring/doc-comment summaries |
 | M2 — Concurrent LLM chunk summaries + chunk semantic records | ✅ Complete | MLX/Raptor summarizes empty chunks concurrently; `code_chunk` semantic records built in target template; CLI/API flags wired |
 | M2.5 — Real-repo verification + parser hardening | ✅ Complete | Verified DB invariants on `/Users/rohit/pi/packages/agent/src`; fixed TS prompt-string false positive and removed `Unknown` chunks from embedding path |
-| M3 — Retrieval config, dense optional | ⬜ Next | Make dense embeddings optional at index/search time via CLI/API flags; stage-based candidate collection |
+| M3 — Retrieval config, dense optional | ✅ Complete | Dense embeddings can be disabled at index/search/prepare/update/rebuild/prewarm time; health/progress treats dense-off as valid |
 | M4 — SPLADE primary retrieval | ⬜ Not started | SPLADE sparse index + postings storage using omlx SPLADE model; SPLADE-first scoring |
 | M5 — Measurement & recall comparison | ⬜ Not started | Retrieval diagnostics + eval harness for SPLADE-only vs hybrid/dense |
 
@@ -528,30 +528,635 @@ fresh DB path or reindex after rebuilding the local binary:
 
 ---
 
-## Milestone 3 — Retrieval Config, Dense Optional ⬜
+## Milestone 3 — Retrieval Config, Dense Optional ✅
 
 ### Goal
 
-Make dense embeddings genuinely optional so we can run `exact + FTS` (and later
-`exact + SPLADE`) without embedding the query or the records.
+Make dense embeddings genuinely optional so we can run `exact + FTS` now, and
+`exact + SPLADE` in M4, without embedding the query or semantic records. Dense
+must remain available as a configurable fallback/support leg.
 
-### Planned changes
+### Implemented behavior
 
-- `crates/core-ir/src/models.rs` (or new config module) — `RetrievalConfig`, `RetrievalPrimary` enum (`Fts`, `Splade`, `Dense`, `Hybrid`).
-- `crates/indexer/src/indexer.rs` — make dense record embedding optional during `index`, `prepare`, `update`, and `rebuild-semantic`; skip dense vector writes and late-interaction vector generation when dense is disabled.
-- `crates/search/src/semantic_search.rs` — `SearchEngine` takes `Option<M>` embedder; stage-based candidate collection (`collect_exact_candidates`, `collect_fts_candidates`, `collect_dense_candidates`); skip query embedding when dense disabled; disable late-interaction when dense disabled.
-- `crates/store-sqlite/src/sqlite_store.rs` — make retrieval health reports explicit about dense-disabled indexes (`embedded_records=0` can be healthy when configured that way).
-- `crates/api/src/lib.rs` — `MatryoshkaConfig` gains `retrieval_primary`, `dense_enabled`, `dense_fallback_enabled`.
-- `crates/cli/src/main.rs` — `--retrieval-primary`, `--enable-dense`, `--disable-dense`, `--dense-fallback`, `--no-dense-fallback` flags on `prepare`/`index`/`update`/`search`/`op`/`prewarm`/`rebuild-semantic`.
-- Progress events — emit a clear dense-skipped/embedding-skipped state so a no-dense index run does not look stalled or broken.
+- `--disable-dense` skips document embedding during `index`, `prepare`, `update`,
+  and `rebuild-semantic`.
+- Dense-disabled indexing still writes:
+  - `semantic_records`
+  - `semantic_records_fts`
+  - code chunk records from M2
+  - file/folder/repo cards
+- Dense-disabled indexing does **not** write:
+  - dense vectors in `semantic_records.payload_json.embedding`
+  - `semantic_late_vectors`
+- Dense-disabled search calls no query embedder path and skips late-interaction
+  MaxSim scoring.
+- Dense-disabled health is valid when:
+  - `semantic_records > 0`
+  - `fts_records > 0`
+  - `embedded_records == 0`
+  - `records_with_late_vectors == 0`
+- Default behavior remains backward compatible: dense is enabled unless explicitly
+  disabled or `--retrieval-primary fts` is selected without `--enable-dense`.
 
-### Deliverable
+### Data model / progress events
+
+`crates/core-ir/src/models.rs`:
+
+```rust
+pub enum RetrievalPrimary { Fts, Splade, Dense, Hybrid }
+
+pub struct RetrievalConfig {
+    pub primary: RetrievalPrimary,
+    pub dense_enabled: bool,
+    pub dense_fallback_enabled: bool,
+}
+```
+
+`RetrievalIndexReport` now carries retrieval mode flags so CLI/API readiness can
+judge dense-off indexes correctly:
+
+```rust
+pub struct RetrievalIndexReport {
+    pub semantic_records: usize,
+    pub embedded_records: usize,
+    pub fts_records: usize,
+    pub late_vector_rows: usize,
+    pub records_with_late_vectors: usize,
+    pub retrieval_primary: RetrievalPrimary,
+    pub dense_enabled: bool,
+    pub dense_fallback_enabled: bool,
+    pub late_interaction_enabled: bool,
+}
+```
+
+New progress event:
+
+```json
+{"type":"embedding_skipped","record_count":13,"reason":"dense embeddings disabled"}
+```
+
+This makes dense-off runs visibly active instead of appearing stuck between chunk
+enrichment and database writes.
+
+### CLI/API configuration
+
+CLI flags added to relevant commands (`prepare`, `index`, `update`, `watch`,
+`rebuild-semantic`, `search`, `op`, `prewarm`, `read-bundle`):
+
+```text
+--retrieval-primary <fts|splade|dense|hybrid>
+--enable-dense
+--disable-dense      # alias: --no-dense-embeddings
+--dense-fallback
+--no-dense-fallback
+```
+
+Rust API additions on `MatryoshkaConfig`:
+
+```rust
+.with_retrieval_primary(RetrievalPrimary::Hybrid)
+.with_dense_enabled(false)
+.with_dense_fallback_enabled(false)
+.with_retrieval_config(RetrievalConfig { ... })
+.retrieval_config()
+```
+
+### Files touched in M3
+
+| File | Change |
+|---|---|
+| `crates/core-ir/src/models.rs` | Added `RetrievalPrimary`, `RetrievalConfig`; extended `RetrievalIndexReport`; added `EmbeddingSkipped` progress event |
+| `crates/search/src/semantic_search.rs` | Added `SearchEngine::with_dense`; skips query embedding and late-interaction scoring when dense is disabled |
+| `crates/indexer/src/indexer.rs` | Added `FullIndexer::with_retrieval_config` / `with_dense_embeddings_enabled`; gates record embedding and late-vector generation; emits `EmbeddingSkipped`; reports dense-aware health |
+| `crates/indexer/src/lib.rs` | Re-exported `RetrievalConfig` and `RetrievalPrimary` |
+| `crates/api/src/lib.rs` | Added dense/retrieval config builders; wired config through prepare/update/rebuild/prewarm/search; dense-aware readiness and progress-state mapping |
+| `crates/cli/src/main.rs` | Added retrieval flags; wired config through index/update/watch/rebuild/search/op/prewarm/read-bundle/prepare helpers; dense-aware prepare summaries and daemon args |
+| `crates/indexer/tests/rust_core.rs` | Added dense-disabled index/search regression test |
+| `crates/api/tests/facade.rs` | Added dense-disabled prepare/search lifecycle regression test |
+| `PROGRESS.md` | Marked M3 complete and documented behavior/validation |
+
+### Validation
+
+Automated:
 
 ```bash
-matryoshka-rs index /repo --disable-dense --progress-jsonl
-matryoshka-rs search "..." --disable-dense --no-dense-fallback
+cargo check --workspace
+cargo test -p matryoshka-indexer dense_disabled_indexing_keeps_fts_search_without_embeddings
+cargo test -p matryoshka-api prepare_with_dense_disabled_reaches_ready_without_embeddings
+cargo test --workspace
 ```
-works without embedding records during indexing and without embedding the query during search.
+
+All passed. Workspace test count after M3 includes:
+- API facade: 7 passed
+- Indexer integration: 12 passed, 1 ignored live MLX test
+- Parser: 16 passed
+- Search: 15 passed
+- Resolver/watcher/enricher tests passed; live oMLX tests remain ignored by default.
+
+Manual CLI smoke test:
+
+```bash
+./target/debug/matryoshka-rs index crates/indexer/tests/fixtures/mini_repo \
+  --db /tmp/matryoshka_m3_dense_off.db \
+  --offline \
+  --disable-dense \
+  --progress-jsonl
+```
+
+Observed:
+
+```json
+{"type":"embedding_skipped","record_count":13,"reason":"dense embeddings disabled"}
+{"type":"retrieval_index_health","report":{"semantic_records":15,"embedded_records":0,"fts_records":15,"late_vector_rows":0,"records_with_late_vectors":0,"retrieval_primary":"hybrid","dense_enabled":false,"dense_fallback_enabled":false,"late_interaction_enabled":false}}
+```
+
+Dense-disabled search also worked without late-interaction evidence:
+
+```bash
+./target/debug/matryoshka-rs search "where is get_env_api_key defined" \
+  --db /tmp/matryoshka_m3_dense_off.db \
+  --offline \
+  --disable-dense \
+  --no-dense-fallback
+```
+
+Top hit: `src/config/env.py`, with exact/FTS/symbol explanations and no
+`Late-interaction MaxSim` reason.
+
+### M3 edge-case matrix — run on 2026-06-20
+
+After the first M3 validation pass, a larger offline CLI matrix was run against
+temporary repos/DBs under:
+
+```text
+/tmp/matryoshka_m3_edge_matrix
+```
+
+The matrix used the freshly built local binary:
+
+```bash
+cargo build -p matryoshka-cli
+/Users/rohit/cradle-embed/target/debug/matryoshka-rs ...
+```
+
+Full machine-readable report:
+
+```text
+/tmp/matryoshka_m3_edge_matrix/report.json
+```
+
+Raw script summary:
+
+```text
+total: 36
+pass:  31
+fail:  5
+error: 0
+```
+
+Manual review of those rows produced **4 real failures** plus **2 caveats**:
+A7, A8, C7, and G3 are real failures; C2 and D6 work but have caveats.
+
+#### Fresh index + config flows
+
+| ID | Flow tested | Result | Observed output / notes |
+|---|---|---|---|
+| A1 | Fresh `index --offline` default dense | ✅ Pass | `semantic_records=18`, `fts_records=18`, `embedded_records=15`, `late_vectors=410`, `embedding_batch` emitted |
+| A2 | Fresh `index --offline --disable-dense` | ✅ Pass | `semantic_records=18`, `fts_records=18`, `embedded_records=0`, `late_vectors=0`, `embedding_skipped` emitted |
+| A3 | Fresh `index --retrieval-primary fts` | ✅ Pass | Defaults dense off: `embedded_records=0`, `late_vectors=0`, `embedding_skipped` emitted |
+| A4 | Fresh `index --retrieval-primary fts --enable-dense` | ✅ Pass | FTS primary but dense enabled: `embedded_records=15`, `late_vectors=410` |
+| A5 | `--enable-dense --disable-dense` | ✅ Pass | CLI errors: `choose either --enable-dense or --disable-dense, not both` |
+| A6 | `--dense-fallback --no-dense-fallback` | ✅ Pass | CLI errors: `choose either --dense-fallback or --no-dense-fallback, not both` |
+| A7 | `--retrieval-primary dense --disable-dense` | ❌ Fails validation expectation | CLI currently accepts this invalid config. Needs a guard: dense primary requires dense enabled. |
+| A8 | `--disable-dense --dense-fallback` | ❌ Fails validation expectation | CLI currently accepts this ambiguous config. Needs a guard: dense fallback requires dense enabled and must conflict with disable-dense. |
+
+#### Search flows
+
+| ID | Flow tested | Result | Observed output / notes |
+|---|---|---|---|
+| B1 | Search default against dense-enabled DB | ✅ Pass | Hits: `src/util.rs`, `src/lib.rs`, `src/auth.rs`; `Late-interaction MaxSim` evidence present |
+| B2 | Search `--disable-dense --no-dense-fallback` against dense-enabled DB | ✅ Pass | Same relevant hits; `Late-interaction MaxSim` evidence absent |
+| B3 | Search default dense against dense-disabled DB | ✅ Pass | Search still works via exact/FTS; hits include `src/util.rs`; no late evidence because DB has no late vectors |
+| B4 | Search dense disabled against dense-disabled DB | ✅ Pass | Search works via exact/FTS; no late evidence |
+
+#### Update / incremental flows with dense disabled
+
+| ID | Flow tested | Result | Observed output / notes |
+|---|---|---|---|
+| C1 | `update --disable-dense` with no source changes | ✅ Pass | No `enriching_file` events; stats unchanged; `embedded_records=0`, `late_vectors=0` |
+| C2 | Modify one file, then `update --disable-dense` | ⚠️ Pass with caveat | Only changed file enriched: `enriching_file_paths=['src/util.rs']`; search found new `cache_key`; dense stayed zero. Caveat: `chunk_sources` became `{'empty': 2, 'llm': 1, 'doc_comment': 1}`, meaning unchanged no-doc chunks lost generated summaries during the update. This needs a fix before M4. |
+| C3 | Add one file, then update | ✅ Pass | `enriching_file_paths=['src/added.rs']`; new path had semantic records and was searchable |
+| C4 | Delete one file, then update | ✅ Pass | Deleted path had `0` semantic records; search no longer returned deleted path |
+| C5 | Rename file | ✅ Pass | Old path `src/rename_me.rs` records `0`; new path `src/renamed.rs` records `5` |
+| C6 | Move file between folders | ✅ Pass | Old path records `0`; new path `src/nested/move_me.rs` records `5`; new folder record present |
+| C7 | Add then remove Rust doc comment on existing no-doc function | ❌ Fail | Expected chunk source to change `llm -> doc_comment -> llm/empty`; observed `initial=['llm']`, `after_add=['llm']`, `after_remove=['llm']`. Root cause: when no chunks need summarization, `refresh_chunk_summaries()` returns semantic records without upserting updated doc-only chunks. |
+| C8 | Modify function body only | ✅ Pass | New body term was searchable in `src/docflow.rs` |
+| C9 | Rename/signature change | ✅ Pass | Old symbol count `0`; new symbol count `1` |
+
+#### Prepare flows
+
+| ID | Flow tested | Result | Observed output / notes |
+|---|---|---|---|
+| D1 | `prepare --offline` new repo default dense | ✅ Pass | `status=ready`; `embedded_records=15`, `late_vectors=410` |
+| D2 | `prepare --offline --disable-dense` new repo | ✅ Pass | `status=ready`; actions `['index', 'prepare_results']`; `embedded_records=0`, `late_vectors=0` |
+| D3 | Prepare existing healthy dense-disabled DB | ✅ Pass | `status=ready`; actions `['update', 'prepare_results']` |
+| D4 | Delete ready marker, then prepare dense-disabled DB | ✅ Pass | `status=ready`; actions `['update', 'prepare_results']`; marker recreated |
+| D5 | Delete `semantic_records`, FTS, and late vectors, then prepare dense-disabled DB | ✅ Pass | Actions `['rebuild_search', 'prepare_results']`; rebuilt `semantic_records=15`, `fts_records=15`, `embedded_records=0` |
+| D6 | Delete file/folder/repo cards, then prepare dense-disabled DB | ⚠️ Works but action label caveat | Cards were repaired (`file_cards=3`, `folder_cards=2`) and status was ready, but actions were `['update', 'prepare_results']` instead of an explicit `repair`. This is observability-only; behavior works. |
+| D7 | Prepare dense-disabled DB again with default dense enabled | ✅ Pass | Detected dense missing and rebuilt search: actions `['rebuild_search', 'prepare_results']`; `embedded_records=12`, `late_vectors=389` |
+| D8 | Prepare dense-enabled DB with `--disable-dense` | ✅ Pass | `status=ready`; dense-off health accepted. Existing dense vectors remain in DB (`embedded_records=15`, `late_vectors=410`) but are ignored by dense-disabled search. |
+
+#### Rebuild flows
+
+| ID | Flow tested | Result | Observed output / notes |
+|---|---|---|---|
+| E1 | `rebuild-semantic --offline` default dense | ✅ Pass | `semantic_records=15`, `fts_records=15`, `embedded_records=12`, `late_vectors=389` |
+| E2 | `rebuild-semantic --offline --disable-dense` after dense DB | ✅ Pass | Dense artifacts purged for rebuilt records: `embedded_records=0`, `late_vectors=0`, `embedding_skipped` emitted |
+
+#### Watch bounded probe
+
+| ID | Flow tested | Result | Observed output / notes |
+|---|---|---|---|
+| F1 | Start `watch --disable-dense --skip-startup-update` and terminate after 1.5s | ✅ Pass | Watch started and printed: `watching /tmp/matryoshka_m3_edge_matrix/f_watch every 500ms with 500ms debounce`; process was intentionally terminated (`returncode=-15`). This verifies CLI config acceptance/startup only, not a full file-change watch loop. |
+
+#### Chunk-summary flows
+
+| ID | Flow tested | Result | Observed output / notes |
+|---|---|---|---|
+| G1 | Documented Rust chunk | ✅ Pass | `documented_chunk` source was `['doc_comment']` |
+| G2 | Undocumented Rust chunk in offline mode | ✅ Pass with naming caveat | Summary was generated and source stored as `['llm']`. Because offline uses `HeuristicChunkSummarizer`, we may want to store `heuristic` instead of `llm` for more accurate provenance. |
+| G3 | `index --offline --disable-dense --no-chunk-summaries` | ❌ Fail | Expected no generated summaries for undocumented chunks; observed `sources=['llm']`. Root cause: offline `index` / `update` branches do not call `.with_chunk_summary_enabled(!no_chunk_summaries)`, so the flag is ignored offline. Online branch is wired. |
+
+#### Retrieval-health edge flow
+
+| ID | Flow tested | Result | Observed output / notes |
+|---|---|---|---|
+| H1 | Delete FTS rows, then prepare dense-disabled DB | ✅ Pass | Detected missing FTS and rebuilt search: actions `['rebuild_search', 'prepare_results']`; `fts_records=15`, `embedded_records=0` |
+
+### M3 live oMLX matrix — run on 2026-06-20
+
+A smaller live matrix was also run against the actual oMLX server:
+
+```text
+base_url: http://127.0.0.1:44449
+api_key: 2508
+chat_model: MercuriusDream--Qwen3.5-4B-MLX-mxfp8
+chunk_summary_model: srswti--bodega-raptor-90m
+embedding_model: mlx-community--embeddinggemma-300m-bf16
+```
+
+Model probe:
+
+```text
+GET /v1/models -> 200
+srswti--bodega-raptor-90m = present
+MercuriusDream--Qwen3.5-4B-MLX-mxfp8 = present
+mlx-community--embeddinggemma-300m-bf16 = present
+```
+
+Temporary root and report:
+
+```text
+/tmp/matryoshka_m3_omlx_matrix
+/tmp/matryoshka_m3_omlx_matrix/report.json
+```
+
+Raw matrix result was `5/6` because the first `rebuild-semantic` command was
+called with unsupported chunk-summary flags. Rerunning `rebuild-semantic` with
+its actual CLI surface passed, so the functional live result is **6/6 pass**
+with the same incremental chunk-summary caveat already found offline.
+
+#### Live oMLX results
+
+| ID | Flow tested | Result | Observed output / notes |
+|---|---|---|---|
+| L1 | Live `index` with oMLX, dense disabled | ✅ Pass | `semantic_records=16`, `fts_records=16`, `embedded_records=0`, `late_vectors=0`, `code_chunks=3`, `chunk_sources={'llm': 2, 'doc_comment': 1}`, `embedding_skipped` emitted |
+| L2 | Live search against L1 DB with `--disable-dense --no-dense-fallback` | ✅ Pass | Hits included `src/util.rs`; no `Late-interaction MaxSim` evidence |
+| L3 | Modify `src/util.rs`, then live `update --disable-dense` | ⚠️ Pass with caveat | Only changed file enriched: `enriching_file_paths=['src/util.rs']`; search found `live_update_marker`; `embedded_records=0`, `late_vectors=0`. Same caveat as offline: unchanged `api_entry` chunk became `summary_source=empty`, so unchanged generated summaries are not preserved correctly. |
+| L4 | Live `rebuild-semantic --disable-dense` | ✅ Pass after corrected command | Correct command emitted `embedding_skipped` with `record_count=15`; final stats `semantic_records=15`, `fts_records=15`, `embedded_records=0`, `late_vectors=0`. First attempt failed only because `rebuild-semantic` does not accept `--chunk-summary-model` / `--chunk-summary-concurrency`. |
+| L5 | Live `prepare --disable-dense` on fresh repo | ✅ Pass | `status=ready`, actions `['index', 'prepare_results']`; `semantic_records=16`, `fts_records=16`, `embedded_records=0`, `late_vectors=0` |
+| L6 | Live `index` dense-enabled tiny repo | ✅ Pass | Verified embedding endpoint path: `semantic_records=8`, `fts_records=8`, `embedded_records=7`, `late_vectors=239`, `embedding_batch`/`embedded_batch` emitted |
+
+Live chunk summaries observed from oMLX/Raptor:
+
+```text
+api_entry -> llm -> The function `api_entry` returns a string from the `util::helper()` function.
+helper -> doc_comment -> Returns the original helper value.
+undocumented_live_chunk -> llm -> A function returns a string 'live-undocumented'.
+live_update_marker -> llm -> A function named live_update_marker returns a string 'live-update-marker'.
+```
+
+Corrected live rebuild command:
+
+```bash
+/Users/rohit/cradle-embed/target/debug/matryoshka-rs rebuild-semantic \
+  /tmp/matryoshka_m3_omlx_matrix/live_dense_off \
+  --db /tmp/matryoshka_m3_omlx_matrix/live_dense_off.db \
+  --base-url http://127.0.0.1:44449 \
+  --api-key 2508 \
+  --embedding-model mlx-community--embeddinggemma-300m-bf16 \
+  --disable-dense \
+  --progress-jsonl
+```
+
+Observed corrected rebuild output:
+
+```json
+{"type":"embedding_skipped","record_count":15,"reason":"dense embeddings disabled"}
+{"type":"retrieval_index_health","report":{"semantic_records":15,"embedded_records":0,"fts_records":15,"late_vector_rows":0,"records_with_late_vectors":0,"retrieval_primary":"hybrid","dense_enabled":false,"dense_fallback_enabled":false,"late_interaction_enabled":false}}
+```
+
+#### Fixes identified before M4
+
+The offline and live matrices found the following concrete follow-ups, which are
+marked completed in the next section:
+
+1. ✅ **CLI config validation** (`crates/cli/src/main.rs`):
+   - reject `--retrieval-primary dense --disable-dense`
+   - reject `--disable-dense --dense-fallback`
+2. ✅ **Offline no-chunk-summaries wiring** (`crates/cli/src/main.rs`):
+   - apply `.with_chunk_summary_enabled(!no_chunk_summaries)` in the offline `index` and `update` branches, not just online branches.
+3. ✅ **Incremental chunk-summary preservation** (`crates/indexer/src/indexer.rs`):
+   - preserve existing generated summaries for unchanged chunks during `update`.
+   - do not overwrite unchanged no-doc chunks back to `summary_source=empty`.
+4. ✅ **Doc-comment update persistence** (`crates/indexer/src/indexer.rs`):
+   - if a changed chunk now has a useful doc comment/docstring and no LLM call is needed, upsert the updated `CodeChunkFact` anyway.
+5. ✅ **Provenance cleanup**:
+   - oMLX/Raptor chunk summaries persist as `summary_source=llm`; heuristic summaries persist as `summary_source=heuristic`.
+
+### M3 follow-up fixes — completed on 2026-06-20
+
+The above issues were fixed one-by-one and validated with live oMLX only (no
+offline test matrix was run for this pass).
+
+#### Code changes
+
+| Area | Files | Fix |
+|---|---|---|
+| CLI validation | `crates/cli/src/main.rs` | `resolve_retrieval_config()` now rejects `--retrieval-primary dense --disable-dense` and `--disable-dense --dense-fallback` |
+| Chunk summary flag wiring | `crates/cli/src/main.rs` | Offline CLI `index`/`update` and CLI prepare helpers now pass `.with_chunk_summary_enabled(...)`; online path was already wired |
+| Summary provenance | `crates/enricher/src/lib.rs`, `crates/enricher/src/heuristic.rs`, `crates/enricher/src/mlx_chat.rs`, `crates/indexer/src/indexer.rs` | `ChunkSummaryDraft` now carries `source`; oMLX summaries store `llm`, heuristic summaries store `heuristic` |
+| Incremental summary preservation | `crates/indexer/src/indexer.rs` | `refresh_chunk_summaries()` merges unchanged chunks from the existing DB so generated summaries are preserved when unrelated files change |
+| Doc-comment add/remove | `crates/indexer/src/indexer.rs` | Changed-file code chunks are replaced before upsert, avoiding stale duplicate chunks when doc comments shift line numbers; changed doc-only chunks are persisted even if no LLM call is needed |
+
+Compile/build validation:
+
+```bash
+cargo fmt --all
+cargo check --workspace
+cargo build -p matryoshka-cli
+```
+
+All passed.
+
+#### Live oMLX fix matrix
+
+Temporary root/report:
+
+```text
+/tmp/matryoshka_m3_fix_omlx_matrix
+/tmp/matryoshka_m3_fix_omlx_matrix/report.json
+```
+
+Model config:
+
+```text
+base_url: http://127.0.0.1:44449
+chat_model: MercuriusDream--Qwen3.5-4B-MLX-mxfp8
+chunk_summary_model: srswti--bodega-raptor-90m
+embedding_model: mlx-community--embeddinggemma-300m-bf16
+```
+
+Result:
+
+```text
+total: 7
+pass:  7
+fail:  0
+```
+
+| ID | Flow tested live against oMLX | Result | Observed output / notes |
+|---|---|---|---|
+| P0 | `/v1/models` probe | ✅ Pass | All three models present |
+| V1 | `--retrieval-primary dense --disable-dense` | ✅ Pass | CLI now errors: `--retrieval-primary dense requires dense embeddings; remove --disable-dense or choose another primary` |
+| V2 | `--disable-dense --dense-fallback` | ✅ Pass | CLI now errors: `--dense-fallback requires dense embeddings; remove --disable-dense or use --no-dense-fallback` |
+| V3 | Online `index --disable-dense --no-chunk-summaries` | ✅ Pass | `undocumented_chunk` stayed `summary_source=empty`; no `enriching_chunks`; `embedded_records=0`, `late_vectors=0` |
+| V4 | Live index, modify only `src/util.rs`, then live update | ✅ Pass | Unchanged `api_entry` kept its `llm` summary exactly; new `live_update_marker` got `llm`; only `src/util.rs` enriched; dense stayed zero |
+| V5 | Add/remove Rust doc comment | ✅ Pass | `docflow_target`: `llm -> doc_comment -> llm`; no duplicate stale chunks remained |
+| V6 | Dense-enabled live sanity index | ✅ Pass | Dense path still works: `embedded_records=7`, `late_vectors=239`, `embedding_batch` emitted |
+
+Key fixed observations:
+
+```text
+V4 api_entry before update:
+  source=llm
+  summary=A function in the 'api_entry' symbol that returns a string from the 'util::helper' function.
+
+V4 api_entry after unrelated file update:
+  source=llm
+  summary=A function in the 'api_entry' symbol that returns a string from the 'util::helper' function.
+
+V5 docflow_target:
+  initial:      source=llm
+  after doc:    source=doc_comment, summary=Explains the documented flow target.
+  after remove: source=llm
+```
+
+#### Live oMLX validation on `cradle-embed`
+
+The current repo was indexed using live oMLX with dense disabled and a temp DB:
+
+```text
+repo: /Users/rohit/cradle-embed
+db:   /tmp/cradle_embed_m3_fix_omlx.db
+```
+
+Command shape:
+
+```bash
+./target/debug/matryoshka-rs index /Users/rohit/cradle-embed \
+  --db /tmp/cradle_embed_m3_fix_omlx.db \
+  --base-url http://127.0.0.1:44449 \
+  --api-key 2508 \
+  --model MercuriusDream--Qwen3.5-4B-MLX-mxfp8 \
+  --embedding-model mlx-community--embeddinggemma-300m-bf16 \
+  --chunk-summary-model srswti--bodega-raptor-90m \
+  --chunk-summary-concurrency 6 \
+  --disable-dense \
+  --ignore target \
+  --ignore .git \
+  --ignore .matryoshka \
+  --progress-jsonl
+```
+
+Index result:
+
+```text
+files_discovered: 35
+symbol_count: 856
+code_chunks: 856
+chunk summaries requested: 842
+chunk summary batches: 27
+semantic_records: 1956
+fts_records: 1956
+embedded_records: 0
+late_vectors: 0
+retrieval_primary: hybrid
+dense_enabled: false
+late_interaction_enabled: false
+```
+
+No-change live update against the same DB:
+
+```text
+semantic_records: 1956
+embedded_records: 0
+fts_records: 1956
+late_vector_rows: 0
+records_with_late_vectors: 0
+```
+
+DB summary after index + no-change update:
+
+```text
+code_chunks: 856
+chunk_sources:
+  doc_comment: 14
+  llm:         842
+  empty:       0
+semantic_records: 1956
+fts_records: 1956
+embedded_records: 0
+late_vectors: 0
+```
+
+Dense-disabled search:
+
+```bash
+./target/debug/matryoshka-rs search "where is resolve_retrieval_config defined" \
+  --db /tmp/cradle_embed_m3_fix_omlx.db \
+  --base-url http://127.0.0.1:44449 \
+  --api-key 2508 \
+  --embedding-model mlx-community--embeddinggemma-300m-bf16 \
+  --disable-dense \
+  --no-dense-fallback
+```
+
+Top hit:
+
+```text
+crates/cli/src/main.rs
+record_id: semantic:symbol:crates/cli/src/main.rs::resolve_retrieval_config:498
+why_matched: exact token/symbol/path + SQLite FTS + Symbol query plan
+Late-interaction MaxSim: absent
+```
+
+### M3.1 — Search Result Granularity + Compact Output ✅
+
+After M3, code chunks were indexed and searched, but the default search response
+still collapsed matching symbol/snippet/chunk records back into file-level results.
+That meant chunk records participated in ranking, but the visible JSON often showed
+file-card summaries instead of function/class/method summaries.
+
+Implemented:
+
+- `crates/search/src/semantic_search.rs`
+  - Added `SearchResultGranularity`:
+    - `file` — current/default behavior; collapse file/symbol/snippet/chunk hits into one file result.
+    - `record` — no collapse; return raw matching records.
+    - `symbol` — return only symbol records.
+    - `chunk` — return only `code_chunk` records, i.e. function/class/method chunks.
+  - Added `SearchEngine::with_result_granularity(...)`.
+  - Changed non-file result hydration so `code_chunk` output now shows the chunk summary, symbol, kind, signature, line range, and summary source instead of replacing it with the file-card summary.
+
+- `crates/api/src/lib.rs`
+  - Added `SearchOptions.result_granularity` with default `file`.
+  - Added `SearchOptions::with_result_granularity(...)`.
+  - Wired the option through the Rust API search path.
+
+- `crates/cli/src/main.rs`
+  - Added CLI search/op flags:
+
+    ```text
+    --result-granularity <file|record|symbol|chunk>
+    --no-collapse       # shortcut for --result-granularity record
+    --compact           # aliases: --hide-match-details, --no-match-details
+    ```
+
+  - `--compact` removes these noisy JSON fields from search output:
+    - `matched_terms`
+    - `total_matched_symbols`
+    - `why_matched`
+  - `matched_symbols` is intentionally preserved.
+
+Validation:
+
+```bash
+cargo fmt --all
+cargo check --workspace
+cargo test -p matryoshka-search
+cargo test --workspace
+cargo build -p matryoshka-cli
+```
+
+All passed.
+
+Live oMLX search validation against the dense-enabled `cradle-embed` DB:
+
+```bash
+./target/debug/matryoshka-rs search \
+  "how does update preserve unchanged generated chunk summaries" \
+  --db /Users/rohit/cradle-embed/.matryoshka/matryoshka.db \
+  --base-url http://127.0.0.1:44449 \
+  --api-key 2508 \
+  --embedding-model mlx-community--embeddinggemma-300m-bf16 \
+  --enable-dense \
+  --result-granularity chunk \
+  --compact \
+  --limit 3
+```
+
+Observed top chunk result:
+
+```text
+entity_type: code_chunk
+path: crates/indexer/src/indexer.rs
+symbol: FullIndexer::refresh_chunk_summaries
+summary_source: doccomment
+summary: Summarize code chunks that have no useful docstring/doc comment, persist the updated chunks to the store, and build `code_chunk` semantic records in the target template for retrieval...
+```
+
+Compact output confirmed absent:
+
+```text
+matched_terms: absent
+total_matched_symbols: absent
+why_matched: absent
+matched_symbols: present
+```
+
+Additional live checks:
+
+```bash
+./target/debug/matryoshka-rs search \
+  "where is resolve_retrieval_config defined" \
+  --db /Users/rohit/cradle-embed/.matryoshka/matryoshka.db \
+  --base-url http://127.0.0.1:44449 \
+  --api-key 2508 \
+  --embedding-model mlx-community--embeddinggemma-300m-bf16 \
+  --enable-dense \
+  --no-collapse \
+  --compact \
+  --limit 4
+```
+
+Observed raw record-level output with top result:
+
+```text
+entity_type: symbol
+path: crates/cli/src/main.rs
+symbol: resolve_retrieval_config
+```
 
 ---
 
