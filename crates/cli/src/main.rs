@@ -1,7 +1,9 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
 use matryoshka_embed_client::{DeterministicEmbedder, EndpointEmbedder};
-use matryoshka_enricher::{HeuristicEnricher, MlxChatEnricher};
+use matryoshka_enricher::{
+    HeuristicChunkSummarizer, HeuristicEnricher, MlxChatEnricher, MlxChunkSummarizer,
+};
 use matryoshka_indexer::{
     ArtifactQualityReport, FullIndexer, IndexSummary, MatryoshkaProgressEvent,
     RetrievalIndexReport, SemanticRebuildSummary, UpdateSummary,
@@ -28,6 +30,8 @@ const DEFAULT_API_KEY: &str = "2508";
 const DEFAULT_EMBED_MODEL: &str = "mlx-community--embeddinggemma-300m-bf16";
 const DEFAULT_CHAT_MODEL: &str = "MercuriusDream--Qwen3.5-4B-MLX-mxfp8";
 const DEFAULT_OMLX_RERANK_MODEL: &str = "mlx-community--Qwen3-Reranker-0.6B-mxfp8";
+const DEFAULT_CHUNK_SUMMARY_MODEL: &str = "srswti--bodega-raptor-90m";
+const DEFAULT_CHUNK_SUMMARY_CONCURRENCY: usize = 6;
 const MATRYOSHKA_DIR: &str = ".matryoshka";
 const DEFAULT_DB_FILE: &str = "matryoshka.db";
 const WATCH_PID_FILE: &str = "watch.pid";
@@ -398,9 +402,13 @@ fn main() -> Result<()> {
             let store = MatryoshkaStore::open(&db)?;
             let parser_config = parser_config(ignore);
             if offline {
-                let indexer =
-                    FullIndexer::new(store, HeuristicEnricher, DeterministicEmbedder::default())
-                        .with_parser_config(parser_config);
+                let indexer = FullIndexer::new(
+                    store,
+                    HeuristicEnricher,
+                    DeterministicEmbedder::default(),
+                    HeuristicChunkSummarizer,
+                )
+                .with_parser_config(parser_config);
                 let summary = if progress_jsonl {
                     indexer.index_repo_with_progress(&repo_root, print_progress_jsonl)?
                 } else {
@@ -414,8 +422,10 @@ fn main() -> Result<()> {
                 let enricher =
                     MlxChatEnricher::new(&base_url, &api_key).with_model(chat_model.clone());
                 let embedder = EndpointEmbedder::new(&base_url, &api_key, embed_model.clone());
-                let indexer =
-                    FullIndexer::new(store, enricher, embedder).with_parser_config(parser_config);
+                let chunk_summarizer =
+                    MlxChunkSummarizer::new(&base_url, &api_key).with_model(&chunk_summary_model);
+                let indexer = FullIndexer::new(store, enricher, embedder, chunk_summarizer)
+                    .with_parser_config(parser_config);
                 let summary = if progress_jsonl {
                     indexer.index_repo_with_progress(&repo_root, print_progress_jsonl)?
                 } else {

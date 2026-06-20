@@ -1,6 +1,7 @@
 use matryoshka_core_ir::MatryoshkaProgressEvent;
 use matryoshka_embed_client::DeterministicEmbedder;
 use matryoshka_embed_client::EndpointEmbedder;
+use matryoshka_enricher::HeuristicChunkSummarizer;
 use matryoshka_enricher::HeuristicEnricher;
 use matryoshka_enricher::MlxChatEnricher;
 use matryoshka_indexer::FullIndexer;
@@ -15,7 +16,7 @@ fn indexes_searches_and_reads_file_cards() {
     let temp = tempfile::tempdir().unwrap();
     let db_path = temp.path().join("index.db");
     let store = MatryoshkaStore::open(&db_path).unwrap();
-    let indexer = FullIndexer::new(store, HeuristicEnricher, DeterministicEmbedder::default());
+    let indexer = FullIndexer::new(store, HeuristicEnricher, DeterministicEmbedder::default(), HeuristicChunkSummarizer);
 
     let summary = indexer.index_repo(&repo_root).unwrap();
 
@@ -145,7 +146,7 @@ fn incremental_update_refreshes_changed_entities_and_preserves_unaffected_cards(
 
     let db_path = temp.path().join("index.db");
     let store = MatryoshkaStore::open(&db_path).unwrap();
-    let indexer = FullIndexer::new(store, HeuristicEnricher, DeterministicEmbedder::default());
+    let indexer = FullIndexer::new(store, HeuristicEnricher, DeterministicEmbedder::default(), HeuristicChunkSummarizer);
     indexer.index_repo(repo_root).unwrap();
 
     let store = MatryoshkaStore::open(&db_path).unwrap();
@@ -202,7 +203,7 @@ fn incremental_update_removes_deleted_files_from_fts_candidates() {
 
     let db_path = temp.path().join("index.db");
     let store = MatryoshkaStore::open(&db_path).unwrap();
-    let indexer = FullIndexer::new(store, HeuristicEnricher, DeterministicEmbedder::default());
+    let indexer = FullIndexer::new(store, HeuristicEnricher, DeterministicEmbedder::default(), HeuristicChunkSummarizer);
     indexer.index_repo(repo_root).unwrap();
 
     let before_hits = MatryoshkaStore::open(&db_path)
@@ -248,10 +249,11 @@ fn heuristic_parent_folder_cards_use_grounded_rollup_summaries() {
     let db_path = temp.path().join("index.db");
     let store = MatryoshkaStore::open(&db_path).unwrap();
     let indexer = FullIndexer::new(
-        store.clone(),
-        HeuristicEnricher,
-        DeterministicEmbedder::default(),
-    );
+                store.clone(),
+                HeuristicEnricher,
+                DeterministicEmbedder::default(),
+                HeuristicChunkSummarizer,
+            );
 
     indexer.index_repo(repo_root).unwrap();
 
@@ -306,10 +308,11 @@ fn storage_heuristics_do_not_leak_matryoshka_internals() {
     let db_path = temp.path().join("index.db");
     let store = MatryoshkaStore::open(&db_path).unwrap();
     let indexer = FullIndexer::new(
-        store.clone(),
-        HeuristicEnricher,
-        DeterministicEmbedder::default(),
-    );
+                store.clone(),
+                HeuristicEnricher,
+                DeterministicEmbedder::default(),
+                HeuristicChunkSummarizer,
+            );
 
     indexer.index_repo(repo_root).unwrap();
 
@@ -338,7 +341,7 @@ fn rebuild_semantic_recovers_search_without_full_reindex() {
     let temp = tempfile::tempdir().unwrap();
     let db_path = temp.path().join("index.db");
     let store = MatryoshkaStore::open(&db_path).unwrap();
-    let indexer = FullIndexer::new(store, HeuristicEnricher, DeterministicEmbedder::default());
+    let indexer = FullIndexer::new(store, HeuristicEnricher, DeterministicEmbedder::default(), HeuristicChunkSummarizer);
 
     indexer.index_repo(&repo_root).unwrap();
 
@@ -386,7 +389,7 @@ fn index_repo_with_progress_emits_real_events() {
     let temp = tempfile::tempdir().unwrap();
     let db_path = temp.path().join("index.db");
     let store = MatryoshkaStore::open(&db_path).unwrap();
-    let indexer = FullIndexer::new(store, HeuristicEnricher, DeterministicEmbedder::default());
+    let indexer = FullIndexer::new(store, HeuristicEnricher, DeterministicEmbedder::default(), HeuristicChunkSummarizer);
     let mut events = Vec::new();
 
     let summary = indexer
@@ -467,7 +470,7 @@ fn index_repo_with_progress_emits_failed_event() {
     let temp = tempfile::tempdir().unwrap();
     let db_path = temp.path().join("index.db");
     let store = MatryoshkaStore::open(&db_path).unwrap();
-    let indexer = FullIndexer::new(store, HeuristicEnricher, DeterministicEmbedder::default());
+    let indexer = FullIndexer::new(store, HeuristicEnricher, DeterministicEmbedder::default(), HeuristicChunkSummarizer);
     let mut events = Vec::new();
 
     let err = indexer
@@ -496,7 +499,7 @@ fn rebuild_semantic_with_progress_emits_batch_events() {
     let temp = tempfile::tempdir().unwrap();
     let db_path = temp.path().join("index.db");
     let store = MatryoshkaStore::open(&db_path).unwrap();
-    let indexer = FullIndexer::new(store, HeuristicEnricher, DeterministicEmbedder::default());
+    let indexer = FullIndexer::new(store, HeuristicEnricher, DeterministicEmbedder::default(), HeuristicChunkSummarizer);
 
     indexer.index_repo(&repo_root).unwrap();
 
@@ -543,10 +546,11 @@ fn update_repairs_missing_enriched_artifacts_after_interrupted_prewarm() {
     let db_path = temp.path().join("index.db");
     let store = MatryoshkaStore::open(&db_path).unwrap();
     let indexer = FullIndexer::new(
-        store.clone(),
-        HeuristicEnricher,
-        DeterministicEmbedder::default(),
-    );
+                store.clone(),
+                HeuristicEnricher,
+                DeterministicEmbedder::default(),
+                HeuristicChunkSummarizer,
+            );
 
     indexer.index_repo(&repo_root).unwrap();
     store
@@ -615,10 +619,11 @@ fn update_repairs_empty_non_heuristic_file_summaries() {
     let db_path = temp.path().join("index.db");
     let store = MatryoshkaStore::open(&db_path).unwrap();
     let indexer = FullIndexer::new(
-        store.clone(),
-        HeuristicEnricher,
-        DeterministicEmbedder::default(),
-    );
+                store.clone(),
+                HeuristicEnricher,
+                DeterministicEmbedder::default(),
+                HeuristicChunkSummarizer,
+            );
 
     indexer.index_repo(&repo_root).unwrap();
 
@@ -670,6 +675,7 @@ fn real_mlx_progress_integration() {
         store,
         MlxChatEnricher::new(&base_url, &api_key).with_model(chat_model),
         EndpointEmbedder::new(&base_url, &api_key, embed_model),
+                HeuristicChunkSummarizer,
     );
     let mut events = Vec::new();
 

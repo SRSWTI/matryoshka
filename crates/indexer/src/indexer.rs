@@ -1,12 +1,14 @@
 use anyhow::Result;
 use matryoshka_core_ir::{
-    ArtifactQualityReport, FileCard, FileEnrichmentContext, FileFact, FolderCard,
-    FolderEnrichmentContext, ImportContext, LateInteractionVector, MatryoshkaProgressEvent,
-    RelatedFileContext, RepoCard, RepositorySnapshot, RetrievalIndexReport, SemanticEntityType,
-    SemanticRecord,
+    ArtifactQualityReport, ChunkSummarySource, CodeChunkFact, FileCard, FileEnrichmentContext,
+    FileFact, FolderCard, FolderEnrichmentContext, ImportContext, LateInteractionVector,
+    MatryoshkaProgressEvent, RelatedFileContext, RepoCard, RepositorySnapshot,
+    RetrievalIndexReport, SemanticEntityType, SemanticRecord,
 };
 use matryoshka_embed_client::Embedder;
-use matryoshka_enricher::CodeEnricher;
+use matryoshka_enricher::{
+    ChunkSummarizer, ChunkSummaryDraft, CodeEnricher, HeuristicChunkSummarizer,
+};
 use matryoshka_parser::{ParserConfig, SourceParser};
 use matryoshka_resolver::GraphResolver;
 use matryoshka_store_sqlite::MatryoshkaStore;
@@ -17,29 +19,39 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::thread;
 
-pub struct FullIndexer<E, M> {
+pub struct FullIndexer<E, M, S = HeuristicChunkSummarizer> {
     store: MatryoshkaStore,
     enricher: E,
     embedder: M,
+    chunk_summarizer: S,
     parser_config: ParserConfig,
+    chunk_summary_enabled: bool,
 }
 
-impl<E, M> FullIndexer<E, M>
+impl<E, M, S> FullIndexer<E, M, S>
 where
     E: CodeEnricher + Sync,
     M: Embedder + Sync,
+    S: ChunkSummarizer + Sync,
 {
-    pub fn new(store: MatryoshkaStore, enricher: E, embedder: M) -> Self {
+    pub fn new(store: MatryoshkaStore, enricher: E, embedder: M, chunk_summarizer: S) -> Self {
         Self {
             store,
             enricher,
             embedder,
+            chunk_summarizer,
             parser_config: ParserConfig::default(),
+            chunk_summary_enabled: true,
         }
     }
 
     pub fn with_parser_config(mut self, parser_config: ParserConfig) -> Self {
         self.parser_config = parser_config;
+        self
+    }
+
+    pub fn with_chunk_summary_enabled(mut self, enabled: bool) -> Self {
+        self.chunk_summary_enabled = enabled;
         self
     }
 
@@ -1330,10 +1342,11 @@ fn artifact_repair_set(
     Ok(repair)
 }
 
-impl<E, M> FullIndexer<E, M>
+impl<E, M, S> FullIndexer<E, M, S>
 where
     E: CodeEnricher + Sync,
     M: Embedder + Sync,
+    S: ChunkSummarizer + Sync,
 {
     fn refresh_artifacts(
         &self,
