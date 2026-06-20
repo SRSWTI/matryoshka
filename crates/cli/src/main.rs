@@ -1,5 +1,9 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
+use matryoshka::{
+    Matryoshka, MatryoshkaConfig, PrepareOptions as ApiPrepareOptions,
+    PrepareSummary as ApiPrepareSummary,
+};
 use matryoshka_embed_client::{DeterministicEmbedder, EndpointEmbedder};
 use matryoshka_enricher::{
     HeuristicChunkSummarizer, HeuristicEnricher, MlxChatEnricher, MlxChunkSummarizer,
@@ -14,7 +18,7 @@ use matryoshka_search::{
     EndpointReranker, OmlxReranker, SearchEngine, SearchPrewarmSummary, SearchResultGranularity,
     default_prewarm_queries,
 };
-use matryoshka_store_sqlite::{CardSummaryRow, MatryoshkaStore, RetrievalIndexStats};
+use matryoshka_store_sqlite::{CardSummaryRow, MatryoshkaStore};
 use matryoshka_watcher::RepoWatcher;
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
@@ -37,7 +41,6 @@ const DEFAULT_CHUNK_SUMMARY_CONCURRENCY: usize = 6;
 const MATRYOSHKA_DIR: &str = ".matryoshka";
 const DEFAULT_DB_FILE: &str = "matryoshka.db";
 const WATCH_PID_FILE: &str = "watch.pid";
-const READY_MARKER_FILE: &str = ".jesco-prewarm-complete";
 
 #[derive(Debug, Parser)]
 #[command(name = "matryoshka-rs")]
@@ -73,6 +76,8 @@ enum Command {
         no_late_interaction: bool,
         #[arg(long, default_value_t = false)]
         json: bool,
+        #[arg(long, default_value_t = false)]
+        progress_jsonl: bool,
         #[arg(long = "chunk-summary-model", default_value = DEFAULT_CHUNK_SUMMARY_MODEL)]
         chunk_summary_model: String,
         #[arg(long = "chunk-summary-concurrency", default_value_t = DEFAULT_CHUNK_SUMMARY_CONCURRENCY)]
@@ -622,6 +627,7 @@ fn main() -> Result<()> {
             queries,
             no_late_interaction,
             json,
+            progress_jsonl,
             chunk_summary_model,
             chunk_summary_concurrency,
             no_chunk_summaries,
@@ -640,30 +646,35 @@ fn main() -> Result<()> {
             )?;
             let db = resolve_db_path(db, Some(&repo_root))?;
             ensure_matryoshka_layout(&db)?;
-            let summary = run_prepare(PrepareOptions {
-                repo_root,
-                db,
-                offline,
-                base_url,
-                api_key,
-                embed_model,
-                chat_model,
-                ignore,
-                limit,
-                queries,
-                late_interaction: !no_late_interaction,
-                retrieval_config,
-                chunk_summary_model,
-                chunk_summary_concurrency,
-                no_chunk_summaries,
-            })?;
-            if json {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&prepare_summary_json(&summary))?
-                );
-            } else {
-                print_prepare_summary(&summary);
+            let summary = run_prepare_via_api(
+                PrepareOptions {
+                    repo_root,
+                    db,
+                    offline,
+                    base_url,
+                    api_key,
+                    embed_model,
+                    chat_model,
+                    ignore,
+                    limit,
+                    queries,
+                    late_interaction: !no_late_interaction,
+                    retrieval_config,
+                    chunk_summary_model,
+                    chunk_summary_concurrency,
+                    no_chunk_summaries,
+                },
+                progress_jsonl,
+            )?;
+            if !progress_jsonl {
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&prepare_summary_json(&summary))?
+                    );
+                } else {
+                    print_prepare_summary(&summary);
+                }
             }
         }
         Command::Index {
@@ -1489,6 +1500,70 @@ struct PrepareSummary {
     embedding_model: String,
 }
 
+fn run_prepare_via_api(options: PrepareOptions, progress_jsonl: bool) -> Result<PrepareSummary> {
+    let config = MatryoshkaConfig::new(&options.repo_root)
+        .with_db(&options.db)
+        .offline(options.offline)
+        .with_endpoint(&options.base_url, &options.api_key)
+        .with_models(&options.chat_model, &options.embed_model)
+        .with_ignored_paths(options.ignore.clone())
+        .with_late_interaction(options.late_interaction)
+        .with_retrieval_config(options.retrieval_config)
+        .with_chunk_summary_enabled(!options.no_chunk_summaries)
+        .with_chunk_summary_model(&options.chunk_summary_model)
+        .with_chunk_summary_concurrency(options.chunk_summary_concurrency);
+    let api = Matryoshka::new(config);
+    let summary = api.prepare_with_progress(
+        ApiPrepareOptions {
+            limit: options.limit,
+            queries: options.queries,
+            write_progress_state: true,
+        },
+        |event| {
+            if progress_jsonl {
+                match serde_json::to_string(&event) {
+                    Ok(line) => println!("{line}"),
+                    Err(err) => println!(
+                        "{}",
+                        json!({
+                            "event": "progress_serialization_failed",
+                            "message": err.to_string(),
+                        })
+                    ),
+                }
+            }
+        },
+    )?;
+    Ok(prepare_summary_from_api(summary))
+}
+
+fn prepare_summary_from_api(summary: ApiPrepareSummary) -> PrepareSummary {
+    PrepareSummary {
+        repo_root: summary.repo_root,
+        db: summary.db,
+        ready_marker: summary.ready_marker,
+        logs_dir: summary.logs_dir,
+        status: summary.status.as_str().into(),
+        actions_taken: summary.actions_taken,
+        file_count: summary.file_count,
+        folder_count: summary.folder_count,
+        symbol_count: summary.symbol_count,
+        semantic_record_count: summary.semantic_record_count,
+        changed_files: summary.changed_files,
+        removed_files: summary.removed_files,
+        changed_folders: summary.changed_folders,
+        repo_card_updated: summary.repo_card_updated,
+        artifact_quality: summary.artifact_quality,
+        retrieval_index: summary.retrieval_index,
+        prewarm: SearchPrewarmSummary {
+            fts_record_count: summary.prewarm.fts_record_count,
+            query_count: summary.prewarm.query_count,
+            warmed_hit_count: summary.prewarm.warmed_hit_count,
+        },
+        embedding_model: summary.embedding_model,
+    }
+}
+
 #[derive(Debug, Clone)]
 struct WatchLoopOptions {
     repo_root: PathBuf,
@@ -1848,205 +1923,6 @@ impl CommandLog {
     }
 }
 
-fn run_prepare(options: PrepareOptions) -> Result<PrepareSummary> {
-    ensure_matryoshka_layout(&options.db)?;
-    let mut log = CommandLog::open(&options.db, "prepare")?;
-    let logs_dir = logs_dir(&options.db);
-    let ready_marker = ready_marker_path(&options.db);
-    let parser_config = parser_config(options.ignore.clone());
-    let existing_file_count = indexed_file_count(&options.db).unwrap_or(0);
-    let existing_gap_count = existing_card_gap_count(&options.db).unwrap_or(0);
-    let existing_search_missing = existing_retrieval_needs_rebuild(
-        &options.db,
-        options.retrieval_config,
-        options.late_interaction,
-    )
-    .unwrap_or(false);
-    let ready_marker_exists = ready_marker.exists();
-    let mut actions_taken = Vec::new();
-
-    log.event(
-        "prepare_started",
-        json!({
-            "repo_root": options.repo_root,
-            "db": options.db,
-            "offline": options.offline,
-            "embedding_model": if options.offline { "deterministic" } else { options.embed_model.as_str() },
-            "chat_model": if options.offline { "heuristic" } else { options.chat_model.as_str() },
-            "existing_file_count": existing_file_count,
-            "existing_missing_text": existing_gap_count,
-            "existing_search_missing": existing_search_missing,
-            "ready_marker_exists": ready_marker_exists,
-        }),
-    )?;
-
-    let first_action = if existing_file_count == 0 {
-        "index"
-    } else if existing_gap_count > 0 {
-        "repair"
-    } else if existing_search_missing {
-        "rebuild_search"
-    } else {
-        "update"
-    };
-    log.event(
-        "prepare_decision",
-        json!({
-            "action": first_action,
-            "reason": if existing_file_count == 0 {
-                "no indexed files found"
-            } else if existing_gap_count > 0 {
-                "project map has gaps"
-            } else if existing_search_missing {
-                "search data is missing or incomplete"
-            } else if !ready_marker_exists {
-                "ready marker missing"
-            } else {
-                "refresh current project map"
-            },
-        }),
-    )?;
-    let mut update = run_update_once(
-        &options.repo_root,
-        &options.db,
-        options.offline,
-        &options.base_url,
-        &options.api_key,
-        &options.embed_model,
-        &options.chat_model,
-        parser_config.clone(),
-        &options.chunk_summary_model,
-        options.chunk_summary_concurrency,
-        !options.no_chunk_summaries,
-        options.retrieval_config,
-        Some(&mut log),
-    )?;
-    actions_taken.push(first_action.to_string());
-
-    if artifact_gap_count(&update.artifact_quality) > 0 && first_action != "repair" {
-        log.event(
-            "prepare_decision",
-            json!({
-                "action": "repair",
-                "reason": "project map has gaps",
-                "missing_text": artifact_gap_count(&update.artifact_quality),
-            }),
-        )?;
-        update = run_update_once(
-            &options.repo_root,
-            &options.db,
-            options.offline,
-            &options.base_url,
-            &options.api_key,
-            &options.embed_model,
-            &options.chat_model,
-            parser_config,
-            &options.chunk_summary_model,
-            options.chunk_summary_concurrency,
-            !options.no_chunk_summaries,
-            options.retrieval_config,
-            Some(&mut log),
-        )?;
-        actions_taken.push("repair".to_string());
-    }
-
-    let mut artifact_quality = update.artifact_quality.clone();
-    let mut retrieval_index = update.retrieval_index.clone();
-    if retrieval_needs_rebuild(&retrieval_index) {
-        log.event(
-            "prepare_decision",
-            json!({
-                "action": "rebuild_search",
-                "reason": "search data is missing or incomplete",
-                "retrieval_index": retrieval_report_json(&retrieval_index),
-            }),
-        )?;
-        let rebuild = run_rebuild_semantic_once(
-            &options.repo_root,
-            &options.db,
-            options.offline,
-            &options.base_url,
-            &options.api_key,
-            &options.embed_model,
-            &options.chunk_summary_model,
-            options.chunk_summary_concurrency,
-            !options.no_chunk_summaries,
-            options.retrieval_config,
-            Some(&mut log),
-        )?;
-        artifact_quality = rebuild.artifact_quality;
-        if !actions_taken
-            .iter()
-            .any(|action| action == "rebuild_search")
-        {
-            actions_taken.push("rebuild_search".to_string());
-        }
-    }
-
-    let queries = if options.queries.is_empty() {
-        default_prewarm_queries()
-    } else {
-        options.queries.clone()
-    };
-    log.event(
-        "prepare_decision",
-        json!({
-            "action": "prepare_results",
-            "reason": "make first searches fast and precise",
-            "queries": queries,
-            "limit": options.limit,
-        }),
-    )?;
-    let prewarm = run_prewarm_once(
-        &options.db,
-        options.offline,
-        &options.base_url,
-        &options.api_key,
-        &options.embed_model,
-        &queries,
-        options.limit,
-        options.late_interaction,
-        options.retrieval_config,
-        Some(&mut log),
-    )?;
-    actions_taken.push("prepare_results".to_string());
-
-    retrieval_index = retrieval_report_from_stats(
-        MatryoshkaStore::open(&options.db)?.retrieval_index_stats()?,
-        options.retrieval_config,
-        options.late_interaction,
-    );
-    let ready = artifact_gap_count(&artifact_quality) == 0 && retrieval_is_ready(&retrieval_index);
-    let status = if ready { "ready" } else { "needs_attention" }.to_string();
-
-    let summary = PrepareSummary {
-        repo_root: options.repo_root,
-        db: options.db,
-        ready_marker,
-        logs_dir,
-        status,
-        actions_taken,
-        file_count: update.file_count,
-        folder_count: update.folder_count,
-        symbol_count: update.symbol_count,
-        semantic_record_count: retrieval_index.semantic_records,
-        changed_files: update.changed_files,
-        removed_files: update.removed_files,
-        changed_folders: update.changed_folders,
-        repo_card_updated: update.repo_card_updated,
-        artifact_quality,
-        retrieval_index,
-        prewarm,
-        embedding_model: update.embedding_model,
-    };
-
-    if summary.status == "ready" {
-        write_ready_marker(&summary)?;
-    }
-    log.event("prepare_completed", prepare_summary_json(&summary))?;
-    Ok(summary)
-}
-
 fn resolve_optional_repo_root(repo_root: Option<PathBuf>) -> Result<PathBuf> {
     Ok(match repo_root {
         Some(repo_root) => repo_root,
@@ -2367,152 +2243,10 @@ fn run_update_once(
     Ok(summary)
 }
 
-fn run_rebuild_semantic_once(
-    repo_root: &Path,
-    db: &Path,
-    offline: bool,
-    base_url: &str,
-    api_key: &str,
-    embed_model: &str,
-    chunk_summary_model: &str,
-    chunk_summary_concurrency: usize,
-    chunk_summary_enabled: bool,
-    retrieval_config: RetrievalConfig,
-    mut log: Option<&mut CommandLog>,
-) -> Result<SemanticRebuildSummary> {
-    if let Some(log) = log.as_deref_mut() {
-        log.event(
-            "semantic_rebuild_started",
-            json!({
-                "repo_root": repo_root,
-                "db": db,
-                "offline": offline,
-                "embedding_model": if offline { "deterministic" } else { embed_model },
-            }),
-        )?;
-    }
-    let store = MatryoshkaStore::open(db)?;
-    let summary = if offline {
-        FullIndexer::new(
-            store,
-            HeuristicEnricher,
-            DeterministicEmbedder::default(),
-            HeuristicChunkSummarizer,
-        )
-        .with_retrieval_config(retrieval_config)
-        .with_chunk_summary_enabled(chunk_summary_enabled)
-        .rebuild_semantic_index(repo_root)?
-    } else {
-        let chunk_summarizer = MlxChunkSummarizer::new(base_url, api_key)
-            .with_model(chunk_summary_model)
-            .with_concurrency(chunk_summary_concurrency);
-        FullIndexer::new(
-            store,
-            HeuristicEnricher,
-            EndpointEmbedder::new(base_url, api_key, embed_model.to_string()),
-            chunk_summarizer,
-        )
-        .with_retrieval_config(retrieval_config)
-        .with_chunk_summary_enabled(chunk_summary_enabled)
-        .rebuild_semantic_index(repo_root)?
-    };
-    if let Some(log) = log.as_deref_mut() {
-        log.event(
-            "semantic_rebuild_completed",
-            semantic_rebuild_summary_json(&summary),
-        )?;
-    }
-    Ok(summary)
-}
-
-#[allow(clippy::too_many_arguments)]
-fn run_prewarm_once(
-    db: &Path,
-    offline: bool,
-    base_url: &str,
-    api_key: &str,
-    embed_model: &str,
-    queries: &[String],
-    limit: usize,
-    late_interaction: bool,
-    retrieval_config: RetrievalConfig,
-    mut log: Option<&mut CommandLog>,
-) -> Result<SearchPrewarmSummary> {
-    if let Some(log) = log.as_deref_mut() {
-        log.event(
-            "prewarm_started",
-            json!({
-                "db": db,
-                "offline": offline,
-                "embedding_model": if offline { "deterministic" } else { embed_model },
-                "limit": limit,
-                "query_count": queries.len(),
-                "late_interaction": late_interaction,
-            }),
-        )?;
-    }
-    let store = MatryoshkaStore::open(db)?;
-    let summary = if offline {
-        SearchEngine::new(store, DeterministicEmbedder::default())
-            .with_dense(retrieval_config.dense_enabled)
-            .with_late_interaction(late_interaction)
-            .prewarm(queries, limit)?
-    } else {
-        SearchEngine::new(
-            store,
-            EndpointEmbedder::new(base_url, api_key, embed_model.to_string()),
-        )
-        .with_dense(retrieval_config.dense_enabled)
-        .with_late_interaction(late_interaction)
-        .prewarm(queries, limit)?
-    };
-    if let Some(log) = log.as_deref_mut() {
-        let retrieval_stats = MatryoshkaStore::open(db)?.retrieval_index_stats()?;
-        log.event(
-            "prewarm_completed",
-            json!({
-                "fts_records": summary.fts_record_count,
-                "queries": summary.query_count,
-                "warmed_hits": summary.warmed_hit_count,
-                "retrieval_index": retrieval_stats_json(&retrieval_stats),
-            }),
-        )?;
-    }
-    Ok(summary)
-}
-
-fn indexed_file_count(db: &Path) -> Result<usize> {
-    Ok(MatryoshkaStore::open(db)?.load_all_files()?.len())
-}
-
-fn existing_card_gap_count(db: &Path) -> Result<usize> {
-    Ok(MatryoshkaStore::open(db)?
-        .load_card_summaries()?
-        .iter()
-        .filter(|row| row.is_empty)
-        .count())
-}
-
-fn existing_retrieval_needs_rebuild(
-    db: &Path,
-    retrieval_config: RetrievalConfig,
-    late_interaction: bool,
-) -> Result<bool> {
-    Ok(retrieval_needs_rebuild(&retrieval_report_from_stats(
-        MatryoshkaStore::open(db)?.retrieval_index_stats()?,
-        retrieval_config,
-        late_interaction,
-    )))
-}
-
 fn artifact_gap_count(report: &ArtifactQualityReport) -> usize {
     report.file_cards_empty_summary
         + report.folder_cards_empty_summary
         + usize::from(!report.repo_card_has_summary)
-}
-
-fn retrieval_needs_rebuild(report: &RetrievalIndexReport) -> bool {
-    !retrieval_is_ready(report)
 }
 
 fn retrieval_is_ready(report: &RetrievalIndexReport) -> bool {
@@ -2524,52 +2258,11 @@ fn retrieval_is_ready(report: &RetrievalIndexReport) -> bool {
             || report.records_with_late_vectors > 0)
 }
 
-fn retrieval_report_from_stats(
-    stats: RetrievalIndexStats,
-    retrieval_config: RetrievalConfig,
-    late_interaction: bool,
-) -> RetrievalIndexReport {
-    RetrievalIndexReport {
-        semantic_records: stats.semantic_records,
-        embedded_records: stats.embedded_records,
-        fts_records: stats.fts_records,
-        late_vector_rows: stats.late_vector_rows,
-        records_with_late_vectors: stats.records_with_late_vectors,
-        retrieval_primary: retrieval_config.primary,
-        dense_enabled: retrieval_config.dense_enabled,
-        dense_fallback_enabled: retrieval_config.dense_fallback_enabled,
-        late_interaction_enabled: retrieval_config.dense_enabled && late_interaction,
-    }
-}
-
-fn logs_dir(db: &Path) -> PathBuf {
-    db.parent()
-        .unwrap_or_else(|| Path::new(MATRYOSHKA_DIR))
-        .join("logs")
-}
-
 fn progress_state_path(db: &Path) -> PathBuf {
     db.parent()
         .unwrap_or_else(|| Path::new(MATRYOSHKA_DIR))
         .join("state")
         .join("progress.json")
-}
-
-fn ready_marker_path(db: &Path) -> PathBuf {
-    db.parent()
-        .unwrap_or_else(|| Path::new(MATRYOSHKA_DIR))
-        .join(READY_MARKER_FILE)
-}
-
-fn write_ready_marker(summary: &PrepareSummary) -> Result<()> {
-    if let Some(parent) = summary.ready_marker.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    fs::write(
-        &summary.ready_marker,
-        serde_json::to_string_pretty(&prepare_summary_json(summary))?,
-    )?;
-    Ok(())
 }
 
 fn ensure_single_reranker(chat_rerank: bool, omlx_rerank: bool) -> Result<()> {
@@ -2960,27 +2653,6 @@ fn prepare_summary_json(summary: &PrepareSummary) -> serde_json::Value {
             "warmed_hits": summary.prewarm.warmed_hit_count,
         },
         "embedding_model": summary.embedding_model,
-    })
-}
-
-fn retrieval_report_json(report: &RetrievalIndexReport) -> serde_json::Value {
-    json!({
-        "semantic_records": report.semantic_records,
-        "embedded_records": report.embedded_records,
-        "fts_records": report.fts_records,
-        "late_vector_rows": report.late_vector_rows,
-        "records_with_late_vectors": report.records_with_late_vectors,
-        "late_interaction_enabled": report.late_interaction_enabled,
-    })
-}
-
-fn retrieval_stats_json(stats: &RetrievalIndexStats) -> serde_json::Value {
-    json!({
-        "semantic_records": stats.semantic_records,
-        "embedded_records": stats.embedded_records,
-        "fts_records": stats.fts_records,
-        "late_vector_rows": stats.late_vector_rows,
-        "records_with_late_vectors": stats.records_with_late_vectors,
     })
 }
 
