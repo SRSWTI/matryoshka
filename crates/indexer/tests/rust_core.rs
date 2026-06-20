@@ -4,7 +4,7 @@ use matryoshka_embed_client::EndpointEmbedder;
 use matryoshka_enricher::HeuristicChunkSummarizer;
 use matryoshka_enricher::HeuristicEnricher;
 use matryoshka_enricher::MlxChatEnricher;
-use matryoshka_indexer::FullIndexer;
+use matryoshka_indexer::{FullIndexer, RetrievalConfig};
 use matryoshka_read_api::{ReadApi, ReadPackMode};
 use matryoshka_search::{SearchEngine, default_prewarm_queries};
 use matryoshka_store_sqlite::MatryoshkaStore;
@@ -16,7 +16,12 @@ fn indexes_searches_and_reads_file_cards() {
     let temp = tempfile::tempdir().unwrap();
     let db_path = temp.path().join("index.db");
     let store = MatryoshkaStore::open(&db_path).unwrap();
-    let indexer = FullIndexer::new(store, HeuristicEnricher, DeterministicEmbedder::default(), HeuristicChunkSummarizer);
+    let indexer = FullIndexer::new(
+        store,
+        HeuristicEnricher,
+        DeterministicEmbedder::default(),
+        HeuristicChunkSummarizer,
+    );
 
     let summary = indexer.index_repo(&repo_root).unwrap();
 
@@ -129,6 +134,79 @@ fn indexes_searches_and_reads_file_cards() {
 }
 
 #[test]
+fn dense_disabled_indexing_keeps_fts_search_without_embeddings() {
+    let repo_root = std::path::PathBuf::from("tests/fixtures/mini_repo");
+    let temp = tempfile::tempdir().unwrap();
+    let db_path = temp.path().join("index.db");
+    let store = MatryoshkaStore::open(&db_path).unwrap();
+    let indexer = FullIndexer::new(
+        store,
+        HeuristicEnricher,
+        DeterministicEmbedder::default(),
+        HeuristicChunkSummarizer,
+    )
+    .with_retrieval_config(RetrievalConfig {
+        dense_enabled: false,
+        dense_fallback_enabled: false,
+        ..RetrievalConfig::default()
+    });
+    let mut events = Vec::new();
+
+    let summary = indexer
+        .index_repo_with_progress(&repo_root, |event| events.push(event))
+        .unwrap();
+
+    assert!(summary.semantic_record_count > 0);
+    assert!(summary.retrieval_index.semantic_records > 0);
+    assert!(summary.retrieval_index.fts_records > 0);
+    assert_eq!(summary.retrieval_index.embedded_records, 0);
+    assert_eq!(summary.retrieval_index.late_vector_rows, 0);
+    assert_eq!(summary.retrieval_index.records_with_late_vectors, 0);
+    assert!(!summary.retrieval_index.dense_enabled);
+    assert!(!summary.retrieval_index.dense_fallback_enabled);
+    assert!(!summary.retrieval_index.late_interaction_enabled);
+    assert!(events.iter().any(|event| matches!(
+        event,
+        MatryoshkaProgressEvent::EmbeddingSkipped { record_count, reason }
+            if *record_count > 0 && reason == "dense embeddings disabled"
+    )));
+    assert!(!events.iter().any(|event| matches!(
+        event,
+        MatryoshkaProgressEvent::EmbeddingBatch { .. }
+            | MatryoshkaProgressEvent::EmbeddedBatch { .. }
+    )));
+
+    let records = MatryoshkaStore::open(&db_path)
+        .unwrap()
+        .load_all_semantic_records()
+        .unwrap();
+    assert!(records.iter().all(|record| record.embedding.is_none()));
+
+    let search = SearchEngine::new(
+        MatryoshkaStore::open(&db_path).unwrap(),
+        DeterministicEmbedder::default(),
+    )
+    .with_dense(false);
+    let hits = search
+        .search("where is get_env_api_key defined", 5)
+        .unwrap();
+    assert!(
+        hits.iter().any(|hit| hit.path.contains("env.py")),
+        "{hits:?}"
+    );
+    assert!(hits.iter().any(|hit| {
+        hit.why_matched
+            .iter()
+            .any(|why| why.contains("SQLite FTS") || why.contains("Symbol query plan"))
+    }));
+    assert!(hits.iter().all(|hit| {
+        !hit.why_matched
+            .iter()
+            .any(|why| why.contains("Late-interaction MaxSim"))
+    }));
+}
+
+#[test]
 fn incremental_update_refreshes_changed_entities_and_preserves_unaffected_cards() {
     let temp = tempfile::tempdir().unwrap();
     let repo_root = temp.path();
@@ -146,7 +224,12 @@ fn incremental_update_refreshes_changed_entities_and_preserves_unaffected_cards(
 
     let db_path = temp.path().join("index.db");
     let store = MatryoshkaStore::open(&db_path).unwrap();
-    let indexer = FullIndexer::new(store, HeuristicEnricher, DeterministicEmbedder::default(), HeuristicChunkSummarizer);
+    let indexer = FullIndexer::new(
+        store,
+        HeuristicEnricher,
+        DeterministicEmbedder::default(),
+        HeuristicChunkSummarizer,
+    );
     indexer.index_repo(repo_root).unwrap();
 
     let store = MatryoshkaStore::open(&db_path).unwrap();
@@ -203,7 +286,12 @@ fn incremental_update_removes_deleted_files_from_fts_candidates() {
 
     let db_path = temp.path().join("index.db");
     let store = MatryoshkaStore::open(&db_path).unwrap();
-    let indexer = FullIndexer::new(store, HeuristicEnricher, DeterministicEmbedder::default(), HeuristicChunkSummarizer);
+    let indexer = FullIndexer::new(
+        store,
+        HeuristicEnricher,
+        DeterministicEmbedder::default(),
+        HeuristicChunkSummarizer,
+    );
     indexer.index_repo(repo_root).unwrap();
 
     let before_hits = MatryoshkaStore::open(&db_path)
@@ -249,11 +337,11 @@ fn heuristic_parent_folder_cards_use_grounded_rollup_summaries() {
     let db_path = temp.path().join("index.db");
     let store = MatryoshkaStore::open(&db_path).unwrap();
     let indexer = FullIndexer::new(
-                store.clone(),
-                HeuristicEnricher,
-                DeterministicEmbedder::default(),
-                HeuristicChunkSummarizer,
-            );
+        store.clone(),
+        HeuristicEnricher,
+        DeterministicEmbedder::default(),
+        HeuristicChunkSummarizer,
+    );
 
     indexer.index_repo(repo_root).unwrap();
 
@@ -308,11 +396,11 @@ fn storage_heuristics_do_not_leak_matryoshka_internals() {
     let db_path = temp.path().join("index.db");
     let store = MatryoshkaStore::open(&db_path).unwrap();
     let indexer = FullIndexer::new(
-                store.clone(),
-                HeuristicEnricher,
-                DeterministicEmbedder::default(),
-                HeuristicChunkSummarizer,
-            );
+        store.clone(),
+        HeuristicEnricher,
+        DeterministicEmbedder::default(),
+        HeuristicChunkSummarizer,
+    );
 
     indexer.index_repo(repo_root).unwrap();
 
@@ -341,7 +429,12 @@ fn rebuild_semantic_recovers_search_without_full_reindex() {
     let temp = tempfile::tempdir().unwrap();
     let db_path = temp.path().join("index.db");
     let store = MatryoshkaStore::open(&db_path).unwrap();
-    let indexer = FullIndexer::new(store, HeuristicEnricher, DeterministicEmbedder::default(), HeuristicChunkSummarizer);
+    let indexer = FullIndexer::new(
+        store,
+        HeuristicEnricher,
+        DeterministicEmbedder::default(),
+        HeuristicChunkSummarizer,
+    );
 
     indexer.index_repo(&repo_root).unwrap();
 
@@ -389,7 +482,12 @@ fn index_repo_with_progress_emits_real_events() {
     let temp = tempfile::tempdir().unwrap();
     let db_path = temp.path().join("index.db");
     let store = MatryoshkaStore::open(&db_path).unwrap();
-    let indexer = FullIndexer::new(store, HeuristicEnricher, DeterministicEmbedder::default(), HeuristicChunkSummarizer);
+    let indexer = FullIndexer::new(
+        store,
+        HeuristicEnricher,
+        DeterministicEmbedder::default(),
+        HeuristicChunkSummarizer,
+    );
     let mut events = Vec::new();
 
     let summary = indexer
@@ -470,7 +568,12 @@ fn index_repo_with_progress_emits_failed_event() {
     let temp = tempfile::tempdir().unwrap();
     let db_path = temp.path().join("index.db");
     let store = MatryoshkaStore::open(&db_path).unwrap();
-    let indexer = FullIndexer::new(store, HeuristicEnricher, DeterministicEmbedder::default(), HeuristicChunkSummarizer);
+    let indexer = FullIndexer::new(
+        store,
+        HeuristicEnricher,
+        DeterministicEmbedder::default(),
+        HeuristicChunkSummarizer,
+    );
     let mut events = Vec::new();
 
     let err = indexer
@@ -499,7 +602,12 @@ fn rebuild_semantic_with_progress_emits_batch_events() {
     let temp = tempfile::tempdir().unwrap();
     let db_path = temp.path().join("index.db");
     let store = MatryoshkaStore::open(&db_path).unwrap();
-    let indexer = FullIndexer::new(store, HeuristicEnricher, DeterministicEmbedder::default(), HeuristicChunkSummarizer);
+    let indexer = FullIndexer::new(
+        store,
+        HeuristicEnricher,
+        DeterministicEmbedder::default(),
+        HeuristicChunkSummarizer,
+    );
 
     indexer.index_repo(&repo_root).unwrap();
 
@@ -546,11 +654,11 @@ fn update_repairs_missing_enriched_artifacts_after_interrupted_prewarm() {
     let db_path = temp.path().join("index.db");
     let store = MatryoshkaStore::open(&db_path).unwrap();
     let indexer = FullIndexer::new(
-                store.clone(),
-                HeuristicEnricher,
-                DeterministicEmbedder::default(),
-                HeuristicChunkSummarizer,
-            );
+        store.clone(),
+        HeuristicEnricher,
+        DeterministicEmbedder::default(),
+        HeuristicChunkSummarizer,
+    );
 
     indexer.index_repo(&repo_root).unwrap();
     store
@@ -619,11 +727,11 @@ fn update_repairs_empty_non_heuristic_file_summaries() {
     let db_path = temp.path().join("index.db");
     let store = MatryoshkaStore::open(&db_path).unwrap();
     let indexer = FullIndexer::new(
-                store.clone(),
-                HeuristicEnricher,
-                DeterministicEmbedder::default(),
-                HeuristicChunkSummarizer,
-            );
+        store.clone(),
+        HeuristicEnricher,
+        DeterministicEmbedder::default(),
+        HeuristicChunkSummarizer,
+    );
 
     indexer.index_repo(&repo_root).unwrap();
 
@@ -675,7 +783,7 @@ fn real_mlx_progress_integration() {
         store,
         MlxChatEnricher::new(&base_url, &api_key).with_model(chat_model),
         EndpointEmbedder::new(&base_url, &api_key, embed_model),
-                HeuristicChunkSummarizer,
+        HeuristicChunkSummarizer,
     );
     let mut events = Vec::new();
 
