@@ -306,7 +306,6 @@ fn read_chunks(chunks: &[CodeChunkFact]) -> Vec<ReadCodeChunk> {
             summary_source: chunk.summary_source,
             summary: chunk.summary.clone(),
             doc_summary: chunk.doc_summary.clone(),
-            generated_summary: chunk.generated_summary.clone(),
         })
         .collect()
 }

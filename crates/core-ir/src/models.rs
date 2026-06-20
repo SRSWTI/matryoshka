@@ -466,8 +466,6 @@ pub struct ReadCodeChunk {
     pub summary: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub doc_summary: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub generated_summary: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
