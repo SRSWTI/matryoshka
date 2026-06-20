@@ -6,7 +6,7 @@ use matryoshka_indexer::{
     ArtifactQualityReport, FullIndexer, IndexSummary, MatryoshkaProgressEvent,
     RetrievalIndexReport, SemanticRebuildSummary, UpdateSummary,
 };
-use matryoshka_parser::ParserConfig;
+use matryoshka_parser::{ParserConfig, SourceParser};
 use matryoshka_read_api::{ReadApi, ReadPackMode};
 use matryoshka_search::{
     EndpointReranker, OmlxReranker, SearchEngine, SearchPrewarmSummary, default_prewarm_queries,
@@ -281,6 +281,22 @@ enum Command {
         empty: bool,
         #[arg(long, default_value_t = false)]
         json: bool,
+    },
+    /// Parse a repo and dump extracted code chunks (parser-only, no embeddings).
+    /// Used to verify Milestone 1 chunk/doc extraction in isolation.
+    Chunks {
+        repo_root: PathBuf,
+        #[arg(long = "ignore", value_name = "PATH")]
+        ignore: Vec<String>,
+        /// Only emit chunks with this summary source (doc_comment, docstring, empty, all).
+        #[arg(long, default_value = "all")]
+        source: String,
+        /// Emit pretty JSON instead of the default table.
+        #[arg(long, default_value_t = false)]
+        json: bool,
+        /// Also print the full code body for each chunk (verbose).
+        #[arg(long, default_value_t = false)]
+        with_code: bool,
     },
 }
 
@@ -891,6 +907,75 @@ fn main() -> Result<()> {
                 println!("{}", serde_json::to_string_pretty(&rows)?);
             } else {
                 print_card_summaries(&db, &rows, empty);
+            }
+        }
+        Command::Chunks {
+            repo_root,
+            ignore,
+            source,
+            json,
+            with_code,
+        } => {
+            let parser_config = parser_config(ignore);
+            let parser = SourceParser::new(parser_config);
+            let parsed = parser.parse_repo(&repo_root)?;
+            let source_filter = source.trim().to_ascii_lowercase();
+            let mut chunks = parsed.code_chunks;
+            if source_filter != "all" {
+                chunks.retain(|chunk| {
+                    format!("{:?}", chunk.summary_source).to_ascii_lowercase() == source_filter
+                });
+            }
+
+            if json {
+                let payload: Vec<serde_json::Value> = chunks
+                    .iter()
+                    .map(|chunk| {
+                        let mut value = serde_json::json!({
+                            "chunk_id": chunk.chunk_id,
+                            "path": chunk.path,
+                            "symbol": chunk.symbol,
+                            "qualified_name": chunk.qualified_name,
+                            "kind": format!("{:?}", chunk.kind),
+                            "signature": chunk.signature,
+                            "start_line": chunk.start_line,
+                            "end_line": chunk.end_line,
+                            "summary_source": format!("{:?}", chunk.summary_source),
+                            "summary": chunk.summary,
+                            "doc_summary": chunk.doc_summary,
+                        });
+                        if with_code {
+                            value["code"] = serde_json::Value::String(chunk.code.clone());
+                        }
+                        value
+                    })
+                    .collect();
+                println!("{}", serde_json::to_string_pretty(&payload)?);
+            } else {
+                println!("chunks: {}", chunks.len());
+                println!(
+                    "{:<60} {:<40} {:<10} {:<10} {:<14} {}",
+                    "path", "symbol", "kind", "lines", "source", "summary"
+                );
+                println!("{}", "-".repeat(160));
+                for chunk in &chunks {
+                    let lines = format!("{}-{}", chunk.start_line, chunk.end_line);
+                    let summary_preview: String = chunk.summary.chars().take(70).collect();
+                    println!(
+                        "{:<60} {:<40} {:<10} {:<10} {:<14} {}",
+                        truncate_str(&chunk.path, 60),
+                        truncate_str(chunk.qualified_name.as_deref().unwrap_or(""), 40),
+                        format!("{:?}", chunk.kind),
+                        lines,
+                        format!("{:?}", chunk.summary_source),
+                        summary_preview
+                    );
+                    if with_code {
+                        println!("--- code ---");
+                        println!("{}", chunk.code);
+                        println!("--- end code ---");
+                    }
+                }
             }
         }
     }
@@ -1710,6 +1795,16 @@ fn print_progress_jsonl(event: MatryoshkaProgressEvent) {
 
 fn parser_config(ignore: Vec<String>) -> ParserConfig {
     ParserConfig::default().with_ignored_paths(ignore)
+}
+
+fn truncate_str(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
+        out.push('…');
+        out
+    }
 }
 
 fn print_prepare_summary(summary: &PrepareSummary) {
