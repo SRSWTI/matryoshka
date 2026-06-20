@@ -1239,6 +1239,9 @@ fn run_prepare(options: PrepareOptions) -> Result<PrepareSummary> {
             &options.base_url,
             &options.api_key,
             &options.embed_model,
+            &options.chunk_summary_model,
+            options.chunk_summary_concurrency,
+            !options.no_chunk_summaries,
             Some(&mut log),
         )?;
         artifact_quality = rebuild.artifact_quality;
@@ -1469,6 +1472,9 @@ fn run_watch_loop(options: WatchLoopOptions) -> Result<()> {
             &options.embed_model,
             &options.chat_model,
             parser_config.clone(),
+            DEFAULT_CHUNK_SUMMARY_MODEL,
+            DEFAULT_CHUNK_SUMMARY_CONCURRENCY,
+            true,
             Some(&mut log),
         )?;
         print_update_summary(summary);
@@ -1522,6 +1528,9 @@ fn run_watch_loop(options: WatchLoopOptions) -> Result<()> {
                 &options.embed_model,
                 &options.chat_model,
                 parser_config.clone(),
+                DEFAULT_CHUNK_SUMMARY_MODEL,
+                DEFAULT_CHUNK_SUMMARY_CONCURRENCY,
+                true,
                 Some(&mut log),
             )?;
             print_update_summary(summary);

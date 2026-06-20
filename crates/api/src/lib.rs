@@ -932,7 +932,8 @@ impl Matryoshka {
             );
             let chunk_summarizer =
                 MlxChunkSummarizer::new(&self.config.base_url, &self.config.api_key)
-                    .with_model(&self.config.chunk_summary_model);
+                    .with_model(&self.config.chunk_summary_model)
+                    .with_concurrency(self.config.chunk_summary_concurrency);
             FullIndexer::new(
                 store,
                 CancellableEnricher::new(enricher, cancel_token.clone()),
