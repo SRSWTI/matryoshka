@@ -483,9 +483,89 @@ fn assert_progress_events_are_consistent(events: &[MatryoshkaEvent]) {
             .iter()
             .any(|event| matches!(event, MatryoshkaEvent::IndexerProgress { .. }))
     );
+    assert!(events.iter().any(|event| matches!(
+        event,
+        MatryoshkaEvent::ProgressState { state }
+            if state.operation == "prepare" && state.message == "Getting ready"
+    )));
+
+    let emitted_file_enrichment = events.iter().any(|event| {
+        matches!(
+            event,
+            MatryoshkaEvent::IndexerProgress {
+                progress: MatryoshkaProgressEvent::EnrichingFile { .. }
+                    | MatryoshkaProgressEvent::EnrichedFile { .. },
+                ..
+            }
+        )
+    });
+    if emitted_file_enrichment {
+        assert!(events.iter().any(|event| matches!(
+            event,
+            MatryoshkaEvent::ProgressState { state }
+                if state.operation == "prepare" && state.phase == "enriching_files"
+        )));
+    }
+
+    let emitted_chunk_enrichment = events.iter().any(|event| {
+        matches!(
+            event,
+            MatryoshkaEvent::IndexerProgress {
+                progress: MatryoshkaProgressEvent::EnrichingChunks { .. }
+                    | MatryoshkaProgressEvent::EnrichingChunkBatch { .. }
+                    | MatryoshkaProgressEvent::EnrichedChunkBatch { .. }
+                    | MatryoshkaProgressEvent::EnrichedChunks { .. },
+                ..
+            }
+        )
+    });
+    if emitted_chunk_enrichment {
+        assert!(events.iter().any(|event| matches!(
+            event,
+            MatryoshkaEvent::ProgressState { state }
+                if state.operation == "prepare"
+                    && state.phase == "enriching_chunks"
+                    && state.files_done.is_none()
+                    && state.files_total.is_none()
+                    && (state.item_label.as_deref() == Some("chunks")
+                        || state.item_label.as_deref() == Some("batches"))
+        )));
+    }
+
+    let emitted_search_progress = events.iter().any(|event| {
+        matches!(
+            event,
+            MatryoshkaEvent::IndexerProgress {
+                progress: MatryoshkaProgressEvent::EmbeddingBatch { .. }
+                    | MatryoshkaProgressEvent::EmbeddedBatch { .. }
+                    | MatryoshkaProgressEvent::EmbeddingSkipped { .. },
+                ..
+            }
+        )
+    });
+    if emitted_search_progress {
+        assert!(events.iter().any(|event| matches!(
+            event,
+            MatryoshkaEvent::ProgressState { state }
+                if state.operation == "prepare"
+                    && state.files_done.is_none()
+                    && state.files_total.is_none()
+                    && ((state.phase == "embedding"
+                        && state.item_label.as_deref() == Some("batches"))
+                        || (state.phase == "embedding_skipped"
+                            && state.item_label.as_deref() == Some("records")))
+        )));
+    }
 
     for event in events {
-        if let MatryoshkaEvent::IndexerProgress { progress, .. } = event {
+        if let MatryoshkaEvent::IndexerProgress {
+            operation,
+            action,
+            progress,
+        } = event
+        {
+            assert_eq!(operation, "prepare");
+            assert!(action.is_some());
             match progress {
                 MatryoshkaProgressEvent::ParsingFile {
                     index, total_files, ..

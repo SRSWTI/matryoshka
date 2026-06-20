@@ -1211,7 +1211,7 @@ fn main() -> Result<()> {
                 }),
             )?;
             let store = MatryoshkaStore::open(&db)?;
-            let mut progress_writer = CliProgressStateWriter::new(&db, "rebuild_search");
+            let mut progress_writer = CliProgressStateWriter::new(&db, "rebuild-semantic");
             let summary = if offline {
                 let indexer = FullIndexer::new(
                     store,
@@ -1543,7 +1543,7 @@ impl CliProgressStateWriter {
             MatryoshkaProgressEvent::Started { .. } => self.state(
                 "running",
                 "starting",
-                "Starting project map",
+                "Getting ready",
                 0.02,
                 None,
                 None,
@@ -1551,8 +1551,8 @@ impl CliProgressStateWriter {
             ),
             MatryoshkaProgressEvent::DiscoveringFiles => self.state(
                 "running",
-                "discovering",
-                "Finding project files",
+                "discovering_files",
+                "Looking through the project",
                 0.04,
                 None,
                 None,
@@ -1560,8 +1560,8 @@ impl CliProgressStateWriter {
             ),
             MatryoshkaProgressEvent::FilesDiscovered { total_files } => self.state(
                 "running",
-                "discovered",
-                "Project files found",
+                "discovering_files",
+                "Looking through the project",
                 0.06,
                 None,
                 Some(0),
@@ -1578,7 +1578,7 @@ impl CliProgressStateWriter {
                 total_files,
             } => self.state(
                 "running",
-                "parsing",
+                "reading_files",
                 "Reading code structure",
                 0.06 + progress_ratio(*index, *total_files) * 0.22,
                 Some(path.clone()),
@@ -1589,8 +1589,8 @@ impl CliProgressStateWriter {
                 path, total_files, ..
             } => self.state(
                 "running",
-                "enriching",
-                "Writing file summaries",
+                "enriching_files",
+                "Understanding files",
                 0.30 + progress_ratio(self.enriched_files.len(), *total_files) * 0.36,
                 Some(path.clone()),
                 Some(self.enriched_files.len()),
@@ -1602,22 +1602,22 @@ impl CliProgressStateWriter {
                 self.enriched_files.insert(path.clone());
                 self.state(
                     "running",
-                    "enriching",
-                    "Writing file summaries",
+                    "enriching_files",
+                    "Understanding files",
                     0.30 + progress_ratio(self.enriched_files.len(), *total_files) * 0.36,
                     Some(path.clone()),
                     Some(self.enriched_files.len()),
                     Some(*total_files),
                 )
             }
-            MatryoshkaProgressEvent::EnrichingChunks { chunk_count } => self.state(
+            MatryoshkaProgressEvent::EnrichingChunks { chunk_count } => self.item_state(
                 "running",
-                "summarizing_chunks",
-                "Summarizing code chunks",
+                "enriching_chunks",
+                "Understanding code",
                 0.66,
-                None,
                 Some(0),
                 Some(*chunk_count),
+                "chunks",
             ),
             MatryoshkaProgressEvent::EnrichingChunkBatch {
                 batch_index,
@@ -1628,23 +1628,23 @@ impl CliProgressStateWriter {
                 batch_index,
                 total_batches,
                 ..
-            } => self.state(
+            } => self.item_state(
                 "running",
-                "summarizing_chunks",
-                "Summarizing code chunks",
+                "enriching_chunks",
+                "Understanding code",
                 0.66 + progress_ratio(*batch_index, *total_batches) * 0.10,
-                None,
                 Some(*batch_index),
                 Some(*total_batches),
+                "batches",
             ),
-            MatryoshkaProgressEvent::EnrichedChunks { chunk_count } => self.state(
+            MatryoshkaProgressEvent::EnrichedChunks { chunk_count } => self.item_state(
                 "running",
-                "summarizing_chunks",
-                "Code chunks summarized",
+                "enriching_chunks",
+                "Understanding code",
                 0.76,
-                None,
                 Some(*chunk_count),
                 Some(*chunk_count),
+                "chunks",
             ),
             MatryoshkaProgressEvent::EmbeddingBatch {
                 batch_index,
@@ -1655,37 +1655,37 @@ impl CliProgressStateWriter {
                 batch_index,
                 total_batches,
                 ..
-            } => self.state(
+            } => self.item_state(
                 "running",
                 "embedding",
-                "Building search data",
+                "Preparing search",
                 0.76 + progress_ratio(*batch_index, *total_batches) * 0.14,
-                None,
                 Some(*batch_index),
                 Some(*total_batches),
+                "batches",
             ),
-            MatryoshkaProgressEvent::EmbeddingSkipped { record_count, .. } => self.state(
+            MatryoshkaProgressEvent::EmbeddingSkipped { record_count, .. } => self.item_state(
                 "running",
                 "embedding_skipped",
-                "Dense embeddings disabled; using exact/FTS search data",
+                "Preparing text search",
                 0.90,
-                None,
                 Some(*record_count),
                 Some(*record_count),
+                "records",
             ),
-            MatryoshkaProgressEvent::WritingDatabase { records_written } => self.state(
+            MatryoshkaProgressEvent::WritingDatabase { records_written } => self.item_state(
                 "running",
-                "writing",
-                "Saving Matryoshka data",
+                "saving",
+                "Saving updates",
                 (self.last_percent + 0.01).min(0.92),
-                None,
                 *records_written,
                 None,
+                "records",
             ),
             MatryoshkaProgressEvent::ArtifactQuality { .. } => self.state(
                 "running",
                 "checking",
-                "Checking project map",
+                "Checking everything",
                 0.94,
                 None,
                 None,
@@ -1693,8 +1693,8 @@ impl CliProgressStateWriter {
             ),
             MatryoshkaProgressEvent::RetrievalIndexHealth { .. } => self.state(
                 "running",
-                "checking_search",
-                "Checking search",
+                "checking",
+                "Checking everything",
                 0.96,
                 None,
                 None,
@@ -1703,16 +1703,16 @@ impl CliProgressStateWriter {
             MatryoshkaProgressEvent::Completed { file_count, .. } => self.state(
                 "completed",
                 "complete",
-                "Project map complete",
+                "Ready",
                 1.0,
                 None,
                 Some(*file_count),
                 Some(*file_count),
             ),
-            MatryoshkaProgressEvent::Failed { stage, message } => self.state(
+            MatryoshkaProgressEvent::Failed { .. } => self.state(
                 "failed",
-                stage,
-                message,
+                "failed",
+                "Needs attention",
                 self.last_percent,
                 None,
                 None,
@@ -1731,6 +1731,57 @@ impl CliProgressStateWriter {
         files_done: Option<usize>,
         files_total: Option<usize>,
     ) -> Value {
+        self.state_with_counters(
+            status,
+            phase,
+            message,
+            percent,
+            current_file,
+            files_done,
+            files_total,
+            None,
+            None,
+            None,
+        )
+    }
+
+    fn item_state(
+        &mut self,
+        status: &str,
+        phase: &str,
+        message: &str,
+        percent: f32,
+        items_done: Option<usize>,
+        items_total: Option<usize>,
+        item_label: &str,
+    ) -> Value {
+        self.state_with_counters(
+            status,
+            phase,
+            message,
+            percent,
+            None,
+            None,
+            None,
+            items_done,
+            items_total,
+            Some(item_label),
+        )
+    }
+
+    fn state_with_counters(
+        &mut self,
+        status: &str,
+        phase: &str,
+        message: &str,
+        percent: f32,
+        current_file: Option<String>,
+        files_done: Option<usize>,
+        files_total: Option<usize>,
+        items_done: Option<usize>,
+        items_total: Option<usize>,
+        item_label: Option<&str>,
+    ) -> Value {
         let percent = if status == "failed" {
             percent
         } else {
@@ -1740,6 +1791,7 @@ impl CliProgressStateWriter {
         self.last_percent = self.last_percent.max(percent);
         json!({
             "operation": self.operation.clone(),
+            "action": Value::Null,
             "status": status,
             "phase": phase,
             "message": message,
@@ -1747,6 +1799,9 @@ impl CliProgressStateWriter {
             "current_file": current_file,
             "files_done": files_done,
             "files_total": files_total,
+            "items_done": items_done,
+            "items_total": items_total,
+            "item_label": item_label,
             "updated_at_unix_ms": unix_millis(),
         })
     }

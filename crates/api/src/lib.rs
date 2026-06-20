@@ -376,8 +376,12 @@ pub enum MatryoshkaEvent {
         action: String,
         reason: String,
     },
+    ProgressState {
+        state: ProgressState,
+    },
     IndexerProgress {
         operation: String,
+        action: Option<String>,
         progress: MatryoshkaProgressEvent,
     },
     PrewarmStarted {
@@ -697,7 +701,8 @@ impl Matryoshka {
                         &mut on_event,
                         &mut progress_writer,
                         MatryoshkaEvent::IndexerProgress {
-                            operation: first_action.to_string(),
+                            operation: "prepare".into(),
+                            action: Some(first_action.to_string()),
                             progress,
                         },
                     );
@@ -741,7 +746,8 @@ impl Matryoshka {
                             &mut on_event,
                             &mut progress_writer,
                             MatryoshkaEvent::IndexerProgress {
-                                operation: "repair".into(),
+                                operation: "prepare".into(),
+                                action: Some("repair".into()),
                                 progress,
                             },
                         );
@@ -787,7 +793,8 @@ impl Matryoshka {
                             &mut on_event,
                             &mut progress_writer,
                             MatryoshkaEvent::IndexerProgress {
-                                operation: "rebuild_search".into(),
+                                operation: "prepare".into(),
+                                action: Some("rebuild_search".into()),
                                 progress,
                             },
                         );
@@ -1240,7 +1247,10 @@ fn emit_event(
     progress_writer: &mut ProgressStateWriter,
     event: MatryoshkaEvent,
 ) {
-    progress_writer.record(&event);
+    if let Some(state) = progress_state_from_event(&event) {
+        progress_writer.record_state(&state);
+        on_event(MatryoshkaEvent::ProgressState { state });
+    }
     on_event(event);
 }
 
@@ -1286,136 +1296,132 @@ impl ProgressStateWriter {
         }
     }
 
-    fn record(&mut self, event: &MatryoshkaEvent) {
+    fn record_state(&mut self, state: &ProgressState) {
         if !self.enabled {
             return;
         }
-        let state = progress_state_from_event(event);
         if let Some(parent) = self.path.parent() {
             let _ = fs::create_dir_all(parent);
         }
         let _ = fs::write(
             &self.path,
-            serde_json::to_string_pretty(&state).unwrap_or_default(),
+            serde_json::to_string_pretty(state).unwrap_or_default(),
         );
     }
 }
 
-fn progress_state_from_event(event: &MatryoshkaEvent) -> ProgressState {
-    match event {
-        MatryoshkaEvent::PrepareWaitingForLock { waited_ms, .. } => progress_state(
+fn progress_state_from_event(event: &MatryoshkaEvent) -> Option<ProgressState> {
+    let state = match event {
+        MatryoshkaEvent::ProgressState { .. } => return None,
+        MatryoshkaEvent::PrepareWaitingForLock { waited_ms, .. } => ProgressState::new(
             "prepare",
-            "running",
-            "waiting",
-            &format!("Waiting for Matryoshka ({waited_ms} ms)"),
-            0.0,
             None,
-            None,
-            None,
-        ),
-        MatryoshkaEvent::PrepareLockAcquired { .. } => progress_state(
-            "prepare",
-            "running",
-            "locked",
-            "Preparing Matryoshka",
-            0.01,
-            None,
-            None,
-            None,
-        ),
-        MatryoshkaEvent::PrepareLockReleased { .. } => progress_state(
-            "prepare",
-            "running",
-            "released",
-            "Matryoshka lock released",
-            1.0,
-            None,
-            None,
-            None,
-        ),
-        MatryoshkaEvent::PrepareStarted { .. } => progress_state(
-            "prepare",
             "running",
             "starting",
-            "Starting Matryoshka",
+            &format!("Waiting for the project ({waited_ms} ms)"),
             0.0,
-            None,
-            None,
-            None,
         ),
-        MatryoshkaEvent::PrepareDecision { action, reason } => progress_state(
+        MatryoshkaEvent::PrepareLockAcquired { .. } => ProgressState::new(
             "prepare",
+            None,
             "running",
-            action,
-            reason,
-            match action.as_str() {
-                "index" | "update" | "repair" => 0.03,
-                "rebuild_search" => 0.82,
-                "prepare_results" => 0.94,
-                _ => 0.05,
-            },
-            None,
-            None,
-            None,
+            "starting",
+            "Getting ready",
+            0.01,
+        ),
+        MatryoshkaEvent::PrepareLockReleased { .. } => return None,
+        MatryoshkaEvent::PrepareStarted { .. } => {
+            ProgressState::new("prepare", None, "running", "starting", "Getting ready", 0.0)
+        }
+        MatryoshkaEvent::PrepareDecision { action, .. } => ProgressState::new(
+            "prepare",
+            Some(action.as_str()),
+            "running",
+            prepare_action_phase(action),
+            prepare_action_message(action),
+            prepare_action_percent(action),
         ),
         MatryoshkaEvent::IndexerProgress {
             operation,
+            action,
             progress,
-        } => indexer_progress_state(operation, progress),
-        MatryoshkaEvent::PrewarmStarted { query_count, .. } => progress_state(
+        } => indexer_progress_state(operation, action.as_deref(), progress),
+        MatryoshkaEvent::PrewarmStarted { query_count, .. } => ProgressState::new(
             "prepare",
+            Some("prepare_results"),
             "running",
-            "prewarming",
-            &format!("Warming {query_count} search queries"),
+            "warming_search",
+            "Warming search",
             0.95,
-            None,
-            None,
-            None,
-        ),
-        MatryoshkaEvent::PrewarmCompleted { .. } => progress_state(
+        )
+        .with_item_progress(Some(0), Some(*query_count), "queries"),
+        MatryoshkaEvent::PrewarmCompleted { summary } => ProgressState::new(
             "prepare",
+            Some("prepare_results"),
             "running",
-            "prewarmed",
-            "Search is warm",
+            "warming_search",
+            "Warming search",
             0.98,
-            None,
-            None,
-            None,
+        )
+        .with_item_progress(
+            Some(summary.query_count),
+            Some(summary.query_count),
+            "queries",
         ),
-        MatryoshkaEvent::PrepareCancelling { reason } => progress_state(
+        MatryoshkaEvent::PrepareCancelling { .. } => ProgressState::new(
             "prepare",
+            None,
             "cancelling",
-            "cancelling",
-            reason,
+            "cancelled",
+            "Cancelling",
             0.99,
-            None,
-            None,
-            None,
         ),
-        MatryoshkaEvent::PrepareCancelled { reason } => progress_state(
+        MatryoshkaEvent::PrepareCancelled { .. } => {
+            ProgressState::new("prepare", None, "cancelled", "cancelled", "Cancelled", 1.0)
+        }
+        MatryoshkaEvent::PrepareCompleted { summary } => ProgressState::new(
             "prepare",
-            "cancelled",
-            "cancelled",
-            reason,
-            1.0,
             None,
-            None,
-            None,
-        ),
-        MatryoshkaEvent::PrepareCompleted { summary } => progress_state(
-            "prepare",
             summary.status.as_str(),
-            "ready",
             if summary.is_ready() {
-                "Jesco is ready"
+                "complete"
             } else {
-                "Matryoshka needs attention"
+                "failed"
+            },
+            if summary.is_ready() {
+                "Ready"
+            } else {
+                "Needs attention"
             },
             1.0,
-            None,
-            Some(summary.file_count),
-            Some(summary.file_count),
-        ),
+        )
+        .with_file_progress(None, Some(summary.file_count), Some(summary.file_count)),
+    };
+    Some(state)
+}
+
+fn prepare_action_phase(action: &str) -> &'static str {
+    match action {
+        "rebuild_search" => "embedding",
+        "prepare_results" => "warming_search",
+        _ => "starting",
+    }
+}
+
+fn prepare_action_message(action: &str) -> &'static str {
+    match action {
+        "rebuild_search" => "Preparing search",
+        "prepare_results" => "Warming search",
+        _ => "Getting ready",
+    }
+}
+
+fn prepare_action_percent(action: &str) -> f32 {
+    match action {
+        "index" | "update" | "repair" => 0.03,
+        "rebuild_search" => 0.82,
+        "prepare_results" => 0.94,
+        _ => 0.05,
     }
 }
 
@@ -1462,38 +1468,37 @@ pub fn is_cancelled_error(error: &(dyn std::error::Error + 'static)) -> bool {
     error.to_string().contains("matryoshka prepare cancelled")
 }
 
-fn indexer_progress_state(operation: &str, event: &MatryoshkaProgressEvent) -> ProgressState {
+fn indexer_progress_state(
+    operation: &str,
+    action: Option<&str>,
+    event: &MatryoshkaProgressEvent,
+) -> ProgressState {
     match event {
-        MatryoshkaProgressEvent::Started { .. } => progress_state(
+        MatryoshkaProgressEvent::Started { .. } => ProgressState::new(
             operation,
+            action,
             "running",
             "starting",
-            "Starting project map",
+            "Getting ready",
             0.04,
-            None,
-            None,
-            None,
         ),
-        MatryoshkaProgressEvent::DiscoveringFiles => progress_state(
+        MatryoshkaProgressEvent::DiscoveringFiles => ProgressState::new(
             operation,
+            action,
             "running",
-            "discovering",
-            "Finding project files",
+            "discovering_files",
+            "Looking through the project",
             0.05,
-            None,
-            None,
-            None,
         ),
-        MatryoshkaProgressEvent::FilesDiscovered { total_files } => progress_state(
+        MatryoshkaProgressEvent::FilesDiscovered { total_files } => ProgressState::new(
             operation,
+            action,
             "running",
-            "discovered",
-            "Project files found",
+            "discovering_files",
+            "Looking through the project",
             0.08,
-            None,
-            Some(0),
-            Some(*total_files),
-        ),
+        )
+        .with_file_progress(None, Some(0), Some(*total_files)),
         MatryoshkaProgressEvent::ParsingFile {
             path,
             index,
@@ -1503,16 +1508,15 @@ fn indexer_progress_state(operation: &str, event: &MatryoshkaProgressEvent) -> P
             path,
             index,
             total_files,
-        } => progress_state(
+        } => ProgressState::new(
             operation,
+            action,
             "running",
-            "parsing",
+            "reading_files",
             "Reading code structure",
             0.08 + ratio(*index, *total_files) * 0.22,
-            Some(path.clone()),
-            Some(*index),
-            Some(*total_files),
-        ),
+        )
+        .with_file_progress(Some(path.clone()), Some(*index), Some(*total_files)),
         MatryoshkaProgressEvent::EnrichingFile {
             path,
             index,
@@ -1522,36 +1526,33 @@ fn indexer_progress_state(operation: &str, event: &MatryoshkaProgressEvent) -> P
             path,
             index,
             total_files,
-        } => progress_state(
+        } => ProgressState::new(
             operation,
+            action,
             "running",
-            "enriching",
-            "Writing file summaries",
+            "enriching_files",
+            "Understanding files",
             0.30 + ratio(*index, *total_files) * 0.36,
-            Some(path.clone()),
-            Some(*index),
-            Some(*total_files),
-        ),
-        MatryoshkaProgressEvent::EnrichingChunks { chunk_count } => progress_state(
+        )
+        .with_file_progress(Some(path.clone()), Some(*index), Some(*total_files)),
+        MatryoshkaProgressEvent::EnrichingChunks { chunk_count } => ProgressState::new(
             operation,
+            action,
             "running",
-            "summarizing_chunks",
-            "Summarizing code chunks",
+            "enriching_chunks",
+            "Understanding code",
             0.66,
-            None,
-            Some(0),
-            Some(*chunk_count),
-        ),
-        MatryoshkaProgressEvent::EnrichedChunks { chunk_count } => progress_state(
+        )
+        .with_item_progress(Some(0), Some(*chunk_count), "chunks"),
+        MatryoshkaProgressEvent::EnrichedChunks { chunk_count } => ProgressState::new(
             operation,
+            action,
             "running",
-            "summarizing_chunks",
-            "Code chunks summarized",
+            "enriching_chunks",
+            "Understanding code",
             0.76,
-            None,
-            Some(*chunk_count),
-            Some(*chunk_count),
-        ),
+        )
+        .with_item_progress(Some(*chunk_count), Some(*chunk_count), "chunks"),
         MatryoshkaProgressEvent::EnrichingChunkBatch {
             batch_index,
             total_batches,
@@ -1561,16 +1562,15 @@ fn indexer_progress_state(operation: &str, event: &MatryoshkaProgressEvent) -> P
             batch_index,
             total_batches,
             ..
-        } => progress_state(
+        } => ProgressState::new(
             operation,
+            action,
             "running",
-            "summarizing_chunks",
-            "Summarizing code chunks",
+            "enriching_chunks",
+            "Understanding code",
             0.66 + ratio(*batch_index, *total_batches) * 0.10,
-            None,
-            Some(*batch_index),
-            Some(*total_batches),
-        ),
+        )
+        .with_item_progress(Some(*batch_index), Some(*total_batches), "batches"),
         MatryoshkaProgressEvent::EmbeddingBatch {
             batch_index,
             total_batches,
@@ -1580,92 +1580,64 @@ fn indexer_progress_state(operation: &str, event: &MatryoshkaProgressEvent) -> P
             batch_index,
             total_batches,
             ..
-        } => progress_state(
+        } => ProgressState::new(
             operation,
+            action,
             "running",
             "embedding",
-            "Building search data",
+            "Preparing search",
             0.76 + ratio(*batch_index, *total_batches) * 0.14,
-            None,
-            Some(*batch_index),
-            Some(*total_batches),
-        ),
-        MatryoshkaProgressEvent::EmbeddingSkipped { record_count, .. } => progress_state(
+        )
+        .with_item_progress(Some(*batch_index), Some(*total_batches), "batches"),
+        MatryoshkaProgressEvent::EmbeddingSkipped { record_count, .. } => ProgressState::new(
             operation,
+            action,
             "running",
             "embedding_skipped",
-            "Dense embeddings disabled; using exact/FTS search data",
+            "Preparing text search",
             0.84,
-            None,
-            Some(*record_count),
-            Some(*record_count),
-        ),
-        MatryoshkaProgressEvent::WritingDatabase { .. } => progress_state(
+        )
+        .with_item_progress(Some(*record_count), Some(*record_count), "records"),
+        MatryoshkaProgressEvent::WritingDatabase { records_written } => {
+            let mut state = ProgressState::new(
+                operation,
+                action,
+                "running",
+                "saving",
+                "Saving updates",
+                0.88,
+            );
+            if let Some(records_written) = records_written {
+                state = state.with_item_progress(Some(*records_written), None, "records");
+            }
+            state
+        }
+        MatryoshkaProgressEvent::ArtifactQuality { .. }
+        | MatryoshkaProgressEvent::RetrievalIndexHealth { .. } => ProgressState::new(
             operation,
-            "running",
-            "writing",
-            "Saving Matryoshka",
-            0.88,
-            None,
-            None,
-            None,
-        ),
-        MatryoshkaProgressEvent::ArtifactQuality { .. } => progress_state(
-            operation,
+            action,
             "running",
             "checking",
-            "Checking project map",
-            0.91,
-            None,
-            None,
-            None,
-        ),
-        MatryoshkaProgressEvent::RetrievalIndexHealth { .. } => progress_state(
-            operation,
-            "running",
-            "checking_search",
-            "Checking search",
+            "Checking everything",
             0.93,
-            None,
-            None,
-            None,
         ),
-        MatryoshkaProgressEvent::Completed { file_count, .. } => progress_state(
-            operation,
-            "running",
-            "complete",
-            "Project map complete",
-            0.94,
-            None,
-            Some(*file_count),
-            Some(*file_count),
-        ),
-        MatryoshkaProgressEvent::Failed { stage, message } => {
-            progress_state(operation, "failed", stage, message, 0.0, None, None, None)
+        MatryoshkaProgressEvent::Completed { file_count, .. } => {
+            let (status, percent, phase, message) = if operation == "prepare" {
+                ("running", 0.94, "checking", "Checking everything")
+            } else {
+                ("completed", 1.0, "complete", "Ready")
+            };
+            ProgressState::new(operation, action, status, phase, message, percent)
+                .with_file_progress(None, Some(*file_count), Some(*file_count))
         }
-    }
-}
-
-fn progress_state(
-    operation: &str,
-    status: &str,
-    phase: &str,
-    message: &str,
-    percent: f32,
-    current_file: Option<String>,
-    files_done: Option<usize>,
-    files_total: Option<usize>,
-) -> ProgressState {
-    ProgressState {
-        operation: operation.into(),
-        status: status.into(),
-        phase: phase.into(),
-        message: message.into(),
-        percent: percent.clamp(0.0, 1.0),
-        current_file,
-        files_done,
-        files_total,
-        updated_at_unix_ms: unix_millis(),
+        MatryoshkaProgressEvent::Failed { .. } => ProgressState::new(
+            operation,
+            action,
+            "failed",
+            "failed",
+            "Needs attention",
+            0.0,
+        ),
     }
 }
 
