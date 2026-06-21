@@ -55,6 +55,22 @@ fn prepare_search_read_and_repair_lifecycle_work_through_rust_api() {
             .iter()
             .any(|symbol| symbol.name == "debounce_window")
     );
+    let read_json = api.read_json("src/watcher.rs").unwrap();
+    assert!(
+        read_json
+            .symbols
+            .iter()
+            .any(|symbol| symbol.name == "debounce_window")
+    );
+    let compact_read = api.read_compact("src/watcher.rs").unwrap();
+    assert_eq!(compact_read.file.path, "src/watcher.rs");
+    assert_eq!(compact_read.symbols.len(), read.symbols.len());
+    assert!(
+        compact_read
+            .symbols
+            .iter()
+            .any(|symbol| symbol.contains("debounce_window"))
+    );
     let read_with_chunks = ReadApi::new(MatryoshkaStore::open(&db).unwrap(), &repo)
         .read_with_chunks("src/watcher.rs")
         .unwrap();

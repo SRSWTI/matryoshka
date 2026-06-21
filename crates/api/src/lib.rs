@@ -1,6 +1,6 @@
 use anyhow::{Result, anyhow};
 use matryoshka_core_ir::{
-    ArtifactQualityReport, FileCard, FileEnrichmentContext, FileFact, FolderCard,
+    ArtifactQualityReport, CompactReadCard, FileCard, FileEnrichmentContext, FileFact, FolderCard,
     FolderEnrichmentContext, FolderFact, MatryoshkaProgressEvent, ReadCard, RepoCard,
     RetrievalConfig, RetrievalIndexReport, RetrievalPrimary, SearchHit, SymbolFact,
 };
@@ -1004,6 +1004,20 @@ impl Matryoshka {
             self.config.repo_root.clone(),
         )
         .read(file)
+    }
+
+    pub fn read_compact(&self, file: &str) -> Result<CompactReadCard> {
+        ensure_matryoshka_layout(&self.config.db)?;
+        self.ensure_prepare_ready_for_reads()?;
+        ReadApi::new(
+            MatryoshkaStore::open(&self.config.db)?,
+            self.config.repo_root.clone(),
+        )
+        .read_compact(file)
+    }
+
+    pub fn read_json(&self, file: &str) -> Result<ReadCard> {
+        self.read(file)
     }
 
     pub fn read_bundle(&self, options: ReadBundleOptions) -> Result<ReadBundle> {

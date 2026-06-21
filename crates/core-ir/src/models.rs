@@ -419,6 +419,30 @@ pub struct ReadCard {
     pub total_depends_on: usize,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CompactReadCard {
+    pub file: ReadFileOverview,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub folder: Option<ReadFolderOverview>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub symbols: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub chunks: Vec<ReadCodeChunk>,
+    pub imports: ReadImports,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dependents: Vec<ReadDependency>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub depends_on: Vec<ReadDependency>,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub total_dependents: usize,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub total_depends_on: usize,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ReadFileOverview {
     pub file_id: String,

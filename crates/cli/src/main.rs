@@ -388,6 +388,12 @@ enum Command {
             default_value_t = false
         )]
         chunks: bool,
+        #[arg(
+            long = "json",
+            help = "Emit legacy full symbol objects instead of compact symbol outlines",
+            default_value_t = false
+        )]
+        json: bool,
         file: String,
     },
     ReadBundle {
@@ -1138,6 +1144,7 @@ fn main() -> Result<()> {
             db,
             repo_root,
             chunks,
+            json: json_output,
             file,
         } => {
             let repo_root = resolve_optional_repo_root(repo_root)?;
@@ -1145,12 +1152,14 @@ fn main() -> Result<()> {
             ensure_matryoshka_layout(&db)?;
             ensure_cli_prepare_ready(&db, RetrievalConfig::default(), true)?;
             let read = ReadApi::new(MatryoshkaStore::open(&db)?, repo_root);
-            let card = if chunks {
-                read.read_with_chunks(&file)?
+            let value = if chunks {
+                serde_json::to_value(read.read_with_chunks(&file)?)?
+            } else if json_output {
+                serde_json::to_value(read.read(&file)?)?
             } else {
-                read.read(&file)?
+                serde_json::to_value(read.read_compact(&file)?)?
             };
-            println!("{}", serde_json::to_string_pretty(&card)?);
+            println!("{}", serde_json::to_string_pretty(&value)?);
         }
         Command::ReadBundle {
             db,

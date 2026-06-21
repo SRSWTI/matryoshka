@@ -1,8 +1,9 @@
 use anyhow::{Result, anyhow};
 use matryoshka_core_ir::{
-    CodeChunkFact, DependencyInterpretation, EdgeFact, EdgeKind, FileCard, FileFact, FolderCard,
-    ImportFact, ReadCard, ReadCodeChunk, ReadDependency, ReadFileOverview, ReadFolderOverview,
-    ReadImports, ReadInternalImport, ReadSymbol, SymbolBehavior, SymbolFact,
+    CodeChunkFact, CompactReadCard, DependencyInterpretation, EdgeFact, EdgeKind, FileCard,
+    FileFact, FolderCard, ImportFact, ReadCard, ReadCodeChunk, ReadDependency, ReadFileOverview,
+    ReadFolderOverview, ReadImports, ReadInternalImport, ReadSymbol, SymbolBehavior, SymbolFact,
+    SymbolKind,
 };
 use matryoshka_store_sqlite::MatryoshkaStore;
 use serde::{Deserialize, Serialize};
@@ -64,8 +65,20 @@ impl ReadApi {
         self.read_inner(file_id, false)
     }
 
+    pub fn read_json(&self, file_id: &str) -> Result<ReadCard> {
+        self.read(file_id)
+    }
+
+    pub fn read_compact(&self, file_id: &str) -> Result<CompactReadCard> {
+        self.read(file_id).map(compact_read_card)
+    }
+
     pub fn read_with_chunks(&self, file_id: &str) -> Result<ReadCard> {
         self.read_inner(file_id, true)
+    }
+
+    pub fn read_compact_with_chunks(&self, file_id: &str) -> Result<CompactReadCard> {
+        self.read_with_chunks(file_id).map(compact_read_card)
     }
 
     fn read_inner(&self, file_id: &str, include_chunks: bool) -> Result<ReadCard> {
@@ -186,6 +199,65 @@ fn pack_read_card(card: ReadCard, mode: ReadPackMode) -> PackedReadCard {
         dependents: card.dependents.into_iter().take(dep_limit).collect(),
         depends_on: card.depends_on.into_iter().take(dep_limit).collect(),
         omitted,
+    }
+}
+
+fn compact_read_card(card: ReadCard) -> CompactReadCard {
+    CompactReadCard {
+        file: card.file,
+        summary: card.summary,
+        description: card.description,
+        folder: card.folder,
+        symbols: card.symbols.iter().map(compact_read_symbol).collect(),
+        chunks: card.chunks,
+        imports: card.imports,
+        dependents: card.dependents,
+        depends_on: card.depends_on,
+        total_dependents: card.total_dependents,
+        total_depends_on: card.total_depends_on,
+    }
+}
+
+fn compact_read_symbol(symbol: &ReadSymbol) -> String {
+    let mut parts = Vec::new();
+    push_inline(&mut parts, &symbol.lines);
+    parts.push(symbol_kind_label(symbol.kind).to_string());
+    push_inline(&mut parts, &symbol.qualified_name);
+    let mut outline = parts.join(" ");
+    let signature = normalize_inline(&symbol.signature);
+    if !signature.is_empty() {
+        if outline.is_empty() {
+            outline.push_str(&signature);
+        } else {
+            outline.push_str(" :: ");
+            outline.push_str(&signature);
+        }
+    }
+    outline
+}
+
+fn push_inline(parts: &mut Vec<String>, value: &str) {
+    let value = normalize_inline(value);
+    if !value.is_empty() {
+        parts.push(value);
+    }
+}
+
+fn normalize_inline(value: &str) -> String {
+    value.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn symbol_kind_label(kind: SymbolKind) -> &'static str {
+    match kind {
+        SymbolKind::Function => "function",
+        SymbolKind::Method => "method",
+        SymbolKind::Class => "class",
+        SymbolKind::Struct => "struct",
+        SymbolKind::Enum => "enum",
+        SymbolKind::Interface => "interface",
+        SymbolKind::TypeAlias => "type_alias",
+        SymbolKind::Constant => "constant",
+        SymbolKind::Unknown => "unknown",
     }
 }
 
