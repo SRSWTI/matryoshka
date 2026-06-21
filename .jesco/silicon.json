@@ -5,13 +5,10 @@
     "log_level": "info",
     "auto_start_on_launch": true
   },
-  "auth": {
-    "api_key": "2508"
-  },
   "model": {
-    "model_dir": "/Users/rohit/cradle-mlx/helpers/omlx/...",
+    "model_dir": "/Users/rohit/.omlx/models",
     "model_dirs": [
-      "/Users/rohit/cradle-mlx/helpers/omlx/..."
+      "/Users/rohit/.omlx/models"
     ]
   },
   "scheduler": {
@@ -25,14 +22,14 @@
   "matryoshka": {
     "chat_model": "srswti--bodega-raptor-90m",
     "embedding_model": "mlx-community--embeddinggemma-300m-bf16",
+    "chunk_summary_enabled": true,
+    "chunk_summary_model": "srswti--bodega-raptor-90m",
+    "chunk_summary_concurrency": 6,
     "offline": false,
     "late_interaction": true,
     "ignored_paths": [
       ".matryoshka",
-      "target",
-      "tests",
-      "test",
-      ".json"
+      "target"
     ],
     "reranker": "none"
   },

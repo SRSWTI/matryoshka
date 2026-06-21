@@ -1,8 +1,7 @@
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use reqwest::blocking::Client;
 use reqwest::header::CONNECTION;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 
 pub trait Embedder {
     fn model(&self) -> &str;
@@ -52,9 +51,8 @@ impl Embedder for EndpointEmbedder {
                 encoding_format: "float",
             })
             .send()
-            .context("failed to call embeddings endpoint")?
-            .error_for_status()
-            .context("embeddings endpoint returned an error")?
+            .context("failed to call embeddings endpoint")
+            .and_then(response_with_body_on_error)?
             .text()
             .context("failed to read embeddings response body")
             .and_then(|body| {
@@ -71,38 +69,17 @@ impl Embedder for EndpointEmbedder {
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct DeterministicEmbedder {
-    model: String,
-    dimensions: usize,
-}
-
-impl DeterministicEmbedder {
-    pub fn new(dimensions: usize) -> Self {
-        Self {
-            model: format!("deterministic-{dimensions}"),
-            dimensions,
-        }
+fn response_with_body_on_error(
+    response: reqwest::blocking::Response,
+) -> Result<reqwest::blocking::Response> {
+    let status = response.status();
+    if status.is_success() {
+        return Ok(response);
     }
-}
-
-impl Default for DeterministicEmbedder {
-    fn default() -> Self {
-        Self::new(96)
-    }
-}
-
-impl Embedder for DeterministicEmbedder {
-    fn model(&self) -> &str {
-        &self.model
-    }
-
-    fn embed(&self, inputs: &[String]) -> Result<Vec<Vec<f32>>> {
-        Ok(inputs
-            .iter()
-            .map(|input| deterministic_vector(input, self.dimensions))
-            .collect())
-    }
+    let body = response
+        .text()
+        .unwrap_or_else(|err| format!("<failed to read error body: {err}>"));
+    Err(anyhow!("embeddings endpoint returned {status}: {body}"))
 }
 
 #[derive(Debug, Serialize)]
@@ -121,22 +98,6 @@ struct EmbeddingResponse {
 struct EmbeddingDatum {
     index: usize,
     embedding: Vec<f32>,
-}
-
-fn deterministic_vector(text: &str, dimensions: usize) -> Vec<f32> {
-    let mut vector = vec![0.0; dimensions];
-    for token in text.split(|ch: char| !ch.is_alphanumeric() && ch != '_') {
-        if token.is_empty() {
-            continue;
-        }
-        let mut hasher = Sha256::new();
-        hasher.update(token.to_lowercase().as_bytes());
-        let digest = hasher.finalize();
-        let index =
-            u32::from_le_bytes([digest[0], digest[1], digest[2], digest[3]]) as usize % dimensions;
-        vector[index] += 1.0;
-    }
-    normalize(vector)
 }
 
 pub fn normalize(mut vector: Vec<f32>) -> Vec<f32> {

@@ -5,10 +5,8 @@ use matryoshka_core_ir::{
     RetrievalConfig, RetrievalIndexReport, RetrievalPrimary, SearchHit, SymbolFact,
 };
 use matryoshka_embed_client::Embedder;
-use matryoshka_embed_client::{DeterministicEmbedder, EndpointEmbedder};
-use matryoshka_enricher::{
-    CodeEnricher, HeuristicChunkSummarizer, HeuristicEnricher, MlxChatEnricher, MlxChunkSummarizer,
-};
+use matryoshka_embed_client::EndpointEmbedder;
+use matryoshka_enricher::{CodeEnricher, MlxChatEnricher, MlxChunkSummarizer};
 use matryoshka_indexer::{FullIndexer, SemanticRebuildSummary, UpdateSummary};
 use matryoshka_parser::ParserConfig;
 use matryoshka_read_api::{ReadApi, ReadBundle, ReadPackMode};
@@ -78,7 +76,6 @@ impl MatryoshkaCancelToken {
 pub struct MatryoshkaConfig {
     pub repo_root: PathBuf,
     pub db: PathBuf,
-    pub offline: bool,
     pub base_url: String,
     pub api_key: String,
     pub embedding_model: String,
@@ -100,7 +97,6 @@ impl MatryoshkaConfig {
         Self {
             repo_root,
             db,
-            offline: false,
             base_url: DEFAULT_BASE_URL.into(),
             api_key: DEFAULT_API_KEY.into(),
             embedding_model: DEFAULT_EMBED_MODEL.into(),
@@ -118,11 +114,6 @@ impl MatryoshkaConfig {
 
     pub fn with_db(mut self, db: impl Into<PathBuf>) -> Self {
         self.db = db.into();
-        self
-    }
-
-    pub fn offline(mut self, offline: bool) -> Self {
-        self.offline = offline;
         self
     }
 
@@ -397,6 +388,10 @@ pub enum MatryoshkaEvent {
     PrepareCancelled {
         reason: String,
     },
+    PrepareFailed {
+        stage: String,
+        message: String,
+    },
     PrepareCompleted {
         summary: PrepareSummary,
     },
@@ -416,6 +411,10 @@ pub struct ProgressState {
     pub items_done: Option<usize>,
     pub items_total: Option<usize>,
     pub item_label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_stage: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
     pub updated_at_unix_ms: u128,
 }
 
@@ -441,6 +440,8 @@ impl ProgressState {
             items_done: None,
             items_total: None,
             item_label: None,
+            error_stage: None,
+            last_error: None,
             updated_at_unix_ms: unix_millis(),
         }
     }
@@ -466,6 +467,12 @@ impl ProgressState {
         self.items_done = items_done;
         self.items_total = items_total;
         self.item_label = Some(item_label.into());
+        self
+    }
+
+    fn with_error(mut self, stage: impl Into<String>, message: impl Into<String>) -> Self {
+        self.error_stage = Some(stage.into());
+        self.last_error = Some(message.into());
         self
     }
 }
@@ -610,7 +617,25 @@ impl Matryoshka {
                         "prepare was cancelled while waiting for the project lock",
                     );
                 }
-                Err(err) => return Err(err),
+                Err(err) => {
+                    let message = format!("{err:#}");
+                    log.event(
+                        "prepare_failed",
+                        json!({
+                            "stage": "acquiring_prepare_lock",
+                            "message": message.clone(),
+                        }),
+                    )?;
+                    emit_event(
+                        &mut on_event,
+                        &mut progress_writer,
+                        MatryoshkaEvent::PrepareFailed {
+                            stage: "acquiring_prepare_lock".into(),
+                            message,
+                        },
+                    );
+                    return Err(err);
+                }
             };
 
         let result = (|| -> Result<PrepareSummary> {
@@ -646,9 +671,8 @@ impl Matryoshka {
                 json!({
                     "repo_root": self.config.repo_root,
                     "db": self.config.db,
-                    "offline": self.config.offline,
-                    "embedding_model": if self.config.offline { "deterministic" } else { self.config.embedding_model.as_str() },
-                    "chat_model": if self.config.offline { "heuristic" } else { self.config.chat_model.as_str() },
+                    "embedding_model": self.config.embedding_model.as_str(),
+                    "chat_model": self.config.chat_model.as_str(),
                     "existing_file_count": existing_file_count,
                     "existing_missing_text": existing_gap_count,
                     "existing_search_missing": existing_search_missing,
@@ -922,6 +946,27 @@ impl Matryoshka {
             Ok(summary)
         })();
 
+        if let Err(err) = result.as_ref() {
+            if !is_cancelled_error(err.as_ref()) {
+                let message = format!("{err:#}");
+                let _ = log.event(
+                    "prepare_failed",
+                    json!({
+                        "stage": "prepare",
+                        "message": message.clone(),
+                    }),
+                );
+                emit_event(
+                    &mut on_event,
+                    &mut progress_writer,
+                    MatryoshkaEvent::PrepareFailed {
+                        stage: "prepare".into(),
+                        message,
+                    },
+                );
+            }
+        }
+
         let release_result =
             release_prepare_lock(prepare_lock, &self.config.db, &mut on_event, &mut log);
         match (result, release_result) {
@@ -933,33 +978,27 @@ impl Matryoshka {
 
     pub fn search(&self, query: &str, options: SearchOptions) -> Result<Vec<SearchHit>> {
         ensure_matryoshka_layout(&self.config.db)?;
+        self.ensure_prepare_ready_for_reads()?;
         ensure_reranker_options(&options.reranker)?;
         let store = MatryoshkaStore::open(&self.config.db)?;
         let result_granularity = options.result_granularity;
-        if self.config.offline {
-            let engine = SearchEngine::new(store, DeterministicEmbedder::default())
-                .with_dense(self.config.dense_enabled)
-                .with_late_interaction(self.config.late_interaction)
-                .with_result_granularity(result_granularity);
-            search_with_reranker(engine, &self.config, query, options.limit, options.reranker)
-        } else {
-            let engine = SearchEngine::new(
-                store,
-                EndpointEmbedder::new(
-                    self.config.base_url.clone(),
-                    self.config.api_key.clone(),
-                    self.config.embedding_model.clone(),
-                ),
-            )
-            .with_dense(self.config.dense_enabled)
-            .with_late_interaction(self.config.late_interaction)
-            .with_result_granularity(result_granularity);
-            search_with_reranker(engine, &self.config, query, options.limit, options.reranker)
-        }
+        let engine = SearchEngine::new(
+            store,
+            EndpointEmbedder::new(
+                self.config.base_url.clone(),
+                self.config.api_key.clone(),
+                self.config.embedding_model.clone(),
+            ),
+        )
+        .with_dense(self.config.dense_enabled)
+        .with_late_interaction(self.config.late_interaction)
+        .with_result_granularity(result_granularity);
+        search_with_reranker(engine, &self.config, query, options.limit, options.reranker)
     }
 
     pub fn read(&self, file: &str) -> Result<ReadCard> {
         ensure_matryoshka_layout(&self.config.db)?;
+        self.ensure_prepare_ready_for_reads()?;
         ReadApi::new(
             MatryoshkaStore::open(&self.config.db)?,
             self.config.repo_root.clone(),
@@ -968,6 +1007,8 @@ impl Matryoshka {
     }
 
     pub fn read_bundle(&self, options: ReadBundleOptions) -> Result<ReadBundle> {
+        ensure_matryoshka_layout(&self.config.db)?;
+        self.ensure_prepare_ready_for_reads()?;
         let store = MatryoshkaStore::open(&self.config.db)?;
         let hits = self.search(
             &task_query(AgentTask::ReadNext, &options.query),
@@ -1013,6 +1054,55 @@ impl Matryoshka {
         Ok(rows)
     }
 
+    fn ensure_prepare_ready_for_reads(&self) -> Result<()> {
+        let ready_marker = ready_marker_path(&self.config.db);
+        if !ready_marker.exists() {
+            return Err(anyhow!(
+                "Matryoshka prepare is not ready for {}; run prepare first{}",
+                self.config.db.display(),
+                prepare_state_error_hint(&self.config.db)
+            ));
+        }
+
+        let store = MatryoshkaStore::open(&self.config.db)?;
+        let empty_cards = store
+            .load_active_card_summaries()?
+            .into_iter()
+            .filter(|row| row.is_empty)
+            .collect::<Vec<_>>();
+        if !empty_cards.is_empty() {
+            let samples = empty_cards
+                .iter()
+                .take(8)
+                .map(|row| format!("{}:{}", row.card_type, row.id))
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(anyhow!(
+                "Matryoshka prepare is not ready: {} active card summaries are empty ({samples}); run prepare again{}",
+                empty_cards.len(),
+                prepare_state_error_hint(&self.config.db)
+            ));
+        }
+
+        let retrieval = retrieval_report_from_stats(
+            store.retrieval_index_stats()?,
+            self.config.retrieval_config(),
+            self.config.late_interaction,
+        );
+        if !retrieval_is_ready(&retrieval) {
+            return Err(anyhow!(
+                "Matryoshka prepare is not ready: retrieval index is incomplete (semantic_records={}, fts_records={}, embedded_records={}, records_with_late_vectors={}); run prepare again{}",
+                retrieval.semantic_records,
+                retrieval.fts_records,
+                retrieval.embedded_records,
+                retrieval.records_with_late_vectors,
+                prepare_state_error_hint(&self.config.db)
+            ));
+        }
+
+        Ok(())
+    }
+
     fn run_update_once_with_progress(
         &self,
         parser_config: ParserConfig,
@@ -1027,45 +1117,31 @@ impl Matryoshka {
                 json!({
                     "repo_root": self.config.repo_root,
                     "db": self.config.db,
-                    "offline": self.config.offline,
-                    "embedding_model": if self.config.offline { "deterministic" } else { self.config.embedding_model.as_str() },
+                    "embedding_model": self.config.embedding_model.as_str(),
                 }),
             )?;
         }
         let store = MatryoshkaStore::open(&self.config.db)?;
-        let summary = if self.config.offline {
-            FullIndexer::new(
-                store,
-                CancellableEnricher::new(HeuristicEnricher, cancel_token.clone()),
-                CancellableEmbedder::new(DeterministicEmbedder::default(), cancel_token.clone()),
-                HeuristicChunkSummarizer,
-            )
-            .with_parser_config(parser_config)
-            .with_retrieval_config(self.config.retrieval_config())
-            .update_repo_with_progress(&self.config.repo_root, &mut progress)?
-        } else {
-            let enricher = MlxChatEnricher::new(&self.config.base_url, &self.config.api_key)
-                .with_model(self.config.chat_model.clone());
-            let embedder = EndpointEmbedder::new(
-                &self.config.base_url,
-                &self.config.api_key,
-                self.config.embedding_model.clone(),
-            );
-            let chunk_summarizer =
-                MlxChunkSummarizer::new(&self.config.base_url, &self.config.api_key)
-                    .with_model(&self.config.chunk_summary_model)
-                    .with_concurrency(self.config.chunk_summary_concurrency);
-            FullIndexer::new(
-                store,
-                CancellableEnricher::new(enricher, cancel_token.clone()),
-                CancellableEmbedder::new(embedder, cancel_token.clone()),
-                chunk_summarizer,
-            )
-            .with_parser_config(parser_config)
-            .with_retrieval_config(self.config.retrieval_config())
-            .with_chunk_summary_enabled(self.config.chunk_summary_enabled)
-            .update_repo_with_progress(&self.config.repo_root, &mut progress)?
-        };
+        let enricher = MlxChatEnricher::new(&self.config.base_url, &self.config.api_key)
+            .with_model(self.config.chat_model.clone());
+        let embedder = EndpointEmbedder::new(
+            &self.config.base_url,
+            &self.config.api_key,
+            self.config.embedding_model.clone(),
+        );
+        let chunk_summarizer = MlxChunkSummarizer::new(&self.config.base_url, &self.config.api_key)
+            .with_model(&self.config.chunk_summary_model)
+            .with_concurrency(self.config.chunk_summary_concurrency);
+        let summary = FullIndexer::new(
+            store,
+            CancellableEnricher::new(enricher, cancel_token.clone()),
+            CancellableEmbedder::new(embedder, cancel_token.clone()),
+            chunk_summarizer,
+        )
+        .with_parser_config(parser_config)
+        .with_retrieval_config(self.config.retrieval_config())
+        .with_chunk_summary_enabled(self.config.chunk_summary_enabled)
+        .update_repo_with_progress(&self.config.repo_root, &mut progress)?;
         cancel_token.check()?;
         if let Some(log) = log.as_deref_mut() {
             log.event("update_completed", update_summary_json(&summary))?;
@@ -1086,38 +1162,32 @@ impl Matryoshka {
                 json!({
                     "repo_root": self.config.repo_root,
                     "db": self.config.db,
-                    "offline": self.config.offline,
-                    "embedding_model": if self.config.offline { "deterministic" } else { self.config.embedding_model.as_str() },
+                    "embedding_model": self.config.embedding_model.as_str(),
                 }),
             )?;
         }
         let store = MatryoshkaStore::open(&self.config.db)?;
-        let summary = if self.config.offline {
-            FullIndexer::new(
-                store,
-                CancellableEnricher::new(HeuristicEnricher, cancel_token.clone()),
-                CancellableEmbedder::new(DeterministicEmbedder::default(), cancel_token.clone()),
-                HeuristicChunkSummarizer,
-            )
-            .with_retrieval_config(self.config.retrieval_config())
-            .rebuild_semantic_index_with_progress(&self.config.repo_root, &mut progress)?
-        } else {
-            FullIndexer::new(
-                store,
-                CancellableEnricher::new(HeuristicEnricher, cancel_token.clone()),
-                CancellableEmbedder::new(
-                    EndpointEmbedder::new(
-                        &self.config.base_url,
-                        &self.config.api_key,
-                        self.config.embedding_model.clone(),
-                    ),
-                    cancel_token.clone(),
+        let summary = FullIndexer::new(
+            store,
+            CancellableEnricher::new(
+                MlxChatEnricher::new(&self.config.base_url, &self.config.api_key)
+                    .with_model(self.config.chat_model.clone()),
+                cancel_token.clone(),
+            ),
+            CancellableEmbedder::new(
+                EndpointEmbedder::new(
+                    &self.config.base_url,
+                    &self.config.api_key,
+                    self.config.embedding_model.clone(),
                 ),
-                HeuristicChunkSummarizer,
-            )
-            .with_retrieval_config(self.config.retrieval_config())
-            .rebuild_semantic_index_with_progress(&self.config.repo_root, &mut progress)?
-        };
+                cancel_token.clone(),
+            ),
+            MlxChunkSummarizer::new(&self.config.base_url, &self.config.api_key)
+                .with_model(&self.config.chunk_summary_model)
+                .with_concurrency(self.config.chunk_summary_concurrency),
+        )
+        .with_retrieval_config(self.config.retrieval_config())
+        .rebuild_semantic_index_with_progress(&self.config.repo_root, &mut progress)?;
         cancel_token.check()?;
         if let Some(log) = log.as_deref_mut() {
             log.event(
@@ -1141,8 +1211,7 @@ impl Matryoshka {
                 "prewarm_started",
                 json!({
                     "db": self.config.db,
-                    "offline": self.config.offline,
-                    "embedding_model": if self.config.offline { "deterministic" } else { self.config.embedding_model.as_str() },
+                    "embedding_model": self.config.embedding_model.as_str(),
                     "limit": limit,
                     "query_count": queries.len(),
                     "late_interaction": self.config.late_interaction,
@@ -1150,30 +1219,20 @@ impl Matryoshka {
             )?;
         }
         let store = MatryoshkaStore::open(&self.config.db)?;
-        let summary = if self.config.offline {
-            SearchEngine::new(
-                store,
-                CancellableEmbedder::new(DeterministicEmbedder::default(), cancel_token.clone()),
-            )
-            .with_dense(self.config.dense_enabled)
-            .with_late_interaction(self.config.late_interaction)
-            .prewarm(queries, limit)?
-        } else {
-            SearchEngine::new(
-                store,
-                CancellableEmbedder::new(
-                    EndpointEmbedder::new(
-                        &self.config.base_url,
-                        &self.config.api_key,
-                        self.config.embedding_model.clone(),
-                    ),
-                    cancel_token.clone(),
+        let summary = SearchEngine::new(
+            store,
+            CancellableEmbedder::new(
+                EndpointEmbedder::new(
+                    &self.config.base_url,
+                    &self.config.api_key,
+                    self.config.embedding_model.clone(),
                 ),
-            )
-            .with_dense(self.config.dense_enabled)
-            .with_late_interaction(self.config.late_interaction)
-            .prewarm(queries, limit)?
-        };
+                cancel_token.clone(),
+            ),
+        )
+        .with_dense(self.config.dense_enabled)
+        .with_late_interaction(self.config.late_interaction)
+        .prewarm(queries, limit)?;
         cancel_token.check()?;
         if let Some(log) = log.as_deref_mut() {
             let retrieval_stats =
@@ -1378,6 +1437,10 @@ fn progress_state_from_event(event: &MatryoshkaEvent) -> Option<ProgressState> {
         ),
         MatryoshkaEvent::PrepareCancelled { .. } => {
             ProgressState::new("prepare", None, "cancelled", "cancelled", "Cancelled", 1.0)
+        }
+        MatryoshkaEvent::PrepareFailed { stage, message } => {
+            ProgressState::new("prepare", None, "failed", stage, "Prepare failed", 1.0)
+                .with_error(stage.clone(), message.clone())
         }
         MatryoshkaEvent::PrepareCompleted { summary } => ProgressState::new(
             "prepare",
@@ -1630,14 +1693,10 @@ fn indexer_progress_state(
             ProgressState::new(operation, action, status, phase, message, percent)
                 .with_file_progress(None, Some(*file_count), Some(*file_count))
         }
-        MatryoshkaProgressEvent::Failed { .. } => ProgressState::new(
-            operation,
-            action,
-            "failed",
-            "failed",
-            "Needs attention",
-            0.0,
-        ),
+        MatryoshkaProgressEvent::Failed { stage, message } => {
+            ProgressState::new(operation, action, "failed", stage, message, 0.0)
+                .with_error(stage.clone(), message.clone())
+        }
     }
 }
 
@@ -1887,6 +1946,49 @@ pub fn progress_state_path(db: &Path) -> PathBuf {
         .unwrap_or_else(|| Path::new(MATRYOSHKA_DIR))
         .join("state")
         .join("progress.json")
+}
+
+fn prepare_state_error_hint(db: &Path) -> String {
+    let path = progress_state_path(db);
+    let Ok(raw) = fs::read_to_string(path) else {
+        return String::new();
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return String::new();
+    };
+    let status = value
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    let phase = value
+        .get("phase")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    let last_error = value
+        .get("last_error")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    let message = value
+        .get("message")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+
+    if !last_error.trim().is_empty() {
+        format!("; last prepare error: {last_error}")
+    } else if status == "running" {
+        let phase = if phase.trim().is_empty() {
+            "unknown"
+        } else {
+            phase
+        };
+        format!(
+            "; previous prepare is still running or was interrupted at phase {phase}; run prepare again to resume"
+        )
+    } else if !status.is_empty() && status != "ready" {
+        format!("; last prepare status: {status} ({phase}) {message}")
+    } else {
+        String::new()
+    }
 }
 
 pub fn ready_marker_path(db: &Path) -> PathBuf {

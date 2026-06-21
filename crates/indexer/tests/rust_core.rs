@@ -1,14 +1,233 @@
-use matryoshka_core_ir::MatryoshkaProgressEvent;
-use matryoshka_embed_client::DeterministicEmbedder;
+use matryoshka_core_ir::{
+    ChunkSummarySource, CodeChunkFact, DependencyInterpretation, FileCard, FileEnrichmentContext,
+    FileFact, FolderCard, FolderEnrichmentContext, FolderFact, MatryoshkaProgressEvent, Provenance,
+    RepoCard, SubareaSummary, SymbolBehavior, SymbolFact,
+};
 use matryoshka_embed_client::EndpointEmbedder;
-use matryoshka_enricher::HeuristicChunkSummarizer;
-use matryoshka_enricher::HeuristicEnricher;
-use matryoshka_enricher::MlxChatEnricher;
+use matryoshka_embed_client::{Embedder, normalize};
+use matryoshka_enricher::{ChunkSummarizer, ChunkSummaryDraft, CodeEnricher, MlxChatEnricher};
 use matryoshka_indexer::{FullIndexer, RetrievalConfig};
 use matryoshka_read_api::{ReadApi, ReadPackMode};
 use matryoshka_search::{SearchEngine, default_prewarm_queries};
 use matryoshka_store_sqlite::MatryoshkaStore;
 use std::fs;
+use std::hash::{Hash, Hasher};
+
+#[derive(Debug, Clone, Default)]
+struct TestEmbedder;
+
+impl Embedder for TestEmbedder {
+    fn model(&self) -> &str {
+        "test-embedder"
+    }
+
+    fn embed(&self, inputs: &[String]) -> anyhow::Result<Vec<Vec<f32>>> {
+        Ok(inputs.iter().map(|input| test_vector(input)).collect())
+    }
+}
+
+fn test_vector(input: &str) -> Vec<f32> {
+    let mut vector = vec![0.0; 96];
+    for token in input.split(|ch: char| !ch.is_alphanumeric() && ch != '_') {
+        if token.is_empty() {
+            continue;
+        }
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        token.to_ascii_lowercase().hash(&mut hasher);
+        let index = hasher.finish() as usize % vector.len();
+        vector[index] += 1.0;
+    }
+    normalize(vector)
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TestEnricher;
+
+impl CodeEnricher for TestEnricher {
+    fn enrich_file(
+        &self,
+        file: &FileFact,
+        symbols: &[SymbolFact],
+        context: &FileEnrichmentContext,
+    ) -> anyhow::Result<FileCard> {
+        Ok(FileCard {
+            file_id: file.file_id.clone(),
+            summary: format!("{} handles {}", file.path, file.name),
+            role: format!("{} source file", file.language),
+            primary_behaviors: symbols
+                .iter()
+                .map(|symbol| symbol.qualified_name.clone())
+                .collect(),
+            behavior_intents: Vec::new(),
+            edit_intents: Vec::new(),
+            retrieval_tags: vec![file.language.clone(), file.name.clone()],
+            ownership_kind: Default::default(),
+            owns_behaviors: Vec::new(),
+            delegates_to: context
+                .internal_imports
+                .iter()
+                .filter_map(|import| import.resolved_path.clone())
+                .collect(),
+            side_effects: Vec::new(),
+            key_entities: symbols.iter().map(|symbol| symbol.name.clone()).collect(),
+            external_systems: context
+                .external_imports
+                .iter()
+                .map(|import| import.module.clone())
+                .collect(),
+            important_symbols: symbols
+                .iter()
+                .map(|symbol| SymbolBehavior {
+                    symbol_id: symbol.symbol_id.clone(),
+                    name: symbol.name.clone(),
+                    role: format!("{:?}", symbol.kind),
+                    behavior: symbol.signature.clone(),
+                })
+                .collect(),
+            imports_interpreted: context
+                .internal_imports
+                .iter()
+                .filter_map(|import| {
+                    let target_id = import.resolved_file_id.clone()?;
+                    Some(DependencyInterpretation {
+                        target_id,
+                        target_path: import
+                            .resolved_path
+                            .clone()
+                            .unwrap_or_else(|| import.module.clone()),
+                        why: format!("imports {}", import.module),
+                        dependency_kind: import.dependency_kind.clone(),
+                    })
+                })
+                .collect(),
+            used_by_interpreted: Vec::new(),
+            blast_radius: Vec::new(),
+            agent_read_hints: Vec::new(),
+            search_phrases: vec![file.path.clone()],
+            risk_notes: Vec::new(),
+            provenance: Provenance::source_only(file.source_hash.clone()),
+        })
+    }
+
+    fn enrich_folder(
+        &self,
+        folder: &FolderFact,
+        child_files: &[FileCard],
+        child_folders: &[FolderCard],
+        _context: &FolderEnrichmentContext,
+    ) -> anyhow::Result<FolderCard> {
+        let child_refs = child_files
+            .iter()
+            .map(|card| card.file_id.clone())
+            .chain(child_folders.iter().map(|card| card.folder_id.clone()))
+            .collect::<Vec<_>>();
+        let child_ref_text = child_refs.join(", ");
+        Ok(FolderCard {
+            folder_id: folder.folder_id.clone(),
+            summary: format!(
+                "{} groups indexed source: {}",
+                folder.folder_id, child_ref_text
+            ),
+            responsibility: format!(
+                "{} groups indexed source: {}",
+                folder.folder_id, child_ref_text
+            ),
+            behavior_intents: Vec::new(),
+            edit_intents: Vec::new(),
+            retrieval_tags: vec![folder.folder_id.clone()],
+            contains_kinds_of_files: child_refs.clone(),
+            incoming_dependencies_meaning: Vec::new(),
+            outgoing_dependencies_meaning: Vec::new(),
+            key_entrypoints: child_refs,
+            common_behaviors: Vec::new(),
+            subareas: folder
+                .child_folder_ids
+                .iter()
+                .map(|id| SubareaSummary {
+                    id: id.clone(),
+                    name: id.clone(),
+                    responsibility: child_folders
+                        .iter()
+                        .find(|card| &card.folder_id == id)
+                        .map(|card| card.responsibility.clone())
+                        .unwrap_or_default(),
+                })
+                .collect(),
+            agent_guidance: Vec::new(),
+            search_phrases: vec![folder.folder_id.clone()],
+            provenance: Provenance::source_only(
+                child_files
+                    .iter()
+                    .map(|card| card.provenance.source_hash.as_str())
+                    .chain(
+                        child_folders
+                            .iter()
+                            .map(|card| card.provenance.source_hash.as_str()),
+                    )
+                    .collect::<Vec<_>>()
+                    .join(":"),
+            ),
+        })
+    }
+
+    fn enrich_repo(&self, repo_root: &str, folders: &[FolderCard]) -> anyhow::Result<RepoCard> {
+        Ok(RepoCard {
+            repo_root: repo_root.to_string(),
+            summary: format!("{repo_root} contains indexed source"),
+            behavior_intents: Vec::new(),
+            edit_intents: Vec::new(),
+            retrieval_tags: vec!["repo".into()],
+            top_level_subsystems: folders
+                .iter()
+                .take(8)
+                .map(|folder| SubareaSummary {
+                    id: folder.folder_id.clone(),
+                    name: folder.folder_id.clone(),
+                    responsibility: folder.responsibility.clone(),
+                })
+                .collect(),
+            cross_subsystem_flows: Vec::new(),
+            entrypoints: folders
+                .iter()
+                .flat_map(|folder| folder.key_entrypoints.clone())
+                .collect(),
+            high_risk_areas: Vec::new(),
+            agent_navigation_hints: Vec::new(),
+            search_phrases: vec![repo_root.to_string()],
+            provenance: Provenance::source_only(
+                folders
+                    .iter()
+                    .map(|folder| folder.provenance.source_hash.as_str())
+                    .collect::<Vec<_>>()
+                    .join(":"),
+            ),
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TestChunkSummarizer;
+
+impl ChunkSummarizer for TestChunkSummarizer {
+    fn summarize_chunks(&self, chunks: &[CodeChunkFact]) -> anyhow::Result<Vec<ChunkSummaryDraft>> {
+        Ok(chunks
+            .iter()
+            .map(|chunk| ChunkSummaryDraft {
+                chunk_id: chunk.chunk_id.clone(),
+                summary: format!(
+                    "{} in {}",
+                    chunk
+                        .qualified_name
+                        .as_deref()
+                        .or(chunk.symbol.as_deref())
+                        .unwrap_or("code chunk"),
+                    chunk.path
+                ),
+                source: ChunkSummarySource::Llm,
+            })
+            .collect())
+    }
+}
 
 #[test]
 fn indexes_searches_and_reads_file_cards() {
@@ -18,9 +237,9 @@ fn indexes_searches_and_reads_file_cards() {
     let store = MatryoshkaStore::open(&db_path).unwrap();
     let indexer = FullIndexer::new(
         store,
-        HeuristicEnricher,
-        DeterministicEmbedder::default(),
-        HeuristicChunkSummarizer,
+        TestEnricher,
+        TestEmbedder::default(),
+        TestChunkSummarizer,
     );
 
     let summary = indexer.index_repo(&repo_root).unwrap();
@@ -74,7 +293,7 @@ fn indexes_searches_and_reads_file_cards() {
 
     let search = SearchEngine::new(
         MatryoshkaStore::open(&db_path).unwrap(),
-        DeterministicEmbedder::default(),
+        TestEmbedder::default(),
     );
     let repo_hits = search.search("repository architecture", 5).unwrap();
     assert!(repo_hits.iter().any(|hit| {
@@ -141,9 +360,9 @@ fn dense_disabled_indexing_keeps_fts_search_without_embeddings() {
     let store = MatryoshkaStore::open(&db_path).unwrap();
     let indexer = FullIndexer::new(
         store,
-        HeuristicEnricher,
-        DeterministicEmbedder::default(),
-        HeuristicChunkSummarizer,
+        TestEnricher,
+        TestEmbedder::default(),
+        TestChunkSummarizer,
     )
     .with_retrieval_config(RetrievalConfig {
         dense_enabled: false,
@@ -184,7 +403,7 @@ fn dense_disabled_indexing_keeps_fts_search_without_embeddings() {
 
     let search = SearchEngine::new(
         MatryoshkaStore::open(&db_path).unwrap(),
-        DeterministicEmbedder::default(),
+        TestEmbedder::default(),
     )
     .with_dense(false);
     let hits = search
@@ -226,9 +445,9 @@ fn incremental_update_refreshes_changed_entities_and_preserves_unaffected_cards(
     let store = MatryoshkaStore::open(&db_path).unwrap();
     let indexer = FullIndexer::new(
         store,
-        HeuristicEnricher,
-        DeterministicEmbedder::default(),
-        HeuristicChunkSummarizer,
+        TestEnricher,
+        TestEmbedder::default(),
+        TestChunkSummarizer,
     );
     indexer.index_repo(repo_root).unwrap();
 
@@ -253,7 +472,7 @@ fn incremental_update_refreshes_changed_entities_and_preserves_unaffected_cards(
     assert_eq!(before_unaffected, after_unaffected);
     assert_ne!(before_changed_hash, after_changed.source_hash);
 
-    let search = SearchEngine::new(store, DeterministicEmbedder::default());
+    let search = SearchEngine::new(store, TestEmbedder::default());
     let hits = search.search("cache_key util cache", 5).unwrap();
     assert!(hits.iter().any(|hit| hit.path == "src/util.rs"));
     let fts_hits = MatryoshkaStore::open(&db_path)
@@ -288,9 +507,9 @@ fn incremental_update_removes_deleted_files_from_fts_candidates() {
     let store = MatryoshkaStore::open(&db_path).unwrap();
     let indexer = FullIndexer::new(
         store,
-        HeuristicEnricher,
-        DeterministicEmbedder::default(),
-        HeuristicChunkSummarizer,
+        TestEnricher,
+        TestEmbedder::default(),
+        TestChunkSummarizer,
     );
     indexer.index_repo(repo_root).unwrap();
 
@@ -315,7 +534,7 @@ fn incremental_update_removes_deleted_files_from_fts_candidates() {
         .unwrap();
     assert!(after_hits.is_empty(), "{after_hits:?}");
 
-    let search = SearchEngine::new(after_store, DeterministicEmbedder::default());
+    let search = SearchEngine::new(after_store, TestEmbedder::default());
     let hits = search.search("obsolete_unique_marker", 5).unwrap();
     assert!(
         hits.iter().all(|hit| !hit.path.contains("remove_me.rs")),
@@ -324,7 +543,7 @@ fn incremental_update_removes_deleted_files_from_fts_candidates() {
 }
 
 #[test]
-fn heuristic_parent_folder_cards_use_grounded_rollup_summaries() {
+fn parent_folder_cards_use_grounded_rollup_summaries() {
     let temp = tempfile::tempdir().unwrap();
     let repo_root = temp.path();
     fs::create_dir_all(repo_root.join("gateway/crates/service/src")).unwrap();
@@ -338,9 +557,9 @@ fn heuristic_parent_folder_cards_use_grounded_rollup_summaries() {
     let store = MatryoshkaStore::open(&db_path).unwrap();
     let indexer = FullIndexer::new(
         store.clone(),
-        HeuristicEnricher,
-        DeterministicEmbedder::default(),
-        HeuristicChunkSummarizer,
+        TestEnricher,
+        TestEmbedder::default(),
+        TestChunkSummarizer,
     );
 
     indexer.index_repo(repo_root).unwrap();
@@ -383,7 +602,7 @@ fn heuristic_parent_folder_cards_use_grounded_rollup_summaries() {
 }
 
 #[test]
-fn storage_heuristics_do_not_leak_matryoshka_internals() {
+fn storage_enrichment_does_not_leak_matryoshka_internals() {
     let temp = tempfile::tempdir().unwrap();
     let repo_root = temp.path();
     fs::create_dir_all(repo_root.join("src/oauth")).unwrap();
@@ -397,9 +616,9 @@ fn storage_heuristics_do_not_leak_matryoshka_internals() {
     let store = MatryoshkaStore::open(&db_path).unwrap();
     let indexer = FullIndexer::new(
         store.clone(),
-        HeuristicEnricher,
-        DeterministicEmbedder::default(),
-        HeuristicChunkSummarizer,
+        TestEnricher,
+        TestEmbedder::default(),
+        TestChunkSummarizer,
     );
 
     indexer.index_repo(repo_root).unwrap();
@@ -431,9 +650,9 @@ fn rebuild_semantic_recovers_search_without_full_reindex() {
     let store = MatryoshkaStore::open(&db_path).unwrap();
     let indexer = FullIndexer::new(
         store,
-        HeuristicEnricher,
-        DeterministicEmbedder::default(),
-        HeuristicChunkSummarizer,
+        TestEnricher,
+        TestEmbedder::default(),
+        TestChunkSummarizer,
     );
 
     indexer.index_repo(&repo_root).unwrap();
@@ -466,7 +685,7 @@ fn rebuild_semantic_recovers_search_without_full_reindex() {
             .is_some_and(|embedding| !embedding.is_empty())
     }));
 
-    let search = SearchEngine::new(store, DeterministicEmbedder::default());
+    let search = SearchEngine::new(store, TestEmbedder::default());
     let hits = search.search("repository architecture", 5).unwrap();
     assert!(hits.iter().any(|hit| {
         matches!(
@@ -484,9 +703,9 @@ fn index_repo_with_progress_emits_real_events() {
     let store = MatryoshkaStore::open(&db_path).unwrap();
     let indexer = FullIndexer::new(
         store,
-        HeuristicEnricher,
-        DeterministicEmbedder::default(),
-        HeuristicChunkSummarizer,
+        TestEnricher,
+        TestEmbedder::default(),
+        TestChunkSummarizer,
     );
     let mut events = Vec::new();
 
@@ -570,9 +789,9 @@ fn index_repo_with_progress_emits_failed_event() {
     let store = MatryoshkaStore::open(&db_path).unwrap();
     let indexer = FullIndexer::new(
         store,
-        HeuristicEnricher,
-        DeterministicEmbedder::default(),
-        HeuristicChunkSummarizer,
+        TestEnricher,
+        TestEmbedder::default(),
+        TestChunkSummarizer,
     );
     let mut events = Vec::new();
 
@@ -604,9 +823,9 @@ fn rebuild_semantic_with_progress_emits_batch_events() {
     let store = MatryoshkaStore::open(&db_path).unwrap();
     let indexer = FullIndexer::new(
         store,
-        HeuristicEnricher,
-        DeterministicEmbedder::default(),
-        HeuristicChunkSummarizer,
+        TestEnricher,
+        TestEmbedder::default(),
+        TestChunkSummarizer,
     );
 
     indexer.index_repo(&repo_root).unwrap();
@@ -655,9 +874,9 @@ fn update_repairs_missing_enriched_artifacts_after_interrupted_prewarm() {
     let store = MatryoshkaStore::open(&db_path).unwrap();
     let indexer = FullIndexer::new(
         store.clone(),
-        HeuristicEnricher,
-        DeterministicEmbedder::default(),
-        HeuristicChunkSummarizer,
+        TestEnricher,
+        TestEmbedder::default(),
+        TestChunkSummarizer,
     );
 
     indexer.index_repo(&repo_root).unwrap();
@@ -721,16 +940,16 @@ fn update_repairs_missing_enriched_artifacts_after_interrupted_prewarm() {
 }
 
 #[test]
-fn update_repairs_empty_non_heuristic_file_summaries() {
+fn update_repairs_empty_prepared_file_summaries() {
     let repo_root = std::path::PathBuf::from("tests/fixtures/mini_repo");
     let temp = tempfile::tempdir().unwrap();
     let db_path = temp.path().join("index.db");
     let store = MatryoshkaStore::open(&db_path).unwrap();
     let indexer = FullIndexer::new(
         store.clone(),
-        HeuristicEnricher,
-        DeterministicEmbedder::default(),
-        HeuristicChunkSummarizer,
+        TestEnricher,
+        TestEmbedder::default(),
+        TestChunkSummarizer,
     );
 
     indexer.index_repo(&repo_root).unwrap();
@@ -755,7 +974,7 @@ fn update_repairs_empty_non_heuristic_file_summaries() {
         .expect("expected repaired file card");
     assert_eq!(summary.changed_files, 0);
     assert_ne!(repaired.role, "stale broken role");
-    assert_eq!(repaired.provenance.model.as_deref(), Some("heuristic"));
+    assert_ne!(repaired.provenance.model.as_deref(), Some("mlx-empty-test"));
     assert!(
         events
             .iter()
@@ -783,7 +1002,7 @@ fn real_mlx_progress_integration() {
         store,
         MlxChatEnricher::new(&base_url, &api_key).with_model(chat_model),
         EndpointEmbedder::new(&base_url, &api_key, embed_model),
-        HeuristicChunkSummarizer,
+        TestChunkSummarizer,
     );
     let mut events = Vec::new();
 

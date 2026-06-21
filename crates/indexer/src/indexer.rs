@@ -6,7 +6,7 @@ use matryoshka_core_ir::{
     RetrievalIndexReport, SemanticEntityType, SemanticRecord,
 };
 use matryoshka_embed_client::Embedder;
-use matryoshka_enricher::{ChunkSummarizer, CodeEnricher, HeuristicChunkSummarizer};
+use matryoshka_enricher::{ChunkSummarizer, CodeEnricher};
 use matryoshka_parser::{ParserConfig, SourceParser};
 use matryoshka_resolver::GraphResolver;
 use matryoshka_store_sqlite::MatryoshkaStore;
@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::thread;
 
-pub struct FullIndexer<E, M, S = HeuristicChunkSummarizer> {
+pub struct FullIndexer<E, M, S> {
     store: MatryoshkaStore,
     enricher: E,
     embedder: M,
@@ -1886,10 +1886,7 @@ where
                 if chunk.summary_source == ChunkSummarySource::Empty {
                     if let Some(existing) = existing_chunks.get(&chunk.chunk_id) {
                         if existing.source_hash == chunk.source_hash
-                            && matches!(
-                                existing.summary_source,
-                                ChunkSummarySource::Llm | ChunkSummarySource::Heuristic
-                            )
+                            && matches!(existing.summary_source, ChunkSummarySource::Llm)
                             && !existing.summary.trim().is_empty()
                         {
                             return existing.clone();
@@ -1960,20 +1957,7 @@ where
                 },
             ) {
                 Ok(drafts) => drafts,
-                Err(_err) => {
-                    // If LLM summarization fails entirely, fall back to heuristic
-                    // summaries so chunks still get a (grounded) summary record.
-                    let fallback = matryoshka_enricher::HeuristicChunkSummarizer;
-                    fallback
-                        .summarize_chunks(&chunks_to_summarize)?
-                        .into_iter()
-                        .map(|mut draft| {
-                            draft.summary = format!("[heuristic] {}", draft.summary);
-                            draft.source = ChunkSummarySource::Heuristic;
-                            draft
-                        })
-                        .collect()
-                }
+                Err(err) => return fail_with_progress("summarizing_code_chunks", err, progress),
             }
         };
 

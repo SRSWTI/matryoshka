@@ -4,10 +4,8 @@ use matryoshka::{
     Matryoshka, MatryoshkaConfig, PrepareOptions as ApiPrepareOptions,
     PrepareSummary as ApiPrepareSummary,
 };
-use matryoshka_embed_client::{DeterministicEmbedder, EndpointEmbedder};
-use matryoshka_enricher::{
-    HeuristicChunkSummarizer, HeuristicEnricher, MlxChatEnricher, MlxChunkSummarizer,
-};
+use matryoshka_embed_client::EndpointEmbedder;
+use matryoshka_enricher::{MlxChatEnricher, MlxChunkSummarizer};
 use matryoshka_indexer::{
     ArtifactQualityReport, FullIndexer, IndexSummary, MatryoshkaProgressEvent, RetrievalConfig,
     RetrievalIndexReport, RetrievalPrimary, SemanticRebuildSummary, UpdateSummary,
@@ -56,8 +54,6 @@ enum Command {
         repo_root: PathBuf,
         #[arg(long)]
         db: Option<PathBuf>,
-        #[arg(long, default_value_t = false)]
-        offline: bool,
         #[arg(long, default_value = DEFAULT_BASE_URL)]
         base_url: String,
         #[arg(long, default_value = DEFAULT_API_KEY)]
@@ -103,8 +99,6 @@ enum Command {
         repo_root: PathBuf,
         #[arg(long)]
         db: Option<PathBuf>,
-        #[arg(long, default_value_t = false)]
-        offline: bool,
         #[arg(long, default_value = DEFAULT_BASE_URL)]
         base_url: String,
         #[arg(long, default_value = DEFAULT_API_KEY)]
@@ -146,8 +140,6 @@ enum Command {
         repo_root: PathBuf,
         #[arg(long)]
         db: Option<PathBuf>,
-        #[arg(long, default_value_t = false)]
-        offline: bool,
         #[arg(long, default_value = DEFAULT_BASE_URL)]
         base_url: String,
         #[arg(long, default_value = DEFAULT_API_KEY)]
@@ -185,8 +177,6 @@ enum Command {
         repo_root: PathBuf,
         #[arg(long)]
         db: Option<PathBuf>,
-        #[arg(long, default_value_t = false)]
-        offline: bool,
         #[arg(long, default_value = DEFAULT_BASE_URL)]
         base_url: String,
         #[arg(long, default_value = DEFAULT_API_KEY)]
@@ -224,8 +214,6 @@ enum Command {
         repo_root: PathBuf,
         #[arg(long)]
         db: Option<PathBuf>,
-        #[arg(long, default_value_t = false)]
-        offline: bool,
         #[arg(long, default_value = DEFAULT_BASE_URL)]
         base_url: String,
         #[arg(long, default_value = DEFAULT_API_KEY)]
@@ -255,8 +243,6 @@ enum Command {
         query: String,
         #[arg(long, default_value_t = 8)]
         limit: usize,
-        #[arg(long, default_value_t = false)]
-        offline: bool,
         #[arg(long, default_value = DEFAULT_BASE_URL)]
         base_url: String,
         #[arg(long, default_value = DEFAULT_API_KEY)]
@@ -309,8 +295,6 @@ enum Command {
         query: String,
         #[arg(long, default_value_t = 8)]
         limit: usize,
-        #[arg(long, default_value_t = false)]
-        offline: bool,
         #[arg(long, default_value = DEFAULT_BASE_URL)]
         base_url: String,
         #[arg(long, default_value = DEFAULT_API_KEY)]
@@ -360,8 +344,6 @@ enum Command {
         db: Option<PathBuf>,
         #[arg(long)]
         repo_root: Option<PathBuf>,
-        #[arg(long, default_value_t = false)]
-        offline: bool,
         #[arg(long, default_value = DEFAULT_BASE_URL)]
         base_url: String,
         #[arg(long, default_value = DEFAULT_API_KEY)]
@@ -420,8 +402,6 @@ enum Command {
         related: usize,
         #[arg(long, value_enum, default_value_t = CliReadPackMode::Brief)]
         mode: CliReadPackMode,
-        #[arg(long, default_value_t = false)]
-        offline: bool,
         #[arg(long, default_value = DEFAULT_BASE_URL)]
         base_url: String,
         #[arg(long, default_value = DEFAULT_API_KEY)]
@@ -623,7 +603,6 @@ fn main() -> Result<()> {
         Command::Prepare {
             repo_root,
             db,
-            offline,
             base_url,
             api_key,
             embed_model,
@@ -656,7 +635,6 @@ fn main() -> Result<()> {
                 PrepareOptions {
                     repo_root,
                     db,
-                    offline,
                     base_url,
                     api_key,
                     embed_model,
@@ -686,7 +664,6 @@ fn main() -> Result<()> {
         Command::Index {
             repo_root,
             db,
-            offline,
             base_url,
             api_key,
             embed_model,
@@ -719,55 +696,33 @@ fn main() -> Result<()> {
                 json!({
                     "repo_root": repo_root,
                     "db": db,
-                    "offline": offline,
-                    "embedding_model": if offline { "deterministic" } else { embed_model.as_str() },
-                    "chat_model": if offline { "heuristic" } else { chat_model.as_str() },
+                    "embedding_model": embed_model.as_str(),
+                    "chat_model": chat_model.as_str(),
                 }),
             )?;
             let store = MatryoshkaStore::open(&db)?;
             let parser_config = parser_config(ignore);
             let mut progress_writer = CliProgressStateWriter::new(&db, "index");
-            if offline {
-                let indexer = FullIndexer::new(
-                    store,
-                    HeuristicEnricher,
-                    DeterministicEmbedder::default(),
-                    HeuristicChunkSummarizer,
-                )
+            let enricher = MlxChatEnricher::new(&base_url, &api_key).with_model(chat_model.clone());
+            let embedder = EndpointEmbedder::new(&base_url, &api_key, embed_model.clone());
+            let chunk_summarizer = MlxChunkSummarizer::new(&base_url, &api_key)
+                .with_model(&chunk_summary_model)
+                .with_concurrency(chunk_summary_concurrency);
+            let indexer = FullIndexer::new(store, enricher, embedder, chunk_summarizer)
                 .with_parser_config(parser_config)
                 .with_retrieval_config(retrieval_config)
                 .with_chunk_summary_enabled(!no_chunk_summaries);
-                let summary = indexer.index_repo_with_progress(&repo_root, |event| {
-                    record_cli_progress(&mut progress_writer, progress_jsonl, event);
-                })?;
-                command_log.event("index_completed", index_summary_json(&summary))?;
-                if !progress_jsonl {
-                    print_index_summary(summary);
-                }
-            } else {
-                let enricher =
-                    MlxChatEnricher::new(&base_url, &api_key).with_model(chat_model.clone());
-                let embedder = EndpointEmbedder::new(&base_url, &api_key, embed_model.clone());
-                let chunk_summarizer = MlxChunkSummarizer::new(&base_url, &api_key)
-                    .with_model(&chunk_summary_model)
-                    .with_concurrency(chunk_summary_concurrency);
-                let indexer = FullIndexer::new(store, enricher, embedder, chunk_summarizer)
-                    .with_parser_config(parser_config)
-                    .with_retrieval_config(retrieval_config)
-                    .with_chunk_summary_enabled(!no_chunk_summaries);
-                let summary = indexer.index_repo_with_progress(&repo_root, |event| {
-                    record_cli_progress(&mut progress_writer, progress_jsonl, event);
-                })?;
-                command_log.event("index_completed", index_summary_json(&summary))?;
-                if !progress_jsonl {
-                    print_index_summary(summary);
-                }
+            let summary = indexer.index_repo_with_progress(&repo_root, |event| {
+                record_cli_progress(&mut progress_writer, progress_jsonl, event);
+            })?;
+            command_log.event("index_completed", index_summary_json(&summary))?;
+            if !progress_jsonl {
+                print_index_summary(summary);
             }
             if watch || watch_daemon {
                 start_watch_after_index(
                     &repo_root,
                     &db,
-                    offline,
                     &base_url,
                     &api_key,
                     &embed_model,
@@ -780,7 +735,6 @@ fn main() -> Result<()> {
         Command::Update {
             repo_root,
             db,
-            offline,
             base_url,
             api_key,
             embed_model,
@@ -811,54 +765,33 @@ fn main() -> Result<()> {
                 json!({
                     "repo_root": repo_root,
                     "db": db,
-                    "offline": offline,
-                    "embedding_model": if offline { "deterministic" } else { embed_model.as_str() },
-                    "chat_model": if offline { "heuristic" } else { chat_model.as_str() },
+                    "embedding_model": embed_model.as_str(),
+                    "chat_model": chat_model.as_str(),
                 }),
             )?;
             let store = MatryoshkaStore::open(&db)?;
             let parser_config = parser_config(ignore);
             let mut progress_writer = CliProgressStateWriter::new(&db, "update");
-            if offline {
-                let indexer = FullIndexer::new(
-                    store,
-                    HeuristicEnricher,
-                    DeterministicEmbedder::default(),
-                    HeuristicChunkSummarizer,
-                )
+            let enricher = MlxChatEnricher::new(&base_url, &api_key).with_model(chat_model);
+            let embedder = EndpointEmbedder::new(&base_url, &api_key, embed_model);
+            let chunk_summarizer = MlxChunkSummarizer::new(&base_url, &api_key)
+                .with_model(&chunk_summary_model)
+                .with_concurrency(chunk_summary_concurrency);
+            let indexer = FullIndexer::new(store, enricher, embedder, chunk_summarizer)
                 .with_parser_config(parser_config)
                 .with_retrieval_config(retrieval_config)
                 .with_chunk_summary_enabled(!no_chunk_summaries);
-                let summary = indexer.update_repo_with_progress(&repo_root, |event| {
-                    record_cli_progress(&mut progress_writer, progress_jsonl, event);
-                })?;
-                command_log.event("update_completed", update_summary_json(&summary))?;
-                if !progress_jsonl {
-                    print_update_summary(summary);
-                }
-            } else {
-                let enricher = MlxChatEnricher::new(&base_url, &api_key).with_model(chat_model);
-                let embedder = EndpointEmbedder::new(&base_url, &api_key, embed_model);
-                let chunk_summarizer = MlxChunkSummarizer::new(&base_url, &api_key)
-                    .with_model(&chunk_summary_model)
-                    .with_concurrency(chunk_summary_concurrency);
-                let indexer = FullIndexer::new(store, enricher, embedder, chunk_summarizer)
-                    .with_parser_config(parser_config)
-                    .with_retrieval_config(retrieval_config)
-                    .with_chunk_summary_enabled(!no_chunk_summaries);
-                let summary = indexer.update_repo_with_progress(&repo_root, |event| {
-                    record_cli_progress(&mut progress_writer, progress_jsonl, event);
-                })?;
-                command_log.event("update_completed", update_summary_json(&summary))?;
-                if !progress_jsonl {
-                    print_update_summary(summary);
-                }
+            let summary = indexer.update_repo_with_progress(&repo_root, |event| {
+                record_cli_progress(&mut progress_writer, progress_jsonl, event);
+            })?;
+            command_log.event("update_completed", update_summary_json(&summary))?;
+            if !progress_jsonl {
+                print_update_summary(summary);
             }
         }
         Command::Watch {
             repo_root,
             db,
-            offline,
             base_url,
             api_key,
             embed_model,
@@ -886,7 +819,6 @@ fn main() -> Result<()> {
             let options = WatchLoopOptions {
                 repo_root,
                 db,
-                offline,
                 base_url,
                 api_key,
                 embed_model,
@@ -907,7 +839,6 @@ fn main() -> Result<()> {
             db,
             query,
             limit,
-            offline,
             base_url,
             api_key,
             embed_model,
@@ -938,25 +869,10 @@ fn main() -> Result<()> {
             let db = resolve_db_path(db, None)?;
             ensure_matryoshka_layout(&db)?;
             ensure_single_reranker(rerank, omlx_rerank)?;
-            let store = MatryoshkaStore::open(&db)?;
             let late_interaction = !no_late_interaction;
-            let hits = if offline && omlx_rerank {
-                SearchEngine::new(store, DeterministicEmbedder::default())
-                    .with_dense(retrieval_config.dense_enabled)
-                    .with_late_interaction(late_interaction)
-                    .with_result_granularity(result_granularity)
-                    .with_reranker(
-                        OmlxReranker::new(base_url, api_key, omlx_rerank_model)
-                            .with_max_candidates(omlx_rerank_candidates),
-                    )
-                    .search(&query, limit)?
-            } else if offline {
-                SearchEngine::new(store, DeterministicEmbedder::default())
-                    .with_dense(retrieval_config.dense_enabled)
-                    .with_late_interaction(late_interaction)
-                    .with_result_granularity(result_granularity)
-                    .search(&query, limit)?
-            } else if omlx_rerank {
+            ensure_cli_prepare_ready(&db, retrieval_config, late_interaction)?;
+            let store = MatryoshkaStore::open(&db)?;
+            let hits = if omlx_rerank {
                 SearchEngine::new(
                     store,
                     EndpointEmbedder::new(base_url.clone(), api_key.clone(), embed_model),
@@ -993,7 +909,6 @@ fn main() -> Result<()> {
             task,
             query,
             limit,
-            offline,
             base_url,
             api_key,
             embed_model,
@@ -1024,26 +939,11 @@ fn main() -> Result<()> {
             let db = resolve_db_path(db, None)?;
             ensure_matryoshka_layout(&db)?;
             ensure_single_reranker(rerank, omlx_rerank)?;
-            let store = MatryoshkaStore::open(&db)?;
             let task_query = task_query(task, &query);
             let late_interaction = !no_late_interaction;
-            let hits = if offline && omlx_rerank {
-                SearchEngine::new(store, DeterministicEmbedder::default())
-                    .with_dense(retrieval_config.dense_enabled)
-                    .with_late_interaction(late_interaction)
-                    .with_result_granularity(result_granularity)
-                    .with_reranker(
-                        OmlxReranker::new(base_url, api_key, omlx_rerank_model)
-                            .with_max_candidates(omlx_rerank_candidates),
-                    )
-                    .search(&task_query, limit)?
-            } else if offline {
-                SearchEngine::new(store, DeterministicEmbedder::default())
-                    .with_dense(retrieval_config.dense_enabled)
-                    .with_late_interaction(late_interaction)
-                    .with_result_granularity(result_granularity)
-                    .search(&task_query, limit)?
-            } else if omlx_rerank {
+            ensure_cli_prepare_ready(&db, retrieval_config, late_interaction)?;
+            let store = MatryoshkaStore::open(&db)?;
+            let hits = if omlx_rerank {
                 SearchEngine::new(
                     store,
                     EndpointEmbedder::new(base_url.clone(), api_key.clone(), embed_model),
@@ -1078,7 +978,6 @@ fn main() -> Result<()> {
         Command::Prewarm {
             db,
             repo_root,
-            offline,
             base_url,
             api_key,
             embed_model,
@@ -1110,8 +1009,7 @@ fn main() -> Result<()> {
                 json!({
                     "repo_root": repo_root,
                     "db": db,
-                    "offline": offline,
-                    "embedding_model": if offline { "deterministic" } else { embed_model.as_str() },
+                    "embedding_model": embed_model.as_str(),
                     "ensure_fresh": ensure_fresh,
                     "limit": limit,
                 }),
@@ -1120,7 +1018,6 @@ fn main() -> Result<()> {
                 let summary = run_update_once(
                     &repo_root,
                     &db,
-                    offline,
                     &base_url,
                     &api_key,
                     &embed_model,
@@ -1141,20 +1038,13 @@ fn main() -> Result<()> {
                 queries
             };
             let late_interaction = !no_late_interaction;
-            let summary = if offline {
-                SearchEngine::new(store, DeterministicEmbedder::default())
-                    .with_dense(retrieval_config.dense_enabled)
-                    .with_late_interaction(late_interaction)
-                    .prewarm(&queries, limit)?
-            } else {
-                SearchEngine::new(
-                    store,
-                    EndpointEmbedder::new(base_url.clone(), api_key.clone(), embed_model.clone()),
-                )
-                .with_dense(retrieval_config.dense_enabled)
-                .with_late_interaction(late_interaction)
-                .prewarm(&queries, limit)?
-            };
+            let summary = SearchEngine::new(
+                store,
+                EndpointEmbedder::new(base_url.clone(), api_key.clone(), embed_model.clone()),
+            )
+            .with_dense(retrieval_config.dense_enabled)
+            .with_late_interaction(late_interaction)
+            .prewarm(&queries, limit)?;
             println!("fts_records: {}", summary.fts_record_count);
             println!("queries: {}", summary.query_count);
             println!("warmed_hits: {}", summary.warmed_hit_count);
@@ -1184,7 +1074,6 @@ fn main() -> Result<()> {
                 start_watch_after_index(
                     &repo_root,
                     &db,
-                    offline,
                     &base_url,
                     &api_key,
                     &embed_model,
@@ -1197,7 +1086,6 @@ fn main() -> Result<()> {
         Command::RebuildSemantic {
             repo_root,
             db,
-            offline,
             base_url,
             api_key,
             embed_model,
@@ -1223,35 +1111,21 @@ fn main() -> Result<()> {
                 json!({
                     "repo_root": repo_root,
                     "db": db,
-                    "offline": offline,
-                    "embedding_model": if offline { "deterministic" } else { embed_model.as_str() },
+                    "embedding_model": embed_model.as_str(),
                 }),
             )?;
             let store = MatryoshkaStore::open(&db)?;
             let mut progress_writer = CliProgressStateWriter::new(&db, "rebuild-semantic");
-            let summary = if offline {
-                let indexer = FullIndexer::new(
-                    store,
-                    HeuristicEnricher,
-                    DeterministicEmbedder::default(),
-                    HeuristicChunkSummarizer,
-                )
-                .with_retrieval_config(retrieval_config);
-                indexer.rebuild_semantic_index_with_progress(&repo_root, |event| {
-                    record_cli_progress(&mut progress_writer, progress_jsonl, event);
-                })?
-            } else {
-                let indexer = FullIndexer::new(
-                    store,
-                    HeuristicEnricher,
-                    EndpointEmbedder::new(base_url, api_key, embed_model),
-                    HeuristicChunkSummarizer,
-                )
-                .with_retrieval_config(retrieval_config);
-                indexer.rebuild_semantic_index_with_progress(&repo_root, |event| {
-                    record_cli_progress(&mut progress_writer, progress_jsonl, event);
-                })?
-            };
+            let indexer = FullIndexer::new(
+                store,
+                MlxChatEnricher::new(&base_url, &api_key).with_model(DEFAULT_CHAT_MODEL),
+                EndpointEmbedder::new(base_url.clone(), api_key.clone(), embed_model),
+                MlxChunkSummarizer::new(base_url, api_key).with_model(DEFAULT_CHUNK_SUMMARY_MODEL),
+            )
+            .with_retrieval_config(retrieval_config);
+            let summary = indexer.rebuild_semantic_index_with_progress(&repo_root, |event| {
+                record_cli_progress(&mut progress_writer, progress_jsonl, event);
+            })?;
             command_log.event(
                 "semantic_rebuild_completed",
                 semantic_rebuild_summary_json(&summary),
@@ -1269,6 +1143,7 @@ fn main() -> Result<()> {
             let repo_root = resolve_optional_repo_root(repo_root)?;
             let db = resolve_db_path(db, Some(&repo_root))?;
             ensure_matryoshka_layout(&db)?;
+            ensure_cli_prepare_ready(&db, RetrievalConfig::default(), true)?;
             let read = ReadApi::new(MatryoshkaStore::open(&db)?, repo_root);
             let card = if chunks {
                 read.read_with_chunks(&file)?
@@ -1284,7 +1159,6 @@ fn main() -> Result<()> {
             limit,
             related,
             mode,
-            offline,
             base_url,
             api_key,
             embed_model,
@@ -1311,23 +1185,10 @@ fn main() -> Result<()> {
             let db = resolve_db_path(db, Some(&repo_root))?;
             ensure_matryoshka_layout(&db)?;
             ensure_single_reranker(rerank, omlx_rerank)?;
-            let store = MatryoshkaStore::open(&db)?;
             let late_interaction = !no_late_interaction;
-            let hits = if offline && omlx_rerank {
-                SearchEngine::new(store.clone(), DeterministicEmbedder::default())
-                    .with_dense(retrieval_config.dense_enabled)
-                    .with_late_interaction(late_interaction)
-                    .with_reranker(
-                        OmlxReranker::new(base_url, api_key, omlx_rerank_model)
-                            .with_max_candidates(omlx_rerank_candidates),
-                    )
-                    .search(&task_query(AgentTask::ReadNext, &query), limit)?
-            } else if offline {
-                SearchEngine::new(store.clone(), DeterministicEmbedder::default())
-                    .with_dense(retrieval_config.dense_enabled)
-                    .with_late_interaction(late_interaction)
-                    .search(&task_query(AgentTask::ReadNext, &query), limit)?
-            } else if omlx_rerank {
+            ensure_cli_prepare_ready(&db, retrieval_config, late_interaction)?;
+            let store = MatryoshkaStore::open(&db)?;
+            let hits = if omlx_rerank {
                 SearchEngine::new(
                     store.clone(),
                     EndpointEmbedder::new(base_url.clone(), api_key.clone(), embed_model),
@@ -1475,7 +1336,6 @@ fn main() -> Result<()> {
 struct PrepareOptions {
     repo_root: PathBuf,
     db: PathBuf,
-    offline: bool,
     base_url: String,
     api_key: String,
     embed_model: String,
@@ -1515,7 +1375,6 @@ struct PrepareSummary {
 fn run_prepare_via_api(options: PrepareOptions, progress_jsonl: bool) -> Result<PrepareSummary> {
     let config = MatryoshkaConfig::new(&options.repo_root)
         .with_db(&options.db)
-        .offline(options.offline)
         .with_endpoint(&options.base_url, &options.api_key)
         .with_models(&options.chat_model, &options.embed_model)
         .with_ignored_paths(options.ignore.clone())
@@ -1580,7 +1439,6 @@ fn prepare_summary_from_api(summary: ApiPrepareSummary) -> PrepareSummary {
 struct WatchLoopOptions {
     repo_root: PathBuf,
     db: PathBuf,
-    offline: bool,
     base_url: String,
     api_key: String,
     embed_model: String,
@@ -1986,7 +1844,6 @@ fn unix_millis() -> u128 {
 fn start_watch_after_index(
     repo_root: &Path,
     db: &Path,
-    offline: bool,
     base_url: &str,
     api_key: &str,
     embed_model: &str,
@@ -1997,7 +1854,6 @@ fn start_watch_after_index(
     let options = WatchLoopOptions {
         repo_root: repo_root.to_path_buf(),
         db: db.to_path_buf(),
-        offline,
         base_url: base_url.to_string(),
         api_key: api_key.to_string(),
         embed_model: embed_model.to_string(),
@@ -2068,9 +1924,6 @@ fn spawn_watch_daemon(options: &WatchLoopOptions) -> Result<()> {
         .stderr(Stdio::from(err_file));
     #[cfg(unix)]
     command.process_group(0);
-    if options.offline {
-        command.arg("--offline");
-    }
     append_retrieval_args(&mut command, options.retrieval_config);
     if options.skip_startup_update {
         command.arg("--skip-startup-update");
@@ -2097,7 +1950,6 @@ fn run_watch_loop(options: WatchLoopOptions) -> Result<()> {
         json!({
             "repo_root": options.repo_root,
             "db": options.db,
-            "offline": options.offline,
             "interval_ms": options.interval_ms,
             "debounce_ms": options.debounce_ms,
             "startup_update": !options.skip_startup_update,
@@ -2108,7 +1960,6 @@ fn run_watch_loop(options: WatchLoopOptions) -> Result<()> {
         let summary = run_update_once(
             &options.repo_root,
             &options.db,
-            options.offline,
             &options.base_url,
             &options.api_key,
             &options.embed_model,
@@ -2165,7 +2016,6 @@ fn run_watch_loop(options: WatchLoopOptions) -> Result<()> {
             let summary = run_update_once(
                 &options.repo_root,
                 &options.db,
-                options.offline,
                 &options.base_url,
                 &options.api_key,
                 &options.embed_model,
@@ -2187,7 +2037,6 @@ fn run_watch_loop(options: WatchLoopOptions) -> Result<()> {
 fn run_update_once(
     repo_root: &Path,
     db: &Path,
-    offline: bool,
     base_url: &str,
     api_key: &str,
     embed_model: &str,
@@ -2205,35 +2054,21 @@ fn run_update_once(
             json!({
                 "repo_root": repo_root,
                 "db": db,
-                "offline": offline,
-                "embedding_model": if offline { "deterministic" } else { embed_model },
+                "embedding_model": embed_model,
             }),
         )?;
     }
     let store = MatryoshkaStore::open(db)?;
-    let summary = if offline {
-        FullIndexer::new(
-            store,
-            HeuristicEnricher,
-            DeterministicEmbedder::default(),
-            HeuristicChunkSummarizer,
-        )
+    let enricher = MlxChatEnricher::new(base_url, api_key).with_model(chat_model.to_string());
+    let embedder = EndpointEmbedder::new(base_url, api_key, embed_model.to_string());
+    let chunk_summarizer = MlxChunkSummarizer::new(base_url, api_key)
+        .with_model(chunk_summary_model)
+        .with_concurrency(chunk_summary_concurrency);
+    let summary = FullIndexer::new(store, enricher, embedder, chunk_summarizer)
         .with_parser_config(parser_config)
         .with_retrieval_config(retrieval_config)
         .with_chunk_summary_enabled(chunk_summary_enabled)
-        .update_repo(repo_root)?
-    } else {
-        let enricher = MlxChatEnricher::new(base_url, api_key).with_model(chat_model.to_string());
-        let embedder = EndpointEmbedder::new(base_url, api_key, embed_model.to_string());
-        let chunk_summarizer = MlxChunkSummarizer::new(base_url, api_key)
-            .with_model(chunk_summary_model)
-            .with_concurrency(chunk_summary_concurrency);
-        FullIndexer::new(store, enricher, embedder, chunk_summarizer)
-            .with_parser_config(parser_config)
-            .with_retrieval_config(retrieval_config)
-            .with_chunk_summary_enabled(chunk_summary_enabled)
-            .update_repo(repo_root)?
-    };
+        .update_repo(repo_root)?;
     if let Some(log) = log.as_deref_mut() {
         log.event(
             "update_completed",
@@ -2275,6 +2110,113 @@ fn progress_state_path(db: &Path) -> PathBuf {
         .unwrap_or_else(|| Path::new(MATRYOSHKA_DIR))
         .join("state")
         .join("progress.json")
+}
+
+fn ready_marker_path(db: &Path) -> PathBuf {
+    db.parent()
+        .unwrap_or_else(|| Path::new(MATRYOSHKA_DIR))
+        .join(".jesco-prewarm-complete")
+}
+
+fn ensure_cli_prepare_ready(
+    db: &Path,
+    retrieval_config: RetrievalConfig,
+    late_interaction: bool,
+) -> Result<()> {
+    if !ready_marker_path(db).exists() {
+        anyhow::bail!(
+            "Matryoshka prepare is not ready for {}; run prepare first{}",
+            db.display(),
+            prepare_state_error_hint(db)
+        );
+    }
+
+    let store = MatryoshkaStore::open(db)?;
+    let empty_cards = store
+        .load_active_card_summaries()?
+        .into_iter()
+        .filter(|row| row.is_empty)
+        .collect::<Vec<_>>();
+    if !empty_cards.is_empty() {
+        let samples = empty_cards
+            .iter()
+            .take(8)
+            .map(|row| format!("{}:{}", row.card_type, row.id))
+            .collect::<Vec<_>>()
+            .join(", ");
+        anyhow::bail!(
+            "Matryoshka prepare is not ready: {} active card summaries are empty ({samples}); run prepare again{}",
+            empty_cards.len(),
+            prepare_state_error_hint(db)
+        );
+    }
+
+    let stats = store.retrieval_index_stats()?;
+    let report = RetrievalIndexReport {
+        semantic_records: stats.semantic_records,
+        embedded_records: stats.embedded_records,
+        fts_records: stats.fts_records,
+        late_vector_rows: stats.late_vector_rows,
+        records_with_late_vectors: stats.records_with_late_vectors,
+        retrieval_primary: retrieval_config.primary,
+        dense_enabled: retrieval_config.dense_enabled,
+        dense_fallback_enabled: retrieval_config.dense_fallback_enabled,
+        late_interaction_enabled: late_interaction && retrieval_config.dense_enabled,
+    };
+    if !retrieval_is_ready(&report) {
+        anyhow::bail!(
+            "Matryoshka prepare is not ready: retrieval index is incomplete (semantic_records={}, fts_records={}, embedded_records={}, records_with_late_vectors={}); run prepare again{}",
+            report.semantic_records,
+            report.fts_records,
+            report.embedded_records,
+            report.records_with_late_vectors,
+            prepare_state_error_hint(db)
+        );
+    }
+
+    Ok(())
+}
+
+fn prepare_state_error_hint(db: &Path) -> String {
+    let Ok(raw) = fs::read_to_string(progress_state_path(db)) else {
+        return String::new();
+    };
+    let Ok(value) = serde_json::from_str::<Value>(&raw) else {
+        return String::new();
+    };
+    let status = value
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let phase = value
+        .get("phase")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let message = value
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let last_error = value
+        .get("last_error")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+
+    if !last_error.trim().is_empty() {
+        format!("; last prepare error: {last_error}")
+    } else if status == "running" {
+        let phase = if phase.trim().is_empty() {
+            "unknown"
+        } else {
+            phase
+        };
+        format!(
+            "; previous prepare is still running or was interrupted at phase {phase}; run prepare again to resume"
+        )
+    } else if !status.is_empty() && status != "ready" {
+        format!("; last prepare status: {status} ({phase}) {message}")
+    } else {
+        String::new()
+    }
 }
 
 fn ensure_single_reranker(chat_rerank: bool, omlx_rerank: bool) -> Result<()> {

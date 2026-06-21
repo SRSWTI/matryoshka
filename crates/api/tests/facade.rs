@@ -4,11 +4,18 @@ use matryoshka::{
     is_cancelled_error, progress_state_path, ready_marker_path,
 };
 use matryoshka_core_ir::MatryoshkaProgressEvent;
+use matryoshka_read_api::ReadApi;
+use matryoshka_store_sqlite::MatryoshkaStore;
 use rusqlite::Connection;
+use serde_json::json;
 use std::fs;
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Barrier};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Barrier, Mutex};
 use std::thread;
+use std::time::Duration;
 use tempfile::TempDir;
 
 #[test]
@@ -16,7 +23,7 @@ fn prepare_search_read_and_repair_lifecycle_work_through_rust_api() {
     let fixture = Fixture::new();
     let repo = fixture.repo();
     let db = repo.join(".matryoshka/matryoshka-api-test.db");
-    let api = test_api(&repo, &db);
+    let api = fixture.api(&db);
 
     let first_events = run_prepare(&api);
     let first = completed_summary(&first_events);
@@ -48,6 +55,17 @@ fn prepare_search_read_and_repair_lifecycle_work_through_rust_api() {
             .iter()
             .any(|symbol| symbol.name == "debounce_window")
     );
+    let read_with_chunks = ReadApi::new(MatryoshkaStore::open(&db).unwrap(), &repo)
+        .read_with_chunks("src/watcher.rs")
+        .unwrap();
+    assert!(read_with_chunks.symbols.is_empty());
+    assert!(!read_with_chunks.chunks.is_empty());
+    assert!(read_with_chunks.chunks.iter().any(|chunk| {
+        chunk
+            .symbol
+            .as_deref()
+            .is_some_and(|symbol| symbol.contains("debounce_window"))
+    }));
 
     let bundle = api
         .read_bundle(ReadBundleOptions::new("watcher debounce flow"))
@@ -132,10 +150,8 @@ fn prepare_with_dense_disabled_reaches_ready_without_embeddings() {
     let repo = fixture.repo();
     let db = repo.join(".matryoshka/matryoshka-api-dense-off.db");
     let api = Matryoshka::new(
-        MatryoshkaConfig::new(&repo)
-            .with_db(&db)
-            .offline(true)
-            .with_ignored_paths([".matryoshka", "target"])
+        fixture
+            .config(&db)
             .with_dense_enabled(false)
             .with_dense_fallback_enabled(false),
     );
@@ -195,7 +211,7 @@ fn prepare_cancellation_before_start_emits_cancelled_state() {
     let fixture = Fixture::new();
     let repo = fixture.repo();
     let db = repo.join(".matryoshka/matryoshka-api-cancel-before.db");
-    let api = test_api(&repo, &db);
+    let api = fixture.api(&db);
     let cancel_token = MatryoshkaCancelToken::new();
     cancel_token.cancel();
 
@@ -217,7 +233,7 @@ fn prepare_cancellation_during_enrichment_stops_before_ready() {
     let fixture = Fixture::new();
     let repo = fixture.repo();
     let db = repo.join(".matryoshka/matryoshka-api-cancel-during.db");
-    let api = test_api(&repo, &db);
+    let api = fixture.api(&db);
     let cancel_token = MatryoshkaCancelToken::new();
     let cancel_from_callback = cancel_token.clone();
 
@@ -254,9 +270,97 @@ fn prepare_cancellation_during_enrichment_stops_before_ready() {
     assert_cancelling_then_cancelled(&events);
     assert_cancelled_progress_state(&db);
     assert!(!ready_marker_path(&db).exists());
+    let read_err = api.read("src/watcher.rs").unwrap_err();
+    let read_err = format!("{read_err:#}");
+    assert!(read_err.contains("Matryoshka prepare is not ready"));
+    assert!(read_err.contains("cancelled"));
 
     let retry = completed_summary(&run_prepare(&api));
     assert_eq!(retry.status, PrepareStatus::Ready);
+}
+
+#[test]
+fn prepare_failure_preserves_mlx_error_text_and_retry_reconciles() {
+    let fixture = Fixture::new();
+    let repo = fixture.repo();
+    let db = repo.join(".matryoshka/matryoshka-api-mlx-error.db");
+    let api = fixture.api(&db);
+    let marker = "mlx-cache exploded while loading embeddinggemma exact marker";
+    fixture.fail_next_chat_requests(9, marker);
+
+    let mut events = Vec::new();
+    let err = api
+        .prepare_with_progress(
+            PrepareOptions {
+                limit: 3,
+                queries: vec!["watcher debounce changed removed paths".into()],
+                write_progress_state: true,
+            },
+            |event| events.push(event),
+        )
+        .unwrap_err();
+    let err = format!("{err:#}");
+    assert!(err.contains(marker), "{err}");
+    assert!(!ready_marker_path(&db).exists());
+    assert!(events.iter().any(|event| matches!(
+        event,
+        MatryoshkaEvent::PrepareFailed { message, .. } if message.contains(marker)
+    )));
+    assert!(events.iter().any(|event| matches!(
+        event,
+        MatryoshkaEvent::ProgressState { state }
+            if state.status == "failed" && state.last_error.as_deref().is_some_and(|error| error.contains(marker))
+    )));
+    assert_failed_progress_state(&db, marker);
+
+    let search_err = api
+        .search(
+            "watcher debounce changed removed paths",
+            SearchOptions::default(),
+        )
+        .unwrap_err();
+    let search_err = format!("{search_err:#}");
+    assert!(search_err.contains("Matryoshka prepare is not ready"));
+    assert!(search_err.contains(marker));
+
+    let retry = completed_summary(&run_prepare(&api));
+    assert_eq!(retry.status, PrepareStatus::Ready);
+    assert!(ready_marker_path(&db).exists());
+    assert_ready_progress_state(&db);
+}
+
+#[test]
+fn stale_running_prepare_state_tells_reads_to_resume_prepare() {
+    let fixture = Fixture::new();
+    let repo = fixture.repo();
+    let db = repo.join(".matryoshka/matryoshka-api-stale-running.db");
+    let api = fixture.api(&db);
+    let state_path = progress_state_path(&db);
+    fs::create_dir_all(state_path.parent().unwrap()).unwrap();
+    fs::write(
+        &state_path,
+        serde_json::to_string_pretty(&json!({
+            "operation": "prepare",
+            "status": "running",
+            "phase": "enriching_chunks",
+            "message": "Understanding code",
+            "percent": 0.76,
+            "updated_at_unix_ms": 1
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let err = api.read("src/watcher.rs").unwrap_err();
+    let err = format!("{err:#}");
+    assert!(err.contains("Matryoshka prepare is not ready"), "{err}");
+    assert!(
+        err.contains(
+            "previous prepare is still running or was interrupted at phase enriching_chunks"
+        ),
+        "{err}"
+    );
+    assert!(err.contains("run prepare again to resume"), "{err}");
 }
 
 #[test]
@@ -264,7 +368,7 @@ fn prepare_prunes_orphaned_artifacts_before_health_checks() {
     let fixture = Fixture::new();
     let repo = fixture.repo();
     let db = repo.join(".matryoshka/matryoshka-api-orphans.db");
-    let api = test_api(&repo, &db);
+    let api = fixture.api(&db);
 
     let first = completed_summary(&run_prepare(&api));
     assert_eq!(first.status, PrepareStatus::Ready);
@@ -295,7 +399,7 @@ fn prepare_calls_for_same_db_serialize_without_sqlite_lock_errors() {
     let fixture = Fixture::new();
     let repo = fixture.repo();
     let db = repo.join(".matryoshka/matryoshka-api-lock-same.db");
-    let api = Arc::new(test_api(&repo, &db));
+    let api = Arc::new(fixture.api(&db));
     let barrier = Arc::new(Barrier::new(2));
 
     let left = spawn_prepare(api.clone(), barrier.clone());
@@ -318,8 +422,8 @@ fn prepare_calls_for_different_db_paths_run_independently() {
     let repo = fixture.repo();
     let left_db = repo.join(".matryoshka/matryoshka-api-lock-left.db");
     let right_db = repo.join(".matryoshka/matryoshka-api-lock-right.db");
-    let left_api = Arc::new(test_api(&repo, &left_db));
-    let right_api = Arc::new(test_api(&repo, &right_db));
+    let left_api = Arc::new(fixture.api(&left_db));
+    let right_api = Arc::new(fixture.api(&right_db));
     let barrier = Arc::new(Barrier::new(2));
 
     let left = spawn_prepare(left_api, barrier.clone());
@@ -339,11 +443,13 @@ fn prepare_calls_for_different_db_paths_run_independently() {
 struct Fixture {
     _tmp: TempDir,
     repo: PathBuf,
+    mlx: FakeMlxServer,
 }
 
 impl Fixture {
     fn new() -> Self {
         let tmp = tempfile::tempdir().unwrap();
+        let mlx = FakeMlxServer::new();
         let repo = tmp.path().join("repo");
         fs::create_dir_all(repo.join("src")).unwrap();
         fs::write(
@@ -390,21 +496,252 @@ pub fn read_next(file: &str) -> String {
 "#,
         )
         .unwrap();
-        Self { _tmp: tmp, repo }
+        Self {
+            _tmp: tmp,
+            repo,
+            mlx,
+        }
     }
 
     fn repo(&self) -> PathBuf {
         self.repo.clone()
     }
+
+    fn config(&self, db: &Path) -> MatryoshkaConfig {
+        MatryoshkaConfig::new(&self.repo)
+            .with_db(db)
+            .with_ignored_paths([".matryoshka", "target"])
+            .with_endpoint(self.mlx.base_url(), "2508")
+            .with_models("fake-chat-model", "fake-embedding-model")
+            .with_chunk_summary_model("fake-chunk-summary-model")
+            .with_chunk_summary_concurrency(2)
+    }
+
+    fn api(&self, db: &Path) -> Matryoshka {
+        Matryoshka::new(self.config(db))
+    }
+
+    fn fail_next_chat_requests(&self, count: usize, message: &str) {
+        self.mlx.fail_next_chat_requests(count, message);
+    }
 }
 
-fn test_api(repo: &Path, db: &Path) -> Matryoshka {
-    Matryoshka::new(
-        MatryoshkaConfig::new(repo)
-            .with_db(db)
-            .offline(true)
-            .with_ignored_paths([".matryoshka", "target"]),
-    )
+struct FakeMlxServer {
+    base_url: String,
+    addr: SocketAddr,
+    stop: Arc<AtomicBool>,
+    state: Arc<FakeMlxState>,
+    handle: Option<thread::JoinHandle<()>>,
+}
+
+#[derive(Default)]
+struct FakeMlxState {
+    chat_failures: Mutex<Option<(usize, String)>>,
+}
+
+impl FakeMlxServer {
+    fn new() -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let state = Arc::new(FakeMlxState::default());
+        let server_stop = stop.clone();
+        let server_state = state.clone();
+        let handle = thread::spawn(move || {
+            for stream in listener.incoming() {
+                if server_stop.load(Ordering::SeqCst) {
+                    break;
+                }
+                let Ok(stream) = stream else {
+                    continue;
+                };
+                let state = server_state.clone();
+                thread::spawn(move || handle_fake_mlx_connection(stream, state));
+            }
+        });
+
+        Self {
+            base_url: format!("http://{addr}"),
+            addr,
+            stop,
+            state,
+            handle: Some(handle),
+        }
+    }
+
+    fn base_url(&self) -> &str {
+        &self.base_url
+    }
+
+    fn fail_next_chat_requests(&self, count: usize, message: &str) {
+        *self.state.chat_failures.lock().unwrap() = Some((count, message.to_string()));
+    }
+}
+
+impl Drop for FakeMlxServer {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        let _ = TcpStream::connect_timeout(&self.addr, Duration::from_millis(100));
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+struct HttpRequest {
+    method: String,
+    path: String,
+    body: Vec<u8>,
+}
+
+fn handle_fake_mlx_connection(mut stream: TcpStream, state: Arc<FakeMlxState>) {
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+    let request = match read_http_request(&stream) {
+        Ok(request) => request,
+        Err(err) => {
+            write_json_response(
+                &mut stream,
+                400,
+                json!({ "error": { "message": format!("bad request: {err}"), "type": "bad_request" } }),
+            );
+            return;
+        }
+    };
+
+    match (request.method.as_str(), request.path.as_str()) {
+        ("POST", "/v1/chat/completions") => respond_chat(&mut stream, &state),
+        ("POST", "/v1/embeddings") => respond_embeddings(&mut stream, &request.body),
+        _ => write_json_response(
+            &mut stream,
+            404,
+            json!({ "error": { "message": "unknown fake mlx route", "type": "not_found" } }),
+        ),
+    }
+}
+
+fn read_http_request(stream: &TcpStream) -> std::io::Result<HttpRequest> {
+    let mut reader = BufReader::new(stream.try_clone()?);
+    let mut first_line = String::new();
+    reader.read_line(&mut first_line)?;
+    let mut parts = first_line.split_whitespace();
+    let method = parts.next().unwrap_or_default().to_string();
+    let path = parts.next().unwrap_or_default().to_string();
+
+    let mut content_length = 0usize;
+    loop {
+        let mut line = String::new();
+        reader.read_line(&mut line)?;
+        let trimmed = line.trim_end_matches(['\r', '\n']);
+        if trimmed.is_empty() {
+            break;
+        }
+        if let Some((name, value)) = trimmed.split_once(':') {
+            if name.eq_ignore_ascii_case("content-length") {
+                content_length = value.trim().parse().unwrap_or(0);
+            }
+        }
+    }
+
+    let mut body = vec![0; content_length];
+    if content_length > 0 {
+        reader.read_exact(&mut body)?;
+    }
+    Ok(HttpRequest { method, path, body })
+}
+
+fn respond_chat(stream: &mut TcpStream, state: &FakeMlxState) {
+    if let Some(message) = next_chat_failure(state) {
+        write_json_response(
+            stream,
+            500,
+            json!({ "error": { "message": message, "type": "server_error" } }),
+        );
+        return;
+    }
+
+    let content = json!({
+        "summary": "Fake MLX prepared summary covering watcher debounce, semantic search, reads, symbols, chunks, changed paths, and removed paths."
+    })
+    .to_string();
+    write_json_response(
+        stream,
+        200,
+        json!({
+            "choices": [{
+                "message": { "content": content },
+                "finish_reason": "stop"
+            }]
+        }),
+    );
+}
+
+fn next_chat_failure(state: &FakeMlxState) -> Option<String> {
+    let mut failures = state.chat_failures.lock().unwrap();
+    let (remaining, message) = failures.as_mut()?;
+    if *remaining == 0 {
+        *failures = None;
+        return None;
+    }
+    *remaining -= 1;
+    let message = message.clone();
+    if *remaining == 0 {
+        *failures = None;
+    }
+    Some(message)
+}
+
+fn respond_embeddings(stream: &mut TcpStream, body: &[u8]) {
+    let input = serde_json::from_slice::<serde_json::Value>(body)
+        .ok()
+        .and_then(|value| value.get("input").cloned())
+        .and_then(|value| value.as_array().cloned())
+        .unwrap_or_default();
+    let data = input
+        .iter()
+        .enumerate()
+        .map(|(index, value)| {
+            let text = value.as_str().unwrap_or_default();
+            json!({
+                "index": index,
+                "embedding": fake_embedding(text),
+            })
+        })
+        .collect::<Vec<_>>();
+    write_json_response(stream, 200, json!({ "data": data }));
+}
+
+fn fake_embedding(text: &str) -> Vec<f32> {
+    let mut vector = vec![0.0; 32];
+    for token in text.split(|ch: char| !ch.is_alphanumeric() && ch != '_') {
+        if token.is_empty() {
+            continue;
+        }
+        let mut hash = 0usize;
+        for byte in token.bytes() {
+            hash = hash.wrapping_mul(33).wrapping_add(byte as usize);
+        }
+        vector[hash % 32] += 1.0;
+    }
+    if vector.iter().all(|value| *value == 0.0) {
+        vector[0] = 1.0;
+    }
+    vector
+}
+
+fn write_json_response(stream: &mut TcpStream, status: u16, body: serde_json::Value) {
+    let body = body.to_string();
+    let reason = match status {
+        200 => "OK",
+        400 => "Bad Request",
+        404 => "Not Found",
+        500 => "Internal Server Error",
+        _ => "Unknown",
+    };
+    let response = format!(
+        "HTTP/1.1 {status} {reason}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    let _ = stream.write_all(response.as_bytes());
 }
 
 fn run_prepare(api: &Matryoshka) -> Vec<MatryoshkaEvent> {
@@ -632,6 +969,26 @@ fn assert_cancelled_progress_state(db: &Path) {
         serde_json::from_str(&fs::read_to_string(state_path).unwrap()).unwrap();
     assert_eq!(value["status"], "cancelled");
     assert_eq!(value["phase"], "cancelled");
+}
+
+fn assert_failed_progress_state(db: &Path, expected_error: &str) {
+    let state_path = progress_state_path(db);
+    assert!(state_path.exists());
+    let value: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(state_path).unwrap()).unwrap();
+    assert_eq!(value["status"], "failed");
+    assert!(
+        value["last_error"]
+            .as_str()
+            .is_some_and(|error| error.contains(expected_error)),
+        "{value:#}"
+    );
+    assert!(
+        value["error_stage"]
+            .as_str()
+            .is_some_and(|stage| !stage.trim().is_empty()),
+        "{value:#}"
+    );
 }
 
 fn assert_cancelling_then_cancelled(events: &[MatryoshkaEvent]) {

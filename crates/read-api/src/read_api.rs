@@ -84,29 +84,18 @@ impl ReadApi {
             Vec::new()
         };
         let source_lines = read_lines(&self.repo_root.join(&file.path)).unwrap_or_default();
-        let module_docs = module_docs(&source_lines, &file.language);
-        let card_is_heuristic = file_card
-            .as_ref()
-            .and_then(|card| card.provenance.model.as_deref())
-            == Some("heuristic");
-        let folder_card_is_heuristic = folder_card
-            .as_ref()
-            .and_then(|card| card.provenance.model.as_deref())
-            == Some("heuristic");
         Ok(ReadCard {
             file: file_overview(&file),
-            summary: read_summary(&file, file_card.as_ref(), &module_docs, card_is_heuristic),
-            description: read_description(file_card.as_ref(), &module_docs, card_is_heuristic),
-            folder: folder_card
-                .as_ref()
-                .filter(|_| !folder_card_is_heuristic)
-                .map(folder_overview),
-            symbols: read_symbols(&symbols, file_card.as_ref(), &source_lines),
+            summary: read_summary(file_card.as_ref()),
+            description: read_description(file_card.as_ref()),
+            folder: folder_card.as_ref().map(folder_overview),
+            symbols: if include_chunks {
+                Vec::new()
+            } else {
+                read_symbols(&symbols, file_card.as_ref(), &source_lines)
+            },
             chunks,
-            imports: read_imports(
-                &file.imports,
-                file_card.as_ref().filter(|_| !card_is_heuristic),
-            ),
+            imports: read_imports(&file.imports, file_card.as_ref()),
             total_dependents: collapsed_dependency_count(&incoming_edges, DependencySide::Incoming),
             dependents: read_dependencies(&incoming_edges, DependencySide::Incoming),
             total_depends_on: collapsed_dependency_count(&outgoing_edges, DependencySide::Outgoing),
@@ -220,49 +209,20 @@ fn folder_overview(card: &FolderCard) -> ReadFolderOverview {
     }
 }
 
-fn read_summary(
-    file: &FileFact,
-    card: Option<&FileCard>,
-    module_docs: &[String],
-    card_is_heuristic: bool,
-) -> Option<String> {
-    if !card_is_heuristic {
-        if let Some(summary) = card
-            .map(|card| card.summary.trim())
-            .filter(|summary| !summary.is_empty())
-        {
-            return Some(summary.to_string());
-        }
-    }
-    module_docs.first().cloned().or_else(|| {
-        card.map(|card| card.summary.trim().to_string())
-            .filter(|summary| !summary.is_empty())
-            .or_else(|| {
-                Some(format!(
-                    "{} is a {} file with {} lines.",
-                    file.path, file.language, file.line_count
-                ))
-            })
-    })
+fn read_summary(card: Option<&FileCard>) -> Option<String> {
+    card.map(|card| card.summary.trim().to_string())
+        .filter(|summary| !summary.is_empty())
 }
 
-fn read_description(
-    card: Option<&FileCard>,
-    module_docs: &[String],
-    card_is_heuristic: bool,
-) -> Option<String> {
+fn read_description(card: Option<&FileCard>) -> Option<String> {
     let mut parts = Vec::new();
-    if card_is_heuristic {
-        parts.extend(module_docs.iter().cloned());
-    } else if let Some(card) = card {
+    if let Some(card) = card {
         push_labeled(&mut parts, "Role", &card.role);
         push_joined(&mut parts, "Behaviors", &card.primary_behaviors);
         push_joined(&mut parts, "Owns", &card.owns_behaviors);
         push_joined(&mut parts, "Delegates to", &card.delegates_to);
         push_joined(&mut parts, "Side effects", &card.side_effects);
         push_joined(&mut parts, "Blast radius", &card.blast_radius);
-    } else {
-        parts.extend(module_docs.iter().cloned());
     }
     non_empty(parts.join("\n"))
 }
@@ -394,8 +354,7 @@ impl InternalImportGroup {
             }
         }
         if self.why.is_none() {
-            self.why =
-                import_purpose(import, interpreted).or_else(|| fallback_import_purpose(import));
+            self.why = import_purpose(import, interpreted);
         }
     }
 
@@ -428,18 +387,6 @@ fn joined_names(names: &[String]) -> Option<String> {
     } else {
         Some(names.join(", "))
     }
-}
-
-fn fallback_import_purpose(import: &ImportFact) -> Option<String> {
-    if !import.is_internal {
-        return None;
-    }
-    let target = import
-        .resolved_file_id
-        .as_deref()
-        .unwrap_or(import.module.as_str());
-    let subject = joined_names(&import.names).unwrap_or_else(|| import.module.clone());
-    Some(format!("Provides {subject} from {target}."))
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -546,59 +493,6 @@ fn dependency_why(
         DependencySide::Outgoing => format!("This file uses it via {joined}."),
     };
     non_empty(text)
-}
-
-fn module_docs(lines: &[String], language: &str) -> Vec<String> {
-    match language {
-        "rust" => rust_module_docs(lines),
-        "python" => python_module_docs(lines),
-        _ => Vec::new(),
-    }
-}
-
-fn rust_module_docs(lines: &[String]) -> Vec<String> {
-    let mut docs = Vec::new();
-    for line in lines.iter().take(80) {
-        let trimmed = line.trim_start();
-        if trimmed.starts_with("//!") {
-            docs.push(strip_doc_marker(trimmed).to_string());
-        } else if trimmed.is_empty() && docs.is_empty() {
-            continue;
-        } else if trimmed.is_empty() && !docs.is_empty() {
-            docs.push(String::new());
-        } else {
-            break;
-        }
-    }
-    normalize_doc_blocks(docs)
-}
-
-fn python_module_docs(lines: &[String]) -> Vec<String> {
-    let first_non_empty = lines.iter().position(|line| !line.trim().is_empty());
-    let Some(start) = first_non_empty else {
-        return Vec::new();
-    };
-    let trimmed = lines[start].trim();
-    let quote = if trimmed.starts_with("\"\"\"") {
-        "\"\"\""
-    } else if trimmed.starts_with("'''") {
-        "'''"
-    } else {
-        return Vec::new();
-    };
-    let mut docs = Vec::new();
-    for (offset, line) in lines[start..].iter().enumerate() {
-        let mut text = line.trim().to_string();
-        if offset == 0 {
-            text = text.trim_start_matches(quote).to_string();
-        }
-        if text.ends_with(quote) {
-            docs.push(text.trim_end_matches(quote).trim().to_string());
-            break;
-        }
-        docs.push(text);
-    }
-    normalize_doc_blocks(docs)
 }
 
 fn symbol_doc(lines: &[String], start_line: usize) -> Option<String> {

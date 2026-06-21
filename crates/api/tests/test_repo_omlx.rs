@@ -1,9 +1,11 @@
 use matryoshka::{
-    CardsOptions, Matryoshka, MatryoshkaConfig, MatryoshkaEvent, PrepareOptions, PrepareStatus,
-    ReadBundleOptions, RerankerOptions, SearchOptions, artifact_gap_count, progress_state_path,
-    ready_marker_path,
+    CardsOptions, Matryoshka, MatryoshkaCancelToken, MatryoshkaConfig, MatryoshkaEvent,
+    PrepareOptions, PrepareStatus, ReadBundleOptions, RerankerOptions, SearchOptions,
+    artifact_gap_count, is_cancelled_error, log_path, progress_state_path, ready_marker_path,
 };
 use matryoshka_core_ir::MatryoshkaProgressEvent;
+use matryoshka_read_api::ReadApi;
+use matryoshka_store_sqlite::MatryoshkaStore;
 use rusqlite::Connection;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -262,6 +264,201 @@ fn test_repo_live_prepare_search_read_and_progress_work_through_rust_api() {
     assert_eq!(orphan_late_vectors(&db), 0);
 }
 
+#[test]
+#[ignore = "requires MATRYOSHKA_COPIED_REPO_LIVE=1 and a live oMLX server"]
+fn copied_repo_live_cancel_resume_mutation_and_failure_work_through_rust_api() {
+    if std::env::var("MATRYOSHKA_COPIED_REPO_LIVE").ok().as_deref() != Some("1") {
+        eprintln!("set MATRYOSHKA_COPIED_REPO_LIVE=1 to run the copied-repo live lifecycle test");
+        return;
+    }
+
+    let repo = copied_repo_path();
+    assert!(repo.join("cli/src/main.rs").exists(), "missing copied cli");
+    assert!(repo.join("api/src/lib.rs").exists(), "missing copied api");
+    assert!(
+        repo.join("read-api/src/read_api.rs").exists(),
+        "missing copied read-api"
+    );
+
+    let db_dir = repo.join(".matryoshka/copied-live");
+    if db_dir.exists() {
+        fs::remove_dir_all(&db_dir).unwrap();
+    }
+    fs::create_dir_all(&db_dir).unwrap();
+    let db = db_dir.join("matryoshka.db");
+    let api = copied_repo_api(&repo, &db, base_url(), chat_model());
+
+    let cancel_token = MatryoshkaCancelToken::new();
+    let cancel_from_callback = cancel_token.clone();
+    let mut cancel_events = Vec::new();
+    let err = api
+        .prepare_with_progress_and_cancel(copied_prepare_options(), cancel_token, |event| {
+            if matches!(
+                &event,
+                MatryoshkaEvent::IndexerProgress {
+                    progress: MatryoshkaProgressEvent::EnrichingFile { .. },
+                    ..
+                }
+            ) {
+                cancel_from_callback.cancel();
+            }
+            cancel_events.push(event);
+        })
+        .unwrap_err();
+    assert!(is_cancelled_error(err.as_ref()), "{err:#}");
+    assert_cancelling_then_cancelled("copied_cancel", &cancel_events);
+    assert_cancelled_progress_state(&db);
+    assert_prepare_log_contains(
+        &db,
+        &["prepare_started", "prepare_cancelling", "prepare_cancelled"],
+    );
+    assert!(!ready_marker_path(&db).exists());
+
+    let resumed_events = run_copied_prepare(&api, "copied_resume");
+    let resumed = completed_summary(&resumed_events);
+    println!(
+        "copied_resume actions={:?} files={} symbols={} records={} warmed={}",
+        resumed.actions_taken,
+        resumed.file_count,
+        resumed.symbol_count,
+        resumed.retrieval_index.semantic_records,
+        resumed.prewarm.warmed_hit_count
+    );
+    assert_eq!(resumed.status, PrepareStatus::Ready);
+    assert_ne!(
+        resumed.actions_taken.first().map(String::as_str),
+        Some("index"),
+        "resume should see partial artifacts left by the cancelled prepare"
+    );
+    assert_eq!(artifact_gap_count(&resumed.artifact_quality), 0);
+    assert!(ready_marker_path(&db).exists());
+    assert_ready_progress_state(&db);
+    assert_progress_events_are_consistent("copied_resume", &resumed_events);
+    assert_prepare_log_contains(
+        &db,
+        &[
+            "prepare_started",
+            "prepare_decision",
+            "update_started",
+            "update_completed",
+            "prewarm_started",
+            "prewarm_completed",
+            "prepare_completed",
+        ],
+    );
+
+    let hits = api
+        .search(
+            "read include chunks symbols",
+            SearchOptions {
+                limit: 6,
+                ..SearchOptions::default()
+            },
+        )
+        .unwrap();
+    println!(
+        "copied search top={:?}",
+        hits.iter()
+            .take(5)
+            .map(|hit| (&hit.path, hit.score))
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        hits.iter()
+            .any(|hit| hit.path == "read-api/src/read_api.rs"),
+        "{hits:#?}"
+    );
+
+    let read_with_chunks = ReadApi::new(MatryoshkaStore::open(&db).unwrap(), &repo)
+        .read_with_chunks("read-api/src/read_api.rs")
+        .unwrap();
+    assert!(read_with_chunks.symbols.is_empty());
+    assert!(!read_with_chunks.chunks.is_empty());
+    assert!(read_with_chunks.chunks.iter().any(|chunk| {
+        chunk
+            .symbol
+            .as_deref()
+            .is_some_and(|symbol| symbol.contains("read_with_chunks"))
+    }));
+
+    let probe = repo.join("read-api/src/matryoshka_live_probe.rs");
+    let _ = fs::remove_file(&probe);
+    fs::write(
+        &probe,
+        "pub fn matryoshka_live_probe_added_symbol() -> &'static str { \"added\" }\n",
+    )
+    .unwrap();
+    let added = completed_summary(&run_copied_prepare(&api, "copied_file_added"));
+    assert_eq!(added.status, PrepareStatus::Ready);
+    assert!(added.changed_files >= 1);
+    assert_eq!(
+        count_file_cards(&db, "read-api/src/matryoshka_live_probe.rs"),
+        1
+    );
+    assert!(count_semantic_records(&db, "read-api/src/matryoshka_live_probe.rs") > 0);
+    assert!(fts_match_count(&db, "matryoshka_live_probe_added_symbol") > 0);
+
+    fs::write(
+        &probe,
+        "pub fn matryoshka_live_probe_changed_symbol() -> &'static str { \"changed\" }\n",
+    )
+    .unwrap();
+    let changed = completed_summary(&run_copied_prepare(&api, "copied_file_changed"));
+    assert_eq!(changed.status, PrepareStatus::Ready);
+    assert!(changed.changed_files >= 1);
+    assert!(fts_match_count(&db, "matryoshka_live_probe_changed_symbol") > 0);
+    assert_eq!(
+        fts_match_count(&db, "matryoshka_live_probe_added_symbol"),
+        0
+    );
+
+    fs::remove_file(&probe).unwrap();
+    let deleted = completed_summary(&run_copied_prepare(&api, "copied_file_deleted"));
+    assert_eq!(deleted.status, PrepareStatus::Ready);
+    assert!(deleted.removed_files >= 1);
+    assert_eq!(
+        count_file_cards(&db, "read-api/src/matryoshka_live_probe.rs"),
+        0
+    );
+    assert_eq!(
+        count_semantic_records(&db, "read-api/src/matryoshka_live_probe.rs"),
+        0
+    );
+    assert_eq!(
+        fts_match_count(&db, "matryoshka_live_probe_changed_symbol"),
+        0
+    );
+
+    let fail_db_dir = repo.join(".matryoshka/copied-live-fail");
+    if fail_db_dir.exists() {
+        fs::remove_dir_all(&fail_db_dir).unwrap();
+    }
+    fs::create_dir_all(&fail_db_dir).unwrap();
+    let fail_db = fail_db_dir.join("matryoshka.db");
+    let failing_api = copied_repo_api(
+        &repo,
+        &fail_db,
+        format!("{}/matryoshka-intentional-failure", base_url()),
+        chat_model(),
+    );
+    let mut failure_events = Vec::new();
+    let err = failing_api
+        .prepare_with_progress(copied_prepare_options(), |event| failure_events.push(event))
+        .unwrap_err();
+    let err = format!("{err:#}");
+    println!("copied_failure error={err}");
+    assert!(err.contains("chat endpoint returned"), "{err}");
+    assert!(err.contains("404") || err.contains("Not Found"), "{err}");
+    assert!(failure_events.iter().any(|event| matches!(
+        event,
+        MatryoshkaEvent::PrepareFailed { message, .. }
+            if message.contains("chat endpoint returned")
+                && (message.contains("404") || message.contains("Not Found"))
+    )));
+    assert_failed_progress_state_contains(&fail_db, "chat endpoint returned");
+    assert_prepare_log_contains(&fail_db, &["prepare_started", "prepare_failed"]);
+}
+
 fn run_prepare(api: &Matryoshka, scenario: &str) -> Vec<MatryoshkaEvent> {
     let mut events = Vec::new();
     let summary = api
@@ -285,6 +482,59 @@ fn run_prepare(api: &Matryoshka, scenario: &str) -> Vec<MatryoshkaEvent> {
     assert_progress_events_are_consistent(scenario, &events);
     assert_lock_events_are_consistent(scenario, &events);
     events
+}
+
+fn run_copied_prepare(api: &Matryoshka, scenario: &str) -> Vec<MatryoshkaEvent> {
+    let mut events = Vec::new();
+    let summary = api
+        .prepare_with_progress(copied_prepare_options(), |event| events.push(event))
+        .unwrap_or_else(|err| panic!("{scenario} prepare failed: {err:#}"));
+    assert!(
+        summary.is_ready(),
+        "{scenario} prepare summary was not ready: {summary:#?}",
+    );
+    assert_progress_events_are_consistent(scenario, &events);
+    assert_lock_events_are_consistent(scenario, &events);
+    events
+}
+
+fn copied_prepare_options() -> PrepareOptions {
+    PrepareOptions {
+        limit: 4,
+        queries: vec![
+            "read include chunks symbols".into(),
+            "prepare progress events cancellation resume".into(),
+            "cli command options api facade".into(),
+        ],
+        write_progress_state: true,
+    }
+}
+
+fn copied_repo_api(
+    repo: &Path,
+    db: &Path,
+    base_url: impl Into<String>,
+    chat_model_name: impl Into<String>,
+) -> Matryoshka {
+    Matryoshka::new(
+        MatryoshkaConfig::new(repo)
+            .with_db(db)
+            .with_endpoint(base_url, api_key())
+            .with_models(chat_model_name, embed_model())
+            .with_chunk_summary_model(chat_model())
+            .with_chunk_summary_concurrency(6)
+            .with_ignored_paths([".matryoshka", "target", "api/tests"]),
+    )
+}
+
+fn copied_repo_path() -> PathBuf {
+    std::env::var_os("MATRYOSHKA_COPIED_TEST_REPO")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../..")
+                .join("test-repo")
+        })
 }
 
 fn completed_summary(events: &[MatryoshkaEvent]) -> matryoshka::PrepareSummary {
@@ -403,6 +653,66 @@ fn assert_ready_progress_state(db: &Path) {
         serde_json::from_str(&fs::read_to_string(state_path).unwrap()).unwrap();
     assert_eq!(value["status"], "ready");
     assert_eq!(value["percent"], 1.0);
+}
+
+fn assert_cancelled_progress_state(db: &Path) {
+    let state_path = progress_state_path(db);
+    assert!(state_path.exists());
+    let value: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(state_path).unwrap()).unwrap();
+    assert_eq!(value["status"], "cancelled");
+    assert_eq!(value["phase"], "cancelled");
+}
+
+fn assert_failed_progress_state_contains(db: &Path, needle: &str) {
+    let state_path = progress_state_path(db);
+    assert!(state_path.exists());
+    let value: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(state_path).unwrap()).unwrap();
+    assert_eq!(value["status"], "failed");
+    assert!(
+        value["last_error"]
+            .as_str()
+            .is_some_and(|error| error.contains(needle)),
+        "{value:#}"
+    );
+}
+
+fn assert_cancelling_then_cancelled(scenario: &str, events: &[MatryoshkaEvent]) {
+    let cancelling = events
+        .iter()
+        .position(|event| matches!(event, MatryoshkaEvent::PrepareCancelling { .. }))
+        .unwrap_or_else(|| panic!("{scenario} did not emit prepare_cancelling"));
+    let cancelled = events
+        .iter()
+        .position(|event| matches!(event, MatryoshkaEvent::PrepareCancelled { .. }))
+        .unwrap_or_else(|| panic!("{scenario} did not emit prepare_cancelled"));
+    assert!(
+        cancelling < cancelled,
+        "{scenario} cancelling event should come before cancelled"
+    );
+}
+
+fn assert_prepare_log_contains(db: &Path, expected_events: &[&str]) {
+    let log = fs::read_to_string(log_path(db, "prepare"))
+        .unwrap_or_else(|err| panic!("failed to read prepare log for {}: {err}", db.display()));
+    for expected in expected_events {
+        assert!(
+            log.lines().any(|line| {
+                serde_json::from_str::<serde_json::Value>(line)
+                    .ok()
+                    .and_then(|value| {
+                        value
+                            .get("event")
+                            .and_then(|event| event.as_str())
+                            .map(str::to_owned)
+                    })
+                    .as_deref()
+                    == Some(*expected)
+            }),
+            "prepare log did not contain event {expected}; log was:\n{log}"
+        );
+    }
 }
 
 fn conn(db: &Path) -> Connection {

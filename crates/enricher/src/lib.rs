@@ -1,8 +1,6 @@
-mod heuristic;
 mod mlx_chat;
 mod prompts;
 
-pub use heuristic::*;
 pub use mlx_chat::*;
 pub use prompts::*;
 
