@@ -33,5 +33,6 @@
     ],
     "reranker": "none"
   },
-  "provider": {}
+  "provider": {},
+  "auth": {}
 }

@@ -1,13 +1,19 @@
 use anyhow::{Result, anyhow};
 use matryoshka_core_ir::{
-    ArtifactQualityReport, CompactReadCard, FileCard, FileEnrichmentContext, FileFact, FolderCard,
-    FolderEnrichmentContext, FolderFact, MatryoshkaProgressEvent, ReadCard, RepoCard,
-    RetrievalConfig, RetrievalIndexReport, RetrievalPrimary, SearchHit, SymbolFact,
+    ArtifactQualityReport, CodeChunkFact, CompactReadCard, EnrichmentReadinessReport, FileCard,
+    FileEnrichmentContext, FileFact, FolderCard, FolderEnrichmentContext, FolderFact,
+    MatryoshkaProgressEvent, ReadCard, RepoCard, RetrievalConfig, RetrievalIndexReport,
+    RetrievalPrimary, SearchHit, SymbolFact,
 };
 use matryoshka_embed_client::Embedder;
 use matryoshka_embed_client::EndpointEmbedder;
-use matryoshka_enricher::{CodeEnricher, MlxChatEnricher, MlxChunkSummarizer};
-use matryoshka_indexer::{FullIndexer, SemanticRebuildSummary, UpdateSummary};
+use matryoshka_enricher::{
+    ChunkSummarizer, ChunkSummaryDraft, CodeEnricher, MlxChatEnricher, MlxChunkSummarizer,
+};
+use matryoshka_indexer::{
+    ArtifactRefreshMode, EnrichmentBatchOptions, EnrichmentBatchSummary, FullIndexer,
+    SemanticRebuildSummary, UpdateSummary,
+};
 use matryoshka_parser::ParserConfig;
 use matryoshka_read_api::{ReadApi, ReadBundle, ReadPackMode};
 use matryoshka_search::{
@@ -85,6 +91,7 @@ pub struct MatryoshkaConfig {
     pub retrieval_primary: RetrievalPrimary,
     pub dense_enabled: bool,
     pub dense_fallback_enabled: bool,
+    pub llm_enrichment_enabled: bool,
     pub chunk_summary_enabled: bool,
     pub chunk_summary_model: String,
     pub chunk_summary_concurrency: usize,
@@ -106,6 +113,7 @@ impl MatryoshkaConfig {
             retrieval_primary: RetrievalPrimary::Hybrid,
             dense_enabled: true,
             dense_fallback_enabled: true,
+            llm_enrichment_enabled: false,
             chunk_summary_enabled: true,
             chunk_summary_model: DEFAULT_CHUNK_SUMMARY_MODEL.into(),
             chunk_summary_concurrency: DEFAULT_CHUNK_SUMMARY_CONCURRENCY,
@@ -178,6 +186,11 @@ impl MatryoshkaConfig {
         self
     }
 
+    pub fn with_llm_enrichment_enabled(mut self, enabled: bool) -> Self {
+        self.llm_enrichment_enabled = enabled;
+        self
+    }
+
     pub fn retrieval_config(&self) -> RetrievalConfig {
         RetrievalConfig {
             primary: self.retrieval_primary,
@@ -217,6 +230,36 @@ impl Default for PrepareOptions {
             write_progress_state: true,
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EnrichmentOptions {
+    pub max_files: usize,
+    pub write_progress_state: bool,
+}
+
+impl Default for EnrichmentOptions {
+    fn default() -> Self {
+        Self {
+            max_files: 1,
+            write_progress_state: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct EnrichmentSummary {
+    pub repo_root: PathBuf,
+    pub db: PathBuf,
+    pub before: EnrichmentReadinessReport,
+    pub after: EnrichmentReadinessReport,
+    pub selected_files: usize,
+    pub selected_folders: usize,
+    pub repo_card_updated: bool,
+    pub semantic_record_count: usize,
+    pub artifact_quality: ArtifactQualityReport,
+    pub retrieval_index: RetrievalIndexReport,
+    pub embedding_model: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -295,6 +338,7 @@ pub struct PrepareSummary {
     pub changed_folders: usize,
     pub repo_card_updated: bool,
     pub artifact_quality: ArtifactQualityReport,
+    pub enrichment: EnrichmentReadinessReport,
     pub retrieval_index: RetrievalIndexReport,
     pub prewarm: SearchPrewarmSummaryJson,
     pub embedding_model: String,
@@ -365,6 +409,21 @@ pub enum MatryoshkaEvent {
     },
     PrepareDecision {
         action: String,
+        reason: String,
+    },
+    EnrichmentStarted {
+        repo_root: PathBuf,
+        db: PathBuf,
+        before: EnrichmentReadinessReport,
+        max_files: usize,
+    },
+    EnrichmentCompleted {
+        summary: EnrichmentSummary,
+    },
+    EnrichmentCancelling {
+        reason: String,
+    },
+    EnrichmentCancelled {
         reason: String,
     },
     ProgressState {
@@ -560,6 +619,51 @@ where
     }
 }
 
+struct CancellableChunkSummarizer<S> {
+    inner: S,
+    cancel_token: MatryoshkaCancelToken,
+}
+
+impl<S> CancellableChunkSummarizer<S> {
+    fn new(inner: S, cancel_token: MatryoshkaCancelToken) -> Self {
+        Self {
+            inner,
+            cancel_token,
+        }
+    }
+}
+
+impl<S> ChunkSummarizer for CancellableChunkSummarizer<S>
+where
+    S: ChunkSummarizer,
+{
+    fn summarize_chunks(&self, chunks: &[CodeChunkFact]) -> Result<Vec<ChunkSummaryDraft>> {
+        self.cancel_token.check()?;
+        let drafts = self.inner.summarize_chunks(chunks)?;
+        self.cancel_token.check()?;
+        Ok(drafts)
+    }
+
+    fn summarize_chunks_with_progress(
+        &self,
+        chunks: &[CodeChunkFact],
+        progress: &mut dyn FnMut(usize, usize, usize),
+    ) -> Result<Vec<ChunkSummaryDraft>> {
+        self.cancel_token.check()?;
+        let cancel_token = self.cancel_token.clone();
+        let mut cancellable_progress =
+            |batch_index: usize, total_batches: usize, chunks_in_batch: usize| {
+                let _ = cancel_token.check();
+                progress(batch_index, total_batches, chunks_in_batch);
+            };
+        let drafts = self
+            .inner
+            .summarize_chunks_with_progress(chunks, &mut cancellable_progress)?;
+        self.cancel_token.check()?;
+        Ok(drafts)
+    }
+}
+
 impl Matryoshka {
     pub fn new(config: MatryoshkaConfig) -> Self {
         Self { config }
@@ -682,7 +786,7 @@ impl Matryoshka {
 
             let first_action = if existing_file_count == 0 {
                 "index"
-            } else if existing_gap_count > 0 {
+            } else if self.config.llm_enrichment_enabled && existing_gap_count > 0 {
                 "repair"
             } else if existing_search_missing {
                 "rebuild_search"
@@ -691,7 +795,7 @@ impl Matryoshka {
             };
             let first_reason = if existing_file_count == 0 {
                 "no indexed files found"
-            } else if existing_gap_count > 0 {
+            } else if self.config.llm_enrichment_enabled && existing_gap_count > 0 {
                 "project map has gaps"
             } else if existing_search_missing {
                 "search data is missing or incomplete"
@@ -745,7 +849,10 @@ impl Matryoshka {
             };
             actions_taken.push(first_action.to_string());
 
-            if artifact_gap_count(&update.artifact_quality) > 0 && first_action != "repair" {
+            if self.config.llm_enrichment_enabled
+                && artifact_gap_count(&update.artifact_quality) > 0
+                && first_action != "repair"
+            {
                 if cancel_token.is_cancelled() {
                     return cancel_prepare(
                         &mut on_event,
@@ -903,8 +1010,11 @@ impl Matryoshka {
                 self.config.retrieval_config(),
                 self.config.late_interaction,
             );
-            let ready =
-                artifact_gap_count(&artifact_quality) == 0 && retrieval_is_ready(&retrieval_index);
+            let enrichment = MatryoshkaStore::open(&self.config.db)?
+                .enrichment_readiness_report(&self.config.repo_root.to_string_lossy())?;
+            let enrichment_ready =
+                !self.config.llm_enrichment_enabled || artifact_gap_count(&artifact_quality) == 0;
+            let ready = enrichment_ready && retrieval_is_ready(&retrieval_index);
             let status = if ready {
                 PrepareStatus::Ready
             } else {
@@ -927,6 +1037,7 @@ impl Matryoshka {
                 changed_folders: update.changed_folders,
                 repo_card_updated: update.repo_card_updated,
                 artifact_quality,
+                enrichment,
                 retrieval_index,
                 prewarm: prewarm_json,
                 embedding_model: update.embedding_model,
@@ -1068,6 +1179,154 @@ impl Matryoshka {
         Ok(rows)
     }
 
+    pub fn enrichment_status(&self) -> Result<EnrichmentReadinessReport> {
+        ensure_matryoshka_layout(&self.config.db)?;
+        let store = MatryoshkaStore::open(&self.config.db)?;
+        store.prune_orphaned_artifacts()?;
+        store.enrichment_readiness_report(&self.config.repo_root.to_string_lossy())
+    }
+
+    pub fn enrich_once(&self, options: EnrichmentOptions) -> Result<EnrichmentSummary> {
+        self.enrich_once_with_progress(options, |_| {})
+    }
+
+    pub fn enrich_once_with_progress(
+        &self,
+        options: EnrichmentOptions,
+        mut on_event: impl FnMut(MatryoshkaEvent),
+    ) -> Result<EnrichmentSummary> {
+        self.enrich_once_with_progress_and_cancel(options, MatryoshkaCancelToken::new(), |event| {
+            on_event(event)
+        })
+    }
+
+    pub fn enrich_once_with_progress_and_cancel(
+        &self,
+        options: EnrichmentOptions,
+        cancel_token: MatryoshkaCancelToken,
+        mut on_event: impl FnMut(MatryoshkaEvent),
+    ) -> Result<EnrichmentSummary> {
+        ensure_matryoshka_layout(&self.config.db)?;
+        let mut progress_writer =
+            ProgressStateWriter::new(&self.config.db, options.write_progress_state);
+        let mut log = CommandLog::open(&self.config.db, "enrich")?;
+
+        if cancel_token.is_cancelled() {
+            return cancel_enrichment(
+                &mut on_event,
+                &mut progress_writer,
+                &mut log,
+                "enrichment was cancelled before it started",
+            );
+        }
+
+        let store = MatryoshkaStore::open(&self.config.db)?;
+        store.prune_orphaned_artifacts()?;
+        if cancel_token.is_cancelled() {
+            return cancel_enrichment(
+                &mut on_event,
+                &mut progress_writer,
+                &mut log,
+                "enrichment was cancelled before work selection",
+            );
+        }
+        let before = store.enrichment_readiness_report(&self.config.repo_root.to_string_lossy())?;
+        emit_event(
+            &mut on_event,
+            &mut progress_writer,
+            MatryoshkaEvent::EnrichmentStarted {
+                repo_root: self.config.repo_root.clone(),
+                db: self.config.db.clone(),
+                before: before.clone(),
+                max_files: options.max_files.max(1),
+            },
+        );
+        log.event(
+            "enrichment_started",
+            json!({
+                "repo_root": self.config.repo_root,
+                "db": self.config.db,
+                "max_files": options.max_files.max(1),
+                "before": before,
+            }),
+        )?;
+        if cancel_token.is_cancelled() {
+            return cancel_enrichment(
+                &mut on_event,
+                &mut progress_writer,
+                &mut log,
+                "enrichment was cancelled before the background batch started",
+            );
+        }
+
+        let enricher = MlxChatEnricher::new(&self.config.base_url, &self.config.api_key)
+            .with_model(self.config.chat_model.clone());
+        let embedder = EndpointEmbedder::new(
+            &self.config.base_url,
+            &self.config.api_key,
+            self.config.embedding_model.clone(),
+        );
+        let chunk_summarizer = MlxChunkSummarizer::new(&self.config.base_url, &self.config.api_key)
+            .with_model(&self.config.chunk_summary_model)
+            .with_concurrency(self.config.chunk_summary_concurrency);
+        let batch_result = FullIndexer::new(
+            store,
+            CancellableEnricher::new(enricher, cancel_token.clone()),
+            CancellableEmbedder::new(embedder, cancel_token.clone()),
+            CancellableChunkSummarizer::new(chunk_summarizer, cancel_token.clone()),
+        )
+            .with_retrieval_config(self.config.retrieval_config())
+            .with_artifact_mode(ArtifactRefreshMode::Enriched)
+            .with_chunk_summary_enabled(self.config.chunk_summary_enabled)
+            .enrich_once_with_progress(
+                &self.config.repo_root,
+                EnrichmentBatchOptions {
+                    max_files: options.max_files.max(1),
+                },
+                |progress| {
+                    emit_event(
+                        &mut on_event,
+                        &mut progress_writer,
+                        MatryoshkaEvent::IndexerProgress {
+                            operation: "enrich".into(),
+                            action: Some("background_batch".into()),
+                            progress,
+                        },
+                    );
+                },
+            );
+        let batch = match batch_result {
+            Ok(batch) => batch,
+            Err(err) if cancel_token.is_cancelled() || is_cancelled_error(err.as_ref()) => {
+                return cancel_enrichment(
+                    &mut on_event,
+                    &mut progress_writer,
+                    &mut log,
+                    "enrichment was cancelled while running the background batch",
+                );
+            }
+            Err(err) => return Err(err),
+        };
+        if cancel_token.is_cancelled() {
+            return cancel_enrichment(
+                &mut on_event,
+                &mut progress_writer,
+                &mut log,
+                "enrichment was cancelled before completion",
+            );
+        }
+        let summary = enrichment_summary_from_batch(&self.config, batch);
+        log.event("enrichment_completed", enrichment_summary_json(&summary))?;
+        emit_event(
+            &mut on_event,
+            &mut progress_writer,
+            MatryoshkaEvent::EnrichmentCompleted {
+                summary: summary.clone(),
+            },
+        );
+        Ok(summary)
+    }
+
     fn ensure_prepare_ready_for_reads(&self) -> Result<()> {
         let ready_marker = ready_marker_path(&self.config.db);
         if !ready_marker.exists() {
@@ -1084,7 +1343,7 @@ impl Matryoshka {
             .into_iter()
             .filter(|row| row.is_empty)
             .collect::<Vec<_>>();
-        if !empty_cards.is_empty() {
+        if self.config.llm_enrichment_enabled && !empty_cards.is_empty() {
             let samples = empty_cards
                 .iter()
                 .take(8)
@@ -1154,7 +1413,14 @@ impl Matryoshka {
         )
         .with_parser_config(parser_config)
         .with_retrieval_config(self.config.retrieval_config())
-        .with_chunk_summary_enabled(self.config.chunk_summary_enabled)
+        .with_artifact_mode(if self.config.llm_enrichment_enabled {
+            ArtifactRefreshMode::Enriched
+        } else {
+            ArtifactRefreshMode::CoreSearchable
+        })
+        .with_chunk_summary_enabled(
+            self.config.chunk_summary_enabled && self.config.llm_enrichment_enabled,
+        )
         .update_repo_with_progress(&self.config.repo_root, &mut progress)?;
         cancel_token.check()?;
         if let Some(log) = log.as_deref_mut() {
@@ -1414,6 +1680,31 @@ fn progress_state_from_event(event: &MatryoshkaEvent) -> Option<ProgressState> {
             prepare_action_message(action),
             prepare_action_percent(action),
         ),
+        MatryoshkaEvent::EnrichmentStarted { max_files, .. } => ProgressState::new(
+            "enrich",
+            Some("background_batch"),
+            "running",
+            "starting",
+            "Starting background enrichment",
+            0.0,
+        )
+        .with_item_progress(Some(0), Some(*max_files), "files"),
+        MatryoshkaEvent::EnrichmentCancelling { .. } => ProgressState::new(
+            "enrich",
+            Some("background_batch"),
+            "cancelling",
+            "cancelled",
+            "Cancelling enrichment",
+            0.99,
+        ),
+        MatryoshkaEvent::EnrichmentCancelled { .. } => ProgressState::new(
+            "enrich",
+            Some("background_batch"),
+            "cancelled",
+            "cancelled",
+            "Enrichment cancelled",
+            1.0,
+        ),
         MatryoshkaEvent::IndexerProgress {
             operation,
             action,
@@ -1473,6 +1764,23 @@ fn progress_state_from_event(event: &MatryoshkaEvent) -> Option<ProgressState> {
             1.0,
         )
         .with_file_progress(None, Some(summary.file_count), Some(summary.file_count)),
+        MatryoshkaEvent::EnrichmentCompleted { summary } => ProgressState::new(
+            "enrich",
+            Some("background_batch"),
+            if summary.after.is_ready() {
+                "ready"
+            } else {
+                "partial"
+            },
+            "complete",
+            "Enrichment batch complete",
+            1.0,
+        )
+        .with_item_progress(
+            Some(summary.after.ready_total()),
+            Some(summary.after.ready_total() + summary.after.pending_total()),
+            "derived_records",
+        ),
     };
     Some(state)
 }
@@ -1541,8 +1849,49 @@ fn cancelled_error() -> anyhow::Error {
     anyhow!("matryoshka prepare cancelled")
 }
 
+fn enrichment_cancelled_error() -> anyhow::Error {
+    anyhow!("matryoshka enrich cancelled")
+}
+
 pub fn is_cancelled_error(error: &(dyn std::error::Error + 'static)) -> bool {
-    error.to_string().contains("matryoshka prepare cancelled")
+    let message = error.to_string();
+    message.contains("matryoshka prepare cancelled")
+        || message.contains("matryoshka enrich cancelled")
+}
+
+fn cancel_enrichment(
+    on_event: &mut impl FnMut(MatryoshkaEvent),
+    progress_writer: &mut ProgressStateWriter,
+    log: &mut CommandLog,
+    reason: &str,
+) -> Result<EnrichmentSummary> {
+    log.event(
+        "enrichment_cancelling",
+        json!({
+            "reason": reason,
+        }),
+    )?;
+    emit_event(
+        on_event,
+        progress_writer,
+        MatryoshkaEvent::EnrichmentCancelling {
+            reason: reason.into(),
+        },
+    );
+    log.event(
+        "enrichment_cancelled",
+        json!({
+            "reason": reason,
+        }),
+    )?;
+    emit_event(
+        on_event,
+        progress_writer,
+        MatryoshkaEvent::EnrichmentCancelled {
+            reason: reason.into(),
+        },
+    );
+    Err(enrichment_cancelled_error())
 }
 
 fn indexer_progress_state(
@@ -2095,6 +2444,7 @@ pub fn prepare_summary_json(summary: &PrepareSummary) -> serde_json::Value {
                 "empty_folder_samples": summary.artifact_quality.empty_folder_summary_samples,
             },
         },
+        "enrichment": &summary.enrichment,
         "search": {
             "status": if retrieval_is_ready(&summary.retrieval_index) {
                 "ready"
@@ -2138,6 +2488,41 @@ fn update_summary_json(summary: &UpdateSummary) -> serde_json::Value {
         "removed_files": summary.removed_files,
         "changed_folders": summary.changed_folders,
         "repo_card_updated": summary.repo_card_updated,
+        "embedding_model": summary.embedding_model,
+    })
+}
+
+fn enrichment_summary_from_batch(
+    config: &MatryoshkaConfig,
+    batch: EnrichmentBatchSummary,
+) -> EnrichmentSummary {
+    EnrichmentSummary {
+        repo_root: config.repo_root.clone(),
+        db: config.db.clone(),
+        before: batch.before,
+        after: batch.after,
+        selected_files: batch.selected_files,
+        selected_folders: batch.selected_folders,
+        repo_card_updated: batch.repo_card_updated,
+        semantic_record_count: batch.semantic_record_count,
+        artifact_quality: batch.artifact_quality,
+        retrieval_index: batch.retrieval_index,
+        embedding_model: batch.embedding_model,
+    }
+}
+
+pub fn enrichment_summary_json(summary: &EnrichmentSummary) -> serde_json::Value {
+    json!({
+        "repo_root": summary.repo_root,
+        "db": summary.db,
+        "before": &summary.before,
+        "after": &summary.after,
+        "selected_files": summary.selected_files,
+        "selected_folders": summary.selected_folders,
+        "repo_card_updated": summary.repo_card_updated,
+        "semantic_records": summary.semantic_record_count,
+        "artifact_quality": &summary.artifact_quality,
+        "retrieval_index": &summary.retrieval_index,
         "embedding_model": summary.embedding_model,
     })
 }

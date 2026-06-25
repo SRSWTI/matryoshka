@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use matryoshka_core_ir::{
-    CodeChunkFact, EdgeFact, FileCard, FileFact, FolderCard, FolderFact, LateInteractionVector,
+    ChunkSummarySource, CodeChunkFact, EdgeFact, EnrichmentReadinessReport,
+    EnrichmentReadinessStatus, FileCard, FileFact, FolderCard, FolderFact, LateInteractionVector,
     RepoCard, RepositorySnapshot, SemanticRecord, SymbolFact,
 };
 use rusqlite::{Connection, OptionalExtension, params};
@@ -486,6 +487,209 @@ impl MatryoshkaStore {
         })
     }
 
+    pub fn enrichment_readiness_report(
+        &self,
+        repo_root: &str,
+    ) -> Result<EnrichmentReadinessReport> {
+        const SAMPLE_LIMIT: usize = 12;
+
+        let files = self.load_all_files()?;
+        let folders = self.load_all_folders()?;
+        let chunks = self.load_all_code_chunks()?;
+        let file_cards = self
+            .load_active_file_cards()?
+            .into_iter()
+            .map(|card| (card.file_id.clone(), card))
+            .collect::<BTreeMap<_, _>>();
+        let folder_cards = self
+            .load_active_folder_cards()?
+            .into_iter()
+            .map(|card| (card.folder_id.clone(), card))
+            .collect::<BTreeMap<_, _>>();
+        let repo_card = self.load_repo_card(repo_root)?;
+        let semantic_records = self
+            .load_all_semantic_records()?
+            .into_iter()
+            .map(|record| (record.record_id.clone(), record))
+            .collect::<BTreeMap<_, _>>();
+
+        let mut report = EnrichmentReadinessReport {
+            files_total: files.len(),
+            folders_total: folders.len(),
+            chunks_total: chunks.len(),
+            ..EnrichmentReadinessReport::default()
+        };
+
+        for file in &files {
+            match file_cards.get(&file.file_id) {
+                Some(card)
+                    if has_useful_text(&card.summary)
+                        && card.provenance.source_hash == file.source_hash =>
+                {
+                    report.file_cards_ready += 1;
+                    let record_id = format!("semantic:file_card:{}", file.file_id);
+                    match derived_semantic_record_ready(
+                        &semantic_records,
+                        &record_id,
+                        &file.source_hash,
+                        &card.summary,
+                    ) {
+                        DerivedSemanticReadiness::Ready => {
+                            report.derived_semantic_records_ready += 1;
+                        }
+                        DerivedSemanticReadiness::Missing => {
+                            report.derived_semantic_records_pending += 1;
+                            push_sample(&mut report.pending_files_sample, &file.path, SAMPLE_LIMIT);
+                        }
+                        DerivedSemanticReadiness::Stale => {
+                            report.derived_semantic_records_pending += 1;
+                            report.derived_semantic_records_stale += 1;
+                            push_sample(&mut report.pending_files_sample, &file.path, SAMPLE_LIMIT);
+                        }
+                    }
+                }
+                Some(card) => {
+                    report.file_cards_pending += 1;
+                    if card.provenance.source_hash != file.source_hash {
+                        report.file_cards_stale += 1;
+                    }
+                    push_sample(&mut report.pending_files_sample, &file.path, SAMPLE_LIMIT);
+                }
+                None => {
+                    report.file_cards_pending += 1;
+                    push_sample(&mut report.pending_files_sample, &file.path, SAMPLE_LIMIT);
+                }
+            }
+        }
+
+        for folder in &folders {
+            match folder_cards.get(&folder.folder_id) {
+                Some(card) if has_useful_text(&card.summary) => {
+                    report.folder_cards_ready += 1;
+                    let record_id = format!("semantic:folder_card:{}", folder.folder_id);
+                    match derived_semantic_record_ready(
+                        &semantic_records,
+                        &record_id,
+                        &card.provenance.source_hash,
+                        &card.summary,
+                    ) {
+                        DerivedSemanticReadiness::Ready => {
+                            report.derived_semantic_records_ready += 1;
+                        }
+                        DerivedSemanticReadiness::Missing => {
+                            report.derived_semantic_records_pending += 1;
+                            push_sample(
+                                &mut report.pending_folders_sample,
+                                &folder.path,
+                                SAMPLE_LIMIT,
+                            );
+                        }
+                        DerivedSemanticReadiness::Stale => {
+                            report.derived_semantic_records_pending += 1;
+                            report.derived_semantic_records_stale += 1;
+                            push_sample(
+                                &mut report.pending_folders_sample,
+                                &folder.path,
+                                SAMPLE_LIMIT,
+                            );
+                        }
+                    }
+                }
+                _ => {
+                    report.folder_cards_pending += 1;
+                    push_sample(
+                        &mut report.pending_folders_sample,
+                        &folder.path,
+                        SAMPLE_LIMIT,
+                    );
+                }
+            }
+        }
+
+        for chunk in &chunks {
+            if chunk.summary_source != ChunkSummarySource::Empty && has_useful_text(&chunk.summary)
+            {
+                report.chunks_ready += 1;
+                let record_id = format!("semantic:code_chunk:{}", chunk.chunk_id);
+                match derived_semantic_record_ready(
+                    &semantic_records,
+                    &record_id,
+                    &chunk.source_hash,
+                    &chunk.summary,
+                ) {
+                    DerivedSemanticReadiness::Ready => {
+                        report.derived_semantic_records_ready += 1;
+                    }
+                    DerivedSemanticReadiness::Missing => {
+                        report.derived_semantic_records_pending += 1;
+                        push_sample(
+                            &mut report.pending_chunks_sample,
+                            &chunk.chunk_id,
+                            SAMPLE_LIMIT,
+                        );
+                    }
+                    DerivedSemanticReadiness::Stale => {
+                        report.derived_semantic_records_pending += 1;
+                        report.derived_semantic_records_stale += 1;
+                        push_sample(
+                            &mut report.pending_chunks_sample,
+                            &chunk.chunk_id,
+                            SAMPLE_LIMIT,
+                        );
+                    }
+                }
+            } else {
+                report.chunks_pending += 1;
+                push_sample(
+                    &mut report.pending_chunks_sample,
+                    &chunk.chunk_id,
+                    SAMPLE_LIMIT,
+                );
+            }
+        }
+
+        report.repo_card_ready = repo_card
+            .as_ref()
+            .map(|card| has_useful_text(&card.summary))
+            .unwrap_or(false);
+        if let Some(card) = repo_card
+            .as_ref()
+            .filter(|card| has_useful_text(&card.summary))
+        {
+            let record_id = format!("semantic:repo_card:{}", card.repo_root);
+            match derived_semantic_record_ready(
+                &semantic_records,
+                &record_id,
+                &card.provenance.source_hash,
+                &card.summary,
+            ) {
+                DerivedSemanticReadiness::Ready => {
+                    report.derived_semantic_records_ready += 1;
+                }
+                DerivedSemanticReadiness::Missing => {
+                    report.derived_semantic_records_pending += 1;
+                }
+                DerivedSemanticReadiness::Stale => {
+                    report.derived_semantic_records_pending += 1;
+                    report.derived_semantic_records_stale += 1;
+                }
+            }
+        }
+        report.repo_card_pending = !files.is_empty() && !report.repo_card_ready;
+
+        report.status = if files.is_empty() {
+            EnrichmentReadinessStatus::Pending
+        } else if report.pending_total() == 0 {
+            EnrichmentReadinessStatus::Ready
+        } else if report.ready_total() > 0 {
+            EnrichmentReadinessStatus::Partial
+        } else {
+            EnrichmentReadinessStatus::Pending
+        };
+
+        Ok(report)
+    }
+
     pub fn replace_late_interaction_vectors(
         &self,
         record_ids: &[String],
@@ -793,6 +997,12 @@ impl MatryoshkaStore {
         )
     }
 
+    pub fn delete_repo_card(&self, repo_root: &str) -> Result<()> {
+        let conn = self.connect()?;
+        conn.execute("DELETE FROM repo_cards WHERE repo_root = ?1", [repo_root])?;
+        Ok(())
+    }
+
     pub fn delete_symbols_for_files(&self, file_ids: &[String]) -> Result<()> {
         delete_many(
             &self.connect()?,
@@ -949,6 +1159,42 @@ fn query_json_many<T: DeserializeOwned>(
         values.push(from_json(&row?)?);
     }
     Ok(values)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DerivedSemanticReadiness {
+    Ready,
+    Missing,
+    Stale,
+}
+
+fn derived_semantic_record_ready(
+    records: &BTreeMap<String, SemanticRecord>,
+    record_id: &str,
+    source_hash: &str,
+    summary: &str,
+) -> DerivedSemanticReadiness {
+    let Some(record) = records.get(record_id) else {
+        return DerivedSemanticReadiness::Missing;
+    };
+    if record.source_hash != source_hash {
+        return DerivedSemanticReadiness::Stale;
+    }
+    let summary = summary.trim();
+    if !summary.is_empty() && !record.content.contains(summary) {
+        return DerivedSemanticReadiness::Stale;
+    }
+    DerivedSemanticReadiness::Ready
+}
+
+fn has_useful_text(value: &str) -> bool {
+    !value.trim().is_empty()
+}
+
+fn push_sample(samples: &mut Vec<String>, value: &str, limit: usize) {
+    if samples.len() < limit {
+        samples.push(value.to_string());
+    }
 }
 
 fn load_card_summary_rows(

@@ -1,14 +1,16 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
 use matryoshka::{
-    Matryoshka, MatryoshkaConfig, PrepareOptions as ApiPrepareOptions,
-    PrepareSummary as ApiPrepareSummary,
+    EnrichmentOptions as ApiEnrichmentOptions, EnrichmentSummary, Matryoshka, MatryoshkaConfig,
+    PrepareOptions as ApiPrepareOptions, PrepareSummary as ApiPrepareSummary,
+    enrichment_summary_json,
 };
 use matryoshka_embed_client::EndpointEmbedder;
 use matryoshka_enricher::{MlxChatEnricher, MlxChunkSummarizer};
 use matryoshka_indexer::{
-    ArtifactQualityReport, FullIndexer, IndexSummary, MatryoshkaProgressEvent, RetrievalConfig,
-    RetrievalIndexReport, RetrievalPrimary, SemanticRebuildSummary, UpdateSummary,
+    ArtifactQualityReport, EnrichmentReadinessReport, FullIndexer, IndexSummary,
+    MatryoshkaProgressEvent, RetrievalConfig, RetrievalIndexReport, RetrievalPrimary,
+    SemanticRebuildSummary, UpdateSummary,
 };
 use matryoshka_parser::{ParserConfig, SourceParser};
 use matryoshka_read_api::{ReadApi, ReadPackMode};
@@ -80,6 +82,8 @@ enum Command {
         chunk_summary_concurrency: usize,
         #[arg(long, default_value_t = false)]
         no_chunk_summaries: bool,
+        #[arg(long, default_value_t = false)]
+        enrich_now: bool,
         #[arg(long = "retrieval-primary", value_enum, default_value_t = CliRetrievalPrimary::Hybrid)]
         retrieval_primary: CliRetrievalPrimary,
         #[arg(long = "enable-dense", default_value_t = false)]
@@ -441,6 +445,47 @@ enum Command {
         #[arg(long = "no-dense-fallback", default_value_t = false)]
         no_dense_fallback: bool,
     },
+    Enrich {
+        repo_root: PathBuf,
+        #[arg(long)]
+        db: Option<PathBuf>,
+        #[arg(long, default_value = DEFAULT_BASE_URL)]
+        base_url: String,
+        #[arg(long, default_value = DEFAULT_API_KEY)]
+        api_key: String,
+        #[arg(long = "embedding-model", visible_alias = "embed-model", default_value = DEFAULT_EMBED_MODEL)]
+        embed_model: String,
+        #[arg(long = "model", visible_alias = "chat-model", default_value = DEFAULT_CHAT_MODEL)]
+        chat_model: String,
+        #[arg(long = "chunk-summary-model", default_value = DEFAULT_CHUNK_SUMMARY_MODEL)]
+        chunk_summary_model: String,
+        #[arg(long = "chunk-summary-concurrency", default_value_t = DEFAULT_CHUNK_SUMMARY_CONCURRENCY)]
+        chunk_summary_concurrency: usize,
+        #[arg(long = "max-files", default_value_t = 1)]
+        max_files: usize,
+        #[arg(long, default_value_t = false)]
+        status: bool,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+        #[arg(long, default_value_t = false)]
+        progress_jsonl: bool,
+        #[arg(long, default_value_t = false)]
+        no_chunk_summaries: bool,
+        #[arg(long = "retrieval-primary", value_enum, default_value_t = CliRetrievalPrimary::Hybrid)]
+        retrieval_primary: CliRetrievalPrimary,
+        #[arg(long = "enable-dense", default_value_t = false)]
+        enable_dense: bool,
+        #[arg(
+            long = "disable-dense",
+            visible_alias = "no-dense-embeddings",
+            default_value_t = false
+        )]
+        disable_dense: bool,
+        #[arg(long = "dense-fallback", default_value_t = false)]
+        dense_fallback: bool,
+        #[arg(long = "no-dense-fallback", default_value_t = false)]
+        no_dense_fallback: bool,
+    },
     Cards {
         #[arg(long)]
         db: Option<PathBuf>,
@@ -622,6 +667,7 @@ fn main() -> Result<()> {
             chunk_summary_model,
             chunk_summary_concurrency,
             no_chunk_summaries,
+            enrich_now,
             retrieval_primary,
             enable_dense,
             disable_dense,
@@ -653,6 +699,7 @@ fn main() -> Result<()> {
                     chunk_summary_model,
                     chunk_summary_concurrency,
                     no_chunk_summaries,
+                    enrich_now,
                 },
                 progress_jsonl,
             )?;
@@ -1246,6 +1293,87 @@ fn main() -> Result<()> {
             let bundle = read.read_bundle(primary, &related_file_ids, mode.into(), related)?;
             println!("{}", serde_json::to_string_pretty(&bundle)?);
         }
+        Command::Enrich {
+            repo_root,
+            db,
+            base_url,
+            api_key,
+            embed_model,
+            chat_model,
+            chunk_summary_model,
+            chunk_summary_concurrency,
+            max_files,
+            status,
+            json,
+            progress_jsonl,
+            no_chunk_summaries,
+            retrieval_primary,
+            enable_dense,
+            disable_dense,
+            dense_fallback,
+            no_dense_fallback,
+        } => {
+            let retrieval_config = resolve_retrieval_config(
+                retrieval_primary,
+                enable_dense,
+                disable_dense,
+                dense_fallback,
+                no_dense_fallback,
+            )?;
+            let db = resolve_db_path(db, Some(&repo_root))?;
+            ensure_matryoshka_layout(&db)?;
+            let api = Matryoshka::new(
+                MatryoshkaConfig::new(&repo_root)
+                    .with_db(&db)
+                    .with_endpoint(&base_url, &api_key)
+                    .with_models(&chat_model, &embed_model)
+                    .with_retrieval_config(retrieval_config)
+                    .with_llm_enrichment_enabled(true)
+                    .with_chunk_summary_enabled(!no_chunk_summaries)
+                    .with_chunk_summary_model(&chunk_summary_model)
+                    .with_chunk_summary_concurrency(chunk_summary_concurrency),
+            );
+            if status {
+                let report = api.enrichment_status()?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&report)?);
+                } else {
+                    print_enrichment_status(&report);
+                }
+                return Ok(());
+            }
+
+            let summary = api.enrich_once_with_progress(
+                ApiEnrichmentOptions {
+                    max_files,
+                    write_progress_state: true,
+                },
+                |event| {
+                    if progress_jsonl {
+                        match serde_json::to_string(&event) {
+                            Ok(line) => println!("{line}"),
+                            Err(err) => println!(
+                                "{}",
+                                json!({
+                                    "event": "progress_serialization_failed",
+                                    "message": err.to_string(),
+                                })
+                            ),
+                        }
+                    }
+                },
+            )?;
+            if !progress_jsonl {
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&enrichment_summary_json(&summary))?
+                    );
+                } else {
+                    print_enrichment_summary(&summary);
+                }
+            }
+        }
         Command::Cards {
             db,
             summaries: _,
@@ -1357,6 +1485,7 @@ struct PrepareOptions {
     chunk_summary_model: String,
     chunk_summary_concurrency: usize,
     no_chunk_summaries: bool,
+    enrich_now: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -1376,6 +1505,7 @@ struct PrepareSummary {
     changed_folders: usize,
     repo_card_updated: bool,
     artifact_quality: ArtifactQualityReport,
+    enrichment: EnrichmentReadinessReport,
     retrieval_index: RetrievalIndexReport,
     prewarm: SearchPrewarmSummary,
     embedding_model: String,
@@ -1389,6 +1519,7 @@ fn run_prepare_via_api(options: PrepareOptions, progress_jsonl: bool) -> Result<
         .with_ignored_paths(options.ignore.clone())
         .with_late_interaction(options.late_interaction)
         .with_retrieval_config(options.retrieval_config)
+        .with_llm_enrichment_enabled(options.enrich_now)
         .with_chunk_summary_enabled(!options.no_chunk_summaries)
         .with_chunk_summary_model(&options.chunk_summary_model)
         .with_chunk_summary_concurrency(options.chunk_summary_concurrency);
@@ -1434,6 +1565,7 @@ fn prepare_summary_from_api(summary: ApiPrepareSummary) -> PrepareSummary {
         changed_folders: summary.changed_folders,
         repo_card_updated: summary.repo_card_updated,
         artifact_quality: summary.artifact_quality,
+        enrichment: summary.enrichment,
         retrieval_index: summary.retrieval_index,
         prewarm: SearchPrewarmSummary {
             fts_record_count: summary.prewarm.fts_record_count,
@@ -2141,24 +2273,6 @@ fn ensure_cli_prepare_ready(
     }
 
     let store = MatryoshkaStore::open(db)?;
-    let empty_cards = store
-        .load_active_card_summaries()?
-        .into_iter()
-        .filter(|row| row.is_empty)
-        .collect::<Vec<_>>();
-    if !empty_cards.is_empty() {
-        let samples = empty_cards
-            .iter()
-            .take(8)
-            .map(|row| format!("{}:{}", row.card_type, row.id))
-            .collect::<Vec<_>>()
-            .join(", ");
-        anyhow::bail!(
-            "Matryoshka prepare is not ready: {} active card summaries are empty ({samples}); run prepare again{}",
-            empty_cards.len(),
-            prepare_state_error_hint(db)
-        );
-    }
 
     let stats = store.retrieval_index_stats()?;
     let report = RetrievalIndexReport {
@@ -2399,6 +2513,7 @@ fn print_prepare_summary(summary: &PrepareSummary) {
             "needs_refresh"
         }
     );
+    println!("enrichment: {:?}", summary.enrichment.status);
     println!("files: {}", summary.file_count);
     println!("folders: {}", summary.folder_count);
     println!("symbols: {}", summary.symbol_count);
@@ -2414,6 +2529,52 @@ fn print_prepare_summary(summary: &PrepareSummary) {
     println!("db: {}", summary.db.display());
     println!("ready_marker: {}", summary.ready_marker.display());
     println!("logs: {}", summary.logs_dir.display());
+}
+
+fn print_enrichment_status(report: &EnrichmentReadinessReport) {
+    println!("enrichment: {:?}", report.status);
+    println!("files: {}/{}", report.file_cards_ready, report.files_total);
+    println!(
+        "folders: {}/{}",
+        report.folder_cards_ready, report.folders_total
+    );
+    println!("chunks: {}/{}", report.chunks_ready, report.chunks_total);
+    println!("repo_card_ready: {}", report.repo_card_ready);
+    println!("pending_total: {}", report.pending_total());
+    println!("stale_file_cards: {}", report.file_cards_stale);
+    if !report.pending_files_sample.is_empty() {
+        println!(
+            "pending_files_sample: {}",
+            report.pending_files_sample.join(", ")
+        );
+    }
+    if !report.pending_folders_sample.is_empty() {
+        println!(
+            "pending_folders_sample: {}",
+            report.pending_folders_sample.join(", ")
+        );
+    }
+    if !report.pending_chunks_sample.is_empty() {
+        println!(
+            "pending_chunks_sample: {}",
+            report.pending_chunks_sample.join(", ")
+        );
+    }
+}
+
+fn print_enrichment_summary(summary: &EnrichmentSummary) {
+    println!("enrichment_batch: complete");
+    println!("selected_files: {}", summary.selected_files);
+    println!("selected_folders: {}", summary.selected_folders);
+    println!("repo_card_updated: {}", summary.repo_card_updated);
+    println!("before_status: {:?}", summary.before.status);
+    println!("after_status: {:?}", summary.after.status);
+    println!("before_pending: {}", summary.before.pending_total());
+    println!("after_pending: {}", summary.after.pending_total());
+    println!("semantic_records: {}", summary.semantic_record_count);
+    print_artifact_quality(&summary.artifact_quality);
+    print_retrieval_index(&summary.retrieval_index);
+    println!("embedding_model: {}", summary.embedding_model);
 }
 
 fn print_index_summary(summary: IndexSummary) {
@@ -2591,6 +2752,7 @@ fn prepare_summary_json(summary: &PrepareSummary) -> serde_json::Value {
                 "empty_folder_samples": summary.artifact_quality.empty_folder_summary_samples,
             },
         },
+        "enrichment": &summary.enrichment,
         "search": {
             "status": if retrieval_is_ready(&summary.retrieval_index) {
                 "ready"
@@ -2657,4 +2819,26 @@ fn semantic_rebuild_summary_json(summary: &SemanticRebuildSummary) -> serde_json
         "retrieval_index": &summary.retrieval_index,
         "embedding_model": summary.embedding_model,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prepare_enrich_now_flag_is_explicit_and_defaults_off() {
+        let default_args = Args::try_parse_from(["matryoshka-rs", "prepare", "/tmp/repo"]).unwrap();
+        match default_args.command {
+            Command::Prepare { enrich_now, .. } => assert!(!enrich_now),
+            _ => panic!("expected prepare command"),
+        }
+
+        let enriched_args =
+            Args::try_parse_from(["matryoshka-rs", "prepare", "/tmp/repo", "--enrich-now"])
+                .unwrap();
+        match enriched_args.command {
+            Command::Prepare { enrich_now, .. } => assert!(enrich_now),
+            _ => panic!("expected prepare command"),
+        }
+    }
 }

@@ -1,9 +1,9 @@
 use anyhow::Result;
 use matryoshka_core_ir::{
-    ArtifactQualityReport, ChunkSummarySource, CodeChunkFact, FileCard, FileEnrichmentContext,
-    FileFact, FolderCard, FolderEnrichmentContext, ImportContext, LateInteractionVector,
-    MatryoshkaProgressEvent, RelatedFileContext, RepoCard, RepositorySnapshot, RetrievalConfig,
-    RetrievalIndexReport, SemanticEntityType, SemanticRecord,
+    ArtifactQualityReport, ChunkSummarySource, CodeChunkFact, EnrichmentReadinessReport, FileCard,
+    FileEnrichmentContext, FileFact, FolderCard, FolderEnrichmentContext, ImportContext,
+    LateInteractionVector, MatryoshkaProgressEvent, RelatedFileContext, RepoCard,
+    RepositorySnapshot, RetrievalConfig, RetrievalIndexReport, SemanticEntityType, SemanticRecord,
 };
 use matryoshka_embed_client::Embedder;
 use matryoshka_enricher::{ChunkSummarizer, CodeEnricher};
@@ -25,6 +25,19 @@ pub struct FullIndexer<E, M, S> {
     parser_config: ParserConfig,
     chunk_summary_enabled: bool,
     retrieval_config: RetrievalConfig,
+    artifact_mode: ArtifactRefreshMode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArtifactRefreshMode {
+    CoreSearchable,
+    Enriched,
+}
+
+impl ArtifactRefreshMode {
+    fn enriches_llm(self) -> bool {
+        matches!(self, Self::Enriched)
+    }
 }
 
 impl<E, M, S> FullIndexer<E, M, S>
@@ -42,6 +55,7 @@ where
             parser_config: ParserConfig::default(),
             chunk_summary_enabled: true,
             retrieval_config: RetrievalConfig::default(),
+            artifact_mode: ArtifactRefreshMode::Enriched,
         }
     }
 
@@ -57,6 +71,11 @@ where
 
     pub fn with_retrieval_config(mut self, config: RetrievalConfig) -> Self {
         self.retrieval_config = config;
+        self
+    }
+
+    pub fn with_artifact_mode(mut self, mode: ArtifactRefreshMode) -> Self {
+        self.artifact_mode = mode;
         self
     }
 
@@ -181,7 +200,7 @@ where
         let delta = compute_delta(&old_snapshot, &new_snapshot);
 
         if delta.is_noop() {
-            let repair = match artifact_repair_set(&self.store, &new_snapshot) {
+            let repair = match self.repair_set(&new_snapshot) {
                 Ok(repair) => repair,
                 Err(err) => return fail_with_progress("checking_artifacts", err, &mut progress),
             };
@@ -303,6 +322,90 @@ where
         Ok(summary)
     }
 
+    pub fn enrichment_status(
+        &self,
+        repo_root: impl AsRef<Path>,
+    ) -> Result<EnrichmentReadinessReport> {
+        let repo_root = repo_root.as_ref().to_string_lossy().to_string();
+        self.store.enrichment_readiness_report(&repo_root)
+    }
+
+    pub fn enrich_once(
+        &self,
+        repo_root: impl AsRef<Path>,
+        options: EnrichmentBatchOptions,
+    ) -> Result<EnrichmentBatchSummary> {
+        self.enrich_once_with_progress(repo_root, options, |_| {})
+    }
+
+    pub fn enrich_once_with_progress(
+        &self,
+        repo_root: impl AsRef<Path>,
+        options: EnrichmentBatchOptions,
+        mut progress: impl FnMut(MatryoshkaProgressEvent),
+    ) -> Result<EnrichmentBatchSummary> {
+        let repo_root = repo_root.as_ref();
+        progress(MatryoshkaProgressEvent::Started { total_steps: None });
+        let snapshot = match load_snapshot(&self.store, repo_root) {
+            Ok(snapshot) => snapshot,
+            Err(err) => return fail_with_progress("loading_snapshot", err, &mut progress),
+        };
+        if snapshot.files.is_empty() {
+            return fail_with_progress(
+                "enrich",
+                anyhow::anyhow!("no indexed files found in store; run prepare first"),
+                &mut progress,
+            );
+        }
+
+        let before = self
+            .store
+            .enrichment_readiness_report(&snapshot.repo_root)?;
+        let targets =
+            match enrichment_batch_targets(&self.store, &snapshot, options.max_files.max(1)) {
+                Ok(targets) => targets,
+                Err(err) => {
+                    return fail_with_progress("selecting_enrichment_batch", err, &mut progress);
+                }
+            };
+
+        let artifacts = if targets.is_empty() {
+            self.current_index_diagnostics(&snapshot.repo_root, &mut progress)?
+        } else {
+            self.refresh_artifacts(
+                &snapshot,
+                &targets.affected_file_ids,
+                &targets.affected_folder_ids,
+                targets.repo_card_stale,
+                BTreeSet::new(),
+                BTreeSet::new(),
+                &mut progress,
+            )?
+        };
+        let after = self
+            .store
+            .enrichment_readiness_report(&snapshot.repo_root)?;
+        let summary = EnrichmentBatchSummary {
+            before,
+            after,
+            selected_files: targets.affected_file_ids.len(),
+            selected_folders: targets.affected_folder_ids.len(),
+            repo_card_updated: targets.repo_card_stale,
+            semantic_record_count: artifacts.semantic_record_count,
+            artifact_quality: artifacts.artifact_quality,
+            retrieval_index: artifacts.retrieval_index,
+            embedding_model: self.embedder.model().into(),
+        };
+        progress(MatryoshkaProgressEvent::Completed {
+            file_count: snapshot.files.len(),
+            folder_count: snapshot.folders.len(),
+            symbol_count: snapshot.symbols.len(),
+            semantic_record_count: summary.semantic_record_count,
+            embedding_model: summary.embedding_model.clone(),
+        });
+        Ok(summary)
+    }
+
     pub fn rebuild_semantic_index(
         &self,
         repo_root: impl AsRef<Path>,
@@ -346,6 +449,7 @@ where
         };
 
         let mut raw_records = raw_semantic_records(&snapshot);
+        raw_records.extend(code_chunk_semantic_records(&snapshot.code_chunks));
         let mut card_records =
             card_semantic_records(&file_cards, &folder_cards, repo_card.as_ref());
 
@@ -353,7 +457,9 @@ where
             let raw_batches = selected_batch_count(&raw_records, |record| {
                 matches!(
                     record.entity_type,
-                    SemanticEntityType::Snippet | SemanticEntityType::Symbol
+                    SemanticEntityType::Snippet
+                        | SemanticEntityType::Symbol
+                        | SemanticEntityType::CodeChunk
                 )
             });
             let card_batches = selected_batch_count(&card_records, |_| true);
@@ -365,7 +471,9 @@ where
                 |record| {
                     matches!(
                         record.entity_type,
-                        SemanticEntityType::Snippet | SemanticEntityType::Symbol
+                        SemanticEntityType::Snippet
+                            | SemanticEntityType::Symbol
+                            | SemanticEntityType::CodeChunk
                     )
                 },
                 Some(&mut progress),
@@ -493,6 +601,30 @@ pub struct SemanticRebuildSummary {
     pub embedding_model: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EnrichmentBatchOptions {
+    pub max_files: usize,
+}
+
+impl Default for EnrichmentBatchOptions {
+    fn default() -> Self {
+        Self { max_files: 1 }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct EnrichmentBatchSummary {
+    pub before: EnrichmentReadinessReport,
+    pub after: EnrichmentReadinessReport,
+    pub selected_files: usize,
+    pub selected_folders: usize,
+    pub repo_card_updated: bool,
+    pub semantic_record_count: usize,
+    pub artifact_quality: ArtifactQualityReport,
+    pub retrieval_index: RetrievalIndexReport,
+    pub embedding_model: String,
+}
+
 #[derive(Debug, Clone)]
 struct ArtifactRefreshReport {
     semantic_record_count: usize,
@@ -546,6 +678,21 @@ impl ArtifactRepairSet {
     fn repair_folder(&mut self, folder_id: impl Into<String>) {
         self.affected_folder_ids.insert(folder_id.into());
         self.repo_card_stale = true;
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct EnrichmentBatchTargets {
+    affected_file_ids: BTreeSet<String>,
+    affected_folder_ids: BTreeSet<String>,
+    repo_card_stale: bool,
+}
+
+impl EnrichmentBatchTargets {
+    fn is_empty(&self) -> bool {
+        self.affected_file_ids.is_empty()
+            && self.affected_folder_ids.is_empty()
+            && !self.repo_card_stale
     }
 }
 
@@ -915,6 +1062,22 @@ fn folder_card_needs_quality_repair(card: &FolderCard) -> bool {
 
 fn repo_card_needs_quality_repair(card: &RepoCard) -> bool {
     !has_useful_summary(&card.summary)
+}
+
+fn derived_semantic_record_current(
+    records: &BTreeMap<String, SemanticRecord>,
+    record_id: &str,
+    source_hash: &str,
+    summary: &str,
+) -> bool {
+    let Some(record) = records.get(record_id) else {
+        return false;
+    };
+    if record.source_hash != source_hash {
+        return false;
+    }
+    let summary = summary.trim();
+    summary.is_empty() || record.content.contains(summary)
 }
 
 #[derive(Debug)]
@@ -1366,12 +1529,168 @@ fn artifact_repair_set(
     Ok(repair)
 }
 
+fn core_search_repair_set(
+    store: &MatryoshkaStore,
+    snapshot: &RepositorySnapshot,
+) -> Result<ArtifactRepairSet> {
+    let mut repair = ArtifactRepairSet::default();
+    let files_by_path = snapshot
+        .files
+        .iter()
+        .map(|file| (file.path.as_str(), file))
+        .collect::<BTreeMap<_, _>>();
+    let semantic_records = store.load_all_semantic_records()?;
+    let semantic_record_ids = semantic_records
+        .iter()
+        .map(|record| record.record_id.as_str())
+        .collect::<BTreeSet<_>>();
+
+    let mut expected_records = raw_semantic_records(snapshot);
+    expected_records.extend(code_chunk_semantic_records(&snapshot.code_chunks));
+    for record in expected_records {
+        if semantic_record_ids.contains(record.record_id.as_str()) {
+            continue;
+        }
+        if let Some(file) = files_by_path.get(record.path.as_str()) {
+            repair.repair_file(file);
+        }
+    }
+
+    Ok(repair)
+}
+
+fn enrichment_batch_targets(
+    store: &MatryoshkaStore,
+    snapshot: &RepositorySnapshot,
+    max_files: usize,
+) -> Result<EnrichmentBatchTargets> {
+    let mut targets = EnrichmentBatchTargets::default();
+    let files_by_id = snapshot
+        .files
+        .iter()
+        .map(|file| (file.file_id.as_str(), file))
+        .collect::<BTreeMap<_, _>>();
+    let file_cards = store
+        .load_active_file_cards()?
+        .into_iter()
+        .map(|card| (card.file_id.clone(), card))
+        .collect::<BTreeMap<_, _>>();
+    let folder_cards = store
+        .load_active_folder_cards()?
+        .into_iter()
+        .map(|card| (card.folder_id.clone(), card))
+        .collect::<BTreeMap<_, _>>();
+    let chunks = store.load_all_code_chunks()?;
+    let semantic_records = store
+        .load_all_semantic_records()?
+        .into_iter()
+        .map(|record| (record.record_id.clone(), record))
+        .collect::<BTreeMap<_, _>>();
+
+    for file in &snapshot.files {
+        if targets.affected_file_ids.len() >= max_files {
+            break;
+        }
+        match file_cards.get(&file.file_id) {
+            Some(card)
+                if card.provenance.source_hash == file.source_hash
+                    && !file_card_needs_quality_repair(card)
+                    && derived_semantic_record_current(
+                        &semantic_records,
+                        &format!("semantic:file_card:{}", file.file_id),
+                        &file.source_hash,
+                        &card.summary,
+                    ) => {}
+            _ => {
+                targets.affected_file_ids.insert(file.file_id.clone());
+                targets
+                    .affected_folder_ids
+                    .insert(file.parent_folder_id.clone());
+            }
+        }
+    }
+
+    if targets.affected_file_ids.len() < max_files {
+        for chunk in &chunks {
+            if targets.affected_file_ids.len() >= max_files {
+                break;
+            }
+            if chunk.summary_source != ChunkSummarySource::Empty
+                && has_useful_summary(&chunk.summary)
+                && derived_semantic_record_current(
+                    &semantic_records,
+                    &format!("semantic:code_chunk:{}", chunk.chunk_id),
+                    &chunk.source_hash,
+                    &chunk.summary,
+                )
+            {
+                continue;
+            }
+            if let Some(file) = files_by_id.get(chunk.file_id.as_str()) {
+                targets.affected_file_ids.insert(file.file_id.clone());
+                targets
+                    .affected_folder_ids
+                    .insert(file.parent_folder_id.clone());
+            }
+        }
+    }
+
+    if targets.affected_file_ids.is_empty() {
+        for folder in &snapshot.folders {
+            match folder_cards.get(&folder.folder_id) {
+                Some(card)
+                    if !folder_card_needs_quality_repair(card)
+                        && derived_semantic_record_current(
+                            &semantic_records,
+                            &format!("semantic:folder_card:{}", folder.folder_id),
+                            &card.provenance.source_hash,
+                            &card.summary,
+                        ) => {}
+                _ => {
+                    targets.affected_folder_ids.insert(folder.folder_id.clone());
+                    break;
+                }
+            }
+        }
+    }
+
+    let repo_card = store.load_repo_card(&snapshot.repo_root)?;
+    let repo_needs_repair = repo_card
+        .as_ref()
+        .map(|card| {
+            repo_card_needs_quality_repair(card)
+                || !derived_semantic_record_current(
+                    &semantic_records,
+                    &format!("semantic:repo_card:{}", card.repo_root),
+                    &card.provenance.source_hash,
+                    &card.summary,
+                )
+        })
+        .unwrap_or(true);
+    targets.repo_card_stale = repo_needs_repair
+        && (!targets.affected_file_ids.is_empty()
+            || !targets.affected_folder_ids.is_empty()
+            || snapshot
+                .folders
+                .iter()
+                .all(|folder| folder_cards.contains_key(&folder.folder_id)));
+
+    Ok(targets)
+}
+
 impl<E, M, S> FullIndexer<E, M, S>
 where
     E: CodeEnricher + Sync,
     M: Embedder + Sync,
     S: ChunkSummarizer + Sync,
 {
+    fn repair_set(&self, snapshot: &RepositorySnapshot) -> Result<ArtifactRepairSet> {
+        match self.artifact_mode {
+            ArtifactRefreshMode::CoreSearchable => core_search_repair_set(&self.store, snapshot),
+            ArtifactRefreshMode::Enriched => artifact_repair_set(&self.store, snapshot),
+        }
+    }
+
     fn refresh_artifacts(
         &self,
         snapshot: &RepositorySnapshot,
@@ -1385,120 +1704,154 @@ where
         if let Err(err) = self.store.prune_orphaned_artifacts() {
             return fail_with_progress("pruning_orphaned_artifacts", err, progress);
         }
-        let file_contexts = build_file_contexts(snapshot);
-        let folder_contexts = build_folder_contexts(snapshot);
-        let enrichment_pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(enrichment_concurrency())
-            .build()
-            .map_err(anyhow::Error::from)?;
+        let (file_cards, folder_cards, repo_card) = if self.artifact_mode.enriches_llm() {
+            let file_contexts = build_file_contexts(snapshot);
+            let folder_contexts = build_folder_contexts(snapshot);
+            let enrichment_pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(enrichment_concurrency())
+                .build()
+                .map_err(anyhow::Error::from)?;
 
-        let file_cards = match self.collect_file_cards_with_progress(
-            snapshot,
-            affected_file_ids,
-            &file_contexts,
-            &enrichment_pool,
-            progress,
-        ) {
-            Ok(cards) => cards,
-            Err(err) => return fail_with_progress("enriching_file_cards", err, progress),
-        };
-
-        progress(MatryoshkaProgressEvent::WritingDatabase {
-            records_written: Some(file_cards.len()),
-        });
-        for card in &file_cards {
-            if let Err(err) = self.store.upsert_file_card(card) {
-                return fail_with_progress("writing_database", err, progress);
-            }
-        }
-
-        let folder_cards = match self.collect_folder_cards_bottom_up(
-            snapshot,
-            affected_folder_ids,
-            &file_cards,
-            &folder_contexts,
-            &enrichment_pool,
-        ) {
-            Ok(cards) => cards,
-            Err(err) => return fail_with_progress("enriching_folder_cards", err, progress),
-        };
-
-        progress(MatryoshkaProgressEvent::WritingDatabase {
-            records_written: Some(folder_cards.len()),
-        });
-        for card in &folder_cards {
-            if let Err(err) = self.store.upsert_folder_card(card) {
-                return fail_with_progress("writing_database", err, progress);
-            }
-        }
-
-        if !removed_file_ids.is_empty() {
-            if let Err(err) = self
-                .store
-                .delete_file_cards(&removed_file_ids.into_iter().collect::<Vec<_>>())
-            {
-                return fail_with_progress("writing_database", err, progress);
-            }
-        }
-        if !removed_folder_ids.is_empty() {
-            if let Err(err) = self
-                .store
-                .delete_folder_cards(&removed_folder_ids.into_iter().collect::<Vec<_>>())
-            {
-                return fail_with_progress("writing_database", err, progress);
-            }
-        }
-
-        let repo_card = if repo_card_stale {
-            let all_folder_cards = snapshot
-                .folders
-                .iter()
-                .map(|folder| {
-                    folder_cards
-                        .iter()
-                        .find(|card| card.folder_id == folder.folder_id)
-                        .cloned()
-                        .or_else(|| {
-                            self.store
-                                .load_folder_card(&folder.folder_id)
-                                .ok()
-                                .flatten()
-                        })
-                        .unwrap_or_else(|| FolderCard {
-                            folder_id: folder.folder_id.clone(),
-                            summary: String::new(),
-                            responsibility: String::new(),
-                            behavior_intents: Vec::new(),
-                            edit_intents: Vec::new(),
-                            retrieval_tags: Vec::new(),
-                            contains_kinds_of_files: Vec::new(),
-                            incoming_dependencies_meaning: Vec::new(),
-                            outgoing_dependencies_meaning: Vec::new(),
-                            key_entrypoints: Vec::new(),
-                            common_behaviors: Vec::new(),
-                            subareas: Vec::new(),
-                            agent_guidance: Vec::new(),
-                            search_phrases: Vec::new(),
-                            provenance: matryoshka_core_ir::Provenance::source_only(""),
-                        })
-                })
-                .collect::<Vec<_>>();
-            let repo_card = match self
-                .enricher
-                .enrich_repo(&snapshot.repo_root, &all_folder_cards)
-            {
-                Ok(card) => card,
-                Err(err) => return fail_with_progress("enriching_repo_card", err, progress),
+            let file_cards = match self.collect_file_cards_with_progress(
+                snapshot,
+                affected_file_ids,
+                &file_contexts,
+                &enrichment_pool,
+                progress,
+            ) {
+                Ok(cards) => cards,
+                Err(err) => return fail_with_progress("enriching_file_cards", err, progress),
             };
+
             progress(MatryoshkaProgressEvent::WritingDatabase {
-                records_written: Some(1),
+                records_written: Some(file_cards.len()),
             });
-            if let Err(err) = self.store.upsert_repo_card(&repo_card) {
-                return fail_with_progress("writing_database", err, progress);
+            for card in &file_cards {
+                if let Err(err) = self.store.upsert_file_card(card) {
+                    return fail_with_progress("writing_database", err, progress);
+                }
             }
-            Some(repo_card)
+
+            let folder_cards = match self.collect_folder_cards_bottom_up(
+                snapshot,
+                affected_folder_ids,
+                &file_cards,
+                &folder_contexts,
+                &enrichment_pool,
+            ) {
+                Ok(cards) => cards,
+                Err(err) => return fail_with_progress("enriching_folder_cards", err, progress),
+            };
+
+            progress(MatryoshkaProgressEvent::WritingDatabase {
+                records_written: Some(folder_cards.len()),
+            });
+            for card in &folder_cards {
+                if let Err(err) = self.store.upsert_folder_card(card) {
+                    return fail_with_progress("writing_database", err, progress);
+                }
+            }
+
+            if !removed_file_ids.is_empty() {
+                if let Err(err) = self
+                    .store
+                    .delete_file_cards(&removed_file_ids.into_iter().collect::<Vec<_>>())
+                {
+                    return fail_with_progress("writing_database", err, progress);
+                }
+            }
+            if !removed_folder_ids.is_empty() {
+                if let Err(err) = self
+                    .store
+                    .delete_folder_cards(&removed_folder_ids.into_iter().collect::<Vec<_>>())
+                {
+                    return fail_with_progress("writing_database", err, progress);
+                }
+            }
+
+            let repo_card = if repo_card_stale {
+                let all_folder_cards = snapshot
+                    .folders
+                    .iter()
+                    .map(|folder| {
+                        folder_cards
+                            .iter()
+                            .find(|card| card.folder_id == folder.folder_id)
+                            .cloned()
+                            .or_else(|| {
+                                self.store
+                                    .load_folder_card(&folder.folder_id)
+                                    .ok()
+                                    .flatten()
+                            })
+                            .unwrap_or_else(|| FolderCard {
+                                folder_id: folder.folder_id.clone(),
+                                summary: String::new(),
+                                responsibility: String::new(),
+                                behavior_intents: Vec::new(),
+                                edit_intents: Vec::new(),
+                                retrieval_tags: Vec::new(),
+                                contains_kinds_of_files: Vec::new(),
+                                incoming_dependencies_meaning: Vec::new(),
+                                outgoing_dependencies_meaning: Vec::new(),
+                                key_entrypoints: Vec::new(),
+                                common_behaviors: Vec::new(),
+                                subareas: Vec::new(),
+                                agent_guidance: Vec::new(),
+                                search_phrases: Vec::new(),
+                                provenance: matryoshka_core_ir::Provenance::source_only(""),
+                            })
+                    })
+                    .collect::<Vec<_>>();
+                let repo_card = match self
+                    .enricher
+                    .enrich_repo(&snapshot.repo_root, &all_folder_cards)
+                {
+                    Ok(card) => card,
+                    Err(err) => return fail_with_progress("enriching_repo_card", err, progress),
+                };
+                progress(MatryoshkaProgressEvent::WritingDatabase {
+                    records_written: Some(1),
+                });
+                if let Err(err) = self.store.upsert_repo_card(&repo_card) {
+                    return fail_with_progress("writing_database", err, progress);
+                }
+                Some(repo_card)
+            } else {
+                None
+            };
+
+            (file_cards, folder_cards, repo_card)
         } else {
-            None
+            let file_cards_to_delete = removed_file_ids
+                .into_iter()
+                .chain(affected_file_ids.iter().cloned())
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>();
+            if !file_cards_to_delete.is_empty() {
+                if let Err(err) = self.store.delete_file_cards(&file_cards_to_delete) {
+                    return fail_with_progress("writing_database", err, progress);
+                }
+            }
+            let folder_cards_to_delete = removed_folder_ids
+                .into_iter()
+                .chain(affected_folder_ids.iter().cloned())
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>();
+            if !folder_cards_to_delete.is_empty() {
+                if let Err(err) = self.store.delete_folder_cards(&folder_cards_to_delete) {
+                    return fail_with_progress("writing_database", err, progress);
+                }
+            }
+            if repo_card_stale {
+                if let Err(err) = self.store.delete_repo_card(&snapshot.repo_root) {
+                    return fail_with_progress("writing_database", err, progress);
+                }
+            }
+
+            (Vec::new(), Vec::new(), None)
         };
 
         // ---- Milestone 2: summarize code chunks that have no useful doc ----
@@ -1921,7 +2274,10 @@ where
             if let Err(err) = self.store.upsert_code_chunks(&merged_chunks) {
                 return fail_with_progress("writing_code_chunks", err, progress);
             }
-            return Ok(Vec::new());
+            return Ok(selected_code_chunk_semantic_records(
+                &merged_chunks,
+                affected_file_ids,
+            ));
         }
 
         // Collect chunks that need summarization: affected files + Empty source.
@@ -2006,8 +2362,11 @@ where
             });
         }
 
-        // Build semantic records for ALL non-empty chunks (docs + generated).
-        Ok(code_chunk_semantic_records(&updated_chunks))
+        // Build semantic records for affected chunks (docs, generated, or raw code).
+        Ok(selected_code_chunk_semantic_records(
+            &updated_chunks,
+            affected_file_ids,
+        ))
     }
 }
 
@@ -2115,7 +2474,11 @@ fn card_semantic_records(
 fn code_chunk_semantic_records(chunks: &[CodeChunkFact]) -> Vec<SemanticRecord> {
     chunks
         .iter()
-        .filter(|chunk| !chunk.summary.is_empty())
+        .filter(|chunk| {
+            !chunk.summary.trim().is_empty()
+                || !chunk.signature.trim().is_empty()
+                || !chunk.code.trim().is_empty()
+        })
         .map(|chunk| {
             let symbol = chunk
                 .qualified_name
@@ -2125,7 +2488,12 @@ fn code_chunk_semantic_records(chunks: &[CodeChunkFact]) -> Vec<SemanticRecord> 
             let kind = format!("{:?}", chunk.kind).to_ascii_lowercase();
             let content = format!(
                 "path: {}\nsymbol: {}\nkind: {}\nsignature: {}\nsummary: {}\ncode:\n{}",
-                chunk.path, symbol, kind, chunk.signature, chunk.summary, chunk.code
+                chunk.path,
+                symbol,
+                kind,
+                chunk.signature,
+                chunk.summary.trim(),
+                chunk.code
             );
             let title = format!("CodeChunk {} in {}", symbol, chunk.path);
             let record_id = format!("semantic:code_chunk:{}", chunk.chunk_id);
@@ -2213,6 +2581,21 @@ fn selected_embedded_raw_records(
         })
         .cloned()
         .collect()
+}
+
+fn selected_code_chunk_semantic_records(
+    chunks: &[CodeChunkFact],
+    affected_file_ids: &BTreeSet<String>,
+) -> Vec<SemanticRecord> {
+    if affected_file_ids.is_empty() {
+        return code_chunk_semantic_records(chunks);
+    }
+    let selected_chunks = chunks
+        .iter()
+        .filter(|chunk| affected_file_ids.contains(&chunk.file_id))
+        .cloned()
+        .collect::<Vec<_>>();
+    code_chunk_semantic_records(&selected_chunks)
 }
 
 fn build_file_contexts(

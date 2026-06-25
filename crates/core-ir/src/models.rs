@@ -544,6 +544,60 @@ pub struct ArtifactQualityReport {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
+pub enum EnrichmentReadinessStatus {
+    Ready,
+    Partial,
+    #[default]
+    Pending,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct EnrichmentReadinessReport {
+    pub status: EnrichmentReadinessStatus,
+    pub files_total: usize,
+    pub file_cards_ready: usize,
+    pub file_cards_pending: usize,
+    pub file_cards_stale: usize,
+    pub folders_total: usize,
+    pub folder_cards_ready: usize,
+    pub folder_cards_pending: usize,
+    pub chunks_total: usize,
+    pub chunks_ready: usize,
+    pub chunks_pending: usize,
+    pub derived_semantic_records_ready: usize,
+    pub derived_semantic_records_pending: usize,
+    pub derived_semantic_records_stale: usize,
+    pub repo_card_ready: bool,
+    pub repo_card_pending: bool,
+    pub pending_files_sample: Vec<String>,
+    pub pending_folders_sample: Vec<String>,
+    pub pending_chunks_sample: Vec<String>,
+}
+
+impl EnrichmentReadinessReport {
+    pub fn pending_total(&self) -> usize {
+        self.file_cards_pending
+            + self.folder_cards_pending
+            + self.chunks_pending
+            + self.derived_semantic_records_pending
+            + usize::from(self.repo_card_pending)
+    }
+
+    pub fn ready_total(&self) -> usize {
+        self.file_cards_ready
+            + self.folder_cards_ready
+            + self.chunks_ready
+            + self.derived_semantic_records_ready
+            + usize::from(self.repo_card_ready)
+    }
+
+    pub fn is_ready(&self) -> bool {
+        self.status == EnrichmentReadinessStatus::Ready
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
 pub enum RetrievalPrimary {
     Fts,
     Splade,

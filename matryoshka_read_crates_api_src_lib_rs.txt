@@ -1,0 +1,375 @@
+### Matryoshka Read
+
+#### `crates/api/src/lib.rs`
+
+`rust` · `2251` lines · parent `crates/api/src`
+
+**Summary:** The code handles an API with a Matryoshka-based system, supporting embedding, enriching files, and managing cancellations. It includes methods for embedding data, enriching files, and managing a cancellable token, all integrated with a parser and indexer system.
+
+**Description:** Role: rust source file
+
+### Folder Context
+**Folder:** `crates/api/src`
+
+
+**Summary:** The code is a source folder for an API in crates, handling data embedding, enriching files, and managing cancellations. It includes a representative file with methods for integrating with a parser and indexer system.
+
+**Responsibility:** The code is a source folder for an API in crates, handling data embedding, enriching files, and managing cancellations. It includes a representative file with methods for integrating with a parser and indexer system.
+
+### Imports
+**External**
+anyhow, matryoshka_core_ir, matryoshka_embed_client.Embedder, matryoshka_embed_client.EndpointEmbedder, matryoshka_enricher, matryoshka_indexer, matryoshka_parser.ParserConfig, matryoshka_read_api, matryoshka_search, matryoshka_store_sqlite, serde, serde_json.json, std.ffi.c_int, std.fs, std.io, std.io.Write, std.os.fd.AsRawFd, std.path, std.sync, std.thread, std.time
+
+### Code Chunks
+- `Matryoshka` · Struct · lines `44-46` · summary source `Llm`
+  - Signature: `pub struct Matryoshka`
+  - Summary: A struct representing a Matryoshka, which contains a configuration.
+- `MatryoshkaCancelToken` · Struct · lines `49-51` · summary source `Llm`
+  - Signature: `pub struct MatryoshkaCancelToken`
+  - Summary: A struct representing a cancel token for a Matryoshka operation, storing a boolean indicating if the token has been cancelled.
+- `MatryoshkaCancelToken::new` · Method · lines `54-56` · summary source `Llm`
+  - Signature: `pub fn new() -> Self`
+  - Summary: A method in the crates::api crate that creates a new instance of the MatryoshkaCancelToken type.
+- `MatryoshkaCancelToken::cancel` · Method · lines `58-60` · summary source `Llm`
+  - Signature: `pub fn cancel(&self)`
+  - Summary: The method `cancel` marks the token as being canceled, storing true in `cancelled` field.
+- `MatryoshkaCancelToken::is_cancelled` · Method · lines `62-64` · summary source `Llm`
+  - Signature: `pub fn is_cancelled(&self) -> bool`
+  - Summary: The method 'is_cancelled' checks if the token is cancelled, returning a boolean value. It loads the cancelled flag from the token.
+- `MatryoshkaCancelToken::check` · Method · lines `66-72` · summary source `Llm`
+  - Signature: `fn check(&self) -> Result<()>`
+  - Summary: Checks if the token is cancelled and returns an error if so; otherwise returns a result with no value.
+- `MatryoshkaConfig` · Struct · lines `76-91` · summary source `Llm`
+  - Signature: `pub struct MatryoshkaConfig`
+  - Summary: A struct representing a MatryoshkaConfig configuration for an API, containing parameters like repository root, database path, API key, embedding model, chat model, etc.
+- `MatryoshkaConfig::new` · Method · lines `94-113` · summary source `Llm`
+  - Signature: `pub fn new(repo_root: impl Into<PathBuf>) -> Self`
+  - Summary: A method in crates/api that creates a configuration for a Matryoshka API, using default values for repository, database, base URL, API key, embedding model, chat model, and other parameters.
+- `MatryoshkaConfig::with_db` · Method · lines `115-118` · summary source `Llm`
+  - Signature: `pub fn with_db(mut self, db: impl Into<PathBuf>) -> Self`
+  - Summary: The method `with_db` sets the database path for the `MatryoshkaConfig` instance.
+- `MatryoshkaConfig::with_endpoint` · Method · lines `120-128` · summary source `Llm`
+  - Signature: `pub fn with_endpoint(`
+  - Summary: The method `with_endpoint` sets the base URL and API key in the `MatryoshkaConfig` instance.
+- `MatryoshkaConfig::with_models` · Method · lines `130-138` · summary source `Llm`
+  - Signature: `pub fn with_models(`
+  - Summary: The method `with_models` sets the chat and embedding models in the `MatryoshkaConfig` instance.
+- `MatryoshkaConfig::with_ignored_paths` · Method · lines `140-146` · summary source `Llm`
+  - Signature: `pub fn with_ignored_paths(`
+  - Summary: The method `with_ignored_paths` takes a vector of strings and merges them into a new vector, which is then used to replace the ignored paths in the configuration.
+- `MatryoshkaConfig::with_late_interaction` · Method · lines `148-151` · summary source `Llm`
+  - Signature: `pub fn with_late_interaction(mut self, enabled: bool) -> Self`
+  - Summary: The method `with_late_interaction` sets a late interaction flag for a crate configuration.
+- `MatryoshkaConfig::with_retrieval_primary` · Method · lines `153-156` · summary source `Llm`
+  - Signature: `pub fn with_retrieval_primary(mut self, primary: RetrievalPrimary) -> Self`
+  - Summary: The method `with_retrieval_primary` sets the `retrieval_primary` field of the `MatryoshkaConfig` instance to the provided `primary` value.
+- `MatryoshkaConfig::with_dense_enabled` · Method · lines `158-164` · summary source `Llm`
+  - Signature: `pub fn with_dense_enabled(mut self, enabled: bool) -> Self`
+  - Summary: The method `with_dense_enabled` sets the dense-enabled flag and optionally sets the fallback flag based on the input boolean value.
+- `MatryoshkaConfig::with_dense_fallback_enabled` · Method · lines `166-172` · summary source `Llm`
+  - Signature: `pub fn with_dense_fallback_enabled(mut self, enabled: bool) -> Self`
+  - Summary: The method `with_dense_fallback_enabled` sets the dense fallback enabled flag and sets the dense enabled flag if enabled. It returns the modified `Self` object.
+- `MatryoshkaConfig::with_retrieval_config` · Method · lines `174-179` · summary source `Llm`
+  - Signature: `pub fn with_retrieval_config(mut self, config: RetrievalConfig) -> Self`
+  - Summary: The method `with_retrieval_config` sets up the retrieval configuration for a crate's `MatryoshkaConfig` instance, setting the primary, dense, and fallback enabled flags.
+- `MatryoshkaConfig::retrieval_config` · Method · lines `181-187` · summary source `Llm`
+  - Signature: `pub fn retrieval_config(&self) -> RetrievalConfig`
+  - Summary: The method retrieves a RetrievalConfig object based on the provided parameters (dense_enabled, dense_fallback_enabled, and primary).
+- `MatryoshkaConfig::with_chunk_summary_enabled` · Method · lines `189-192` · summary source `Llm`
+  - Signature: `pub fn with_chunk_summary_enabled(mut self, enabled: bool) -> Self`
+  - Summary: The method sets the chunk summary enabled flag in the configuration, returning a new instance of the configuration.
+- `MatryoshkaConfig::with_chunk_summary_model` · Method · lines `194-197` · summary source `Llm`
+  - Signature: `pub fn with_chunk_summary_model(mut self, model: impl Into<String>) -> Self`
+  - Summary: The method `with_chunk_summary_model` sets the chunk summary model in the `MatryoshkaConfig` instance.
+- `MatryoshkaConfig::with_chunk_summary_concurrency` · Method · lines `199-202` · summary source `Llm`
+  - Signature: `pub fn with_chunk_summary_concurrency(mut self, concurrency: usize) -> Self`
+  - Summary: The method sets the concurrency parameter to the maximum between 1 and the provided value, ensuring a default value of 1 if not specified.
+- `PrepareOptions` · Struct · lines `206-210` · summary source `Llm`
+  - Signature: `pub struct PrepareOptions`
+  - Summary: A struct named PrepareOptions is used to store parameters for a crate's API, including a limit, queries, and write progress state.
+- `PrepareOptions::default` · Method · lines `213-219` · summary source `Llm`
+  - Signature: `fn default() -> Self`
+  - Summary: The method 'PrepareOptions::default' initializes a new instance of PrepareOptions with default parameters: limit 8, queries empty, and write progress state set to true.
+- `SearchOptions` · Struct · lines `223-228` · summary source `Llm`
+  - Signature: `pub struct SearchOptions`
+  - Summary: A struct representing search options with fields for limit, reranker, and granularity.
+- `SearchOptions::with_result_granularity` · Method · lines `231-234` · summary source `Llm`
+  - Signature: `pub fn with_result_granularity(mut self, granularity: SearchResultGranularity) -> Self`
+  - Summary: The method 'with_result_granularity' sets the result granularity for a SearchOptions instance.
+- `SearchOptions::default` · Method · lines `238-244` · summary source `Llm`
+  - Signature: `fn default() -> Self`
+  - Summary: The method `default` of the crate returns a new instance of the SearchOptions struct with default values: limit 8, reranker None, and file granularity.
+- `RerankerOptions` · Enum · lines `249-253` · summary source `Llm`
+  - Signature: `pub enum RerankerOptions`
+  - Summary: The enum RerankerOptions represents options for reranking in a model, with None, Chat, and Omlx variants. None is the default option, Chat uses a model, and Omlx uses a model and a fixed number of candidates.
+- `ReadBundleOptions` · Struct · lines `256-262` · summary source `Llm`
+  - Signature: `pub struct ReadBundleOptions`
+  - Summary: A struct representing options for reading bundles in a crate, including query, limit, related, mode, and search parameters.
+- `ReadBundleOptions::new` · Method · lines `265-273` · summary source `Llm`
+  - Signature: `pub fn new(query: impl Into<String>) -> Self`
+  - Summary: The method `new` of `ReadBundleOptions::new` creates a new instance with default parameters: query set to the input string, limit 4, related 3, mode as brief, and search options as default.
+- `CardsOptions` · Struct · lines `277-279` · summary source `Llm`
+  - Signature: `pub struct CardsOptions`
+  - Summary: A struct representing options for cards in a game, with an empty_only boolean field.
+- `PrepareSummary` · Struct · lines `282-301` · summary source `Llm`
+  - Signature: `pub struct PrepareSummary`
+  - Summary: The code defines a struct called PrepareSummary with various fields representing the state and information about a repository in a crate's API, including status, logs, files, folders, and other metadata.
+- `PrepareSummary::is_ready` · Method · lines `304-306` · summary source `Llm`
+  - Signature: `pub fn is_ready(&self) -> bool`
+  - Summary: The method 'is_ready' checks if the object is in the 'PrepareStatus::Ready' state.
+- `PrepareStatus` · Enum · lines `311-314` · summary source `Llm`
+  - Signature: `pub enum PrepareStatus`
+  - Summary: The enum 'PrepareStatus' represents the status of a crate's preparation, with options 'Ready' and 'NeedsAttention'.
+- `PrepareStatus::as_str` · Method · lines `317-322` · summary source `Llm`
+  - Signature: `pub fn as_str(&self) -> &'static str`
+  - Summary: The method 'PrepareStatus::as_str' returns the string 'ready' for 'Self::Ready' and 'needs_attention' for 'Self::NeedsAttention'.
+- `SearchPrewarmSummaryJson` · Struct · lines `326-330` · summary source `Llm`
+  - Signature: `pub struct SearchPrewarmSummaryJson`
+  - Summary: A struct representing a pre-rewarm summary with fields for the count of FTS records, query counts, and warmed hits.
+- `SearchPrewarmSummaryJson::from` · Method · lines `333-339` · summary source `Llm`
+  - Signature: `fn from(value: SearchPrewarmSummary) -> Self`
+  - Summary: The method `from` takes a `SearchPrewarmSummary` object and returns a new instance of `SearchPrewarmSummaryJson::from` with the count fields populated from the input object.
+- `MatryoshkaEvent` · Enum · lines `344-398` · summary source `Llm`
+  - Signature: `pub enum MatryoshkaEvent`
+  - Summary: The enum 'MatryoshkaEvent' represents events during the matryoshka preparation process, with different states like preparing, waiting for lock, locking, decision, progress, prewarm, etc., each with specific parameters. The events include actions, progress details, and status markers.
+- `ProgressState` · Struct · lines `401-419` · summary source `Llm`
+  - Signature: `pub struct ProgressState`
+  - Summary: A struct representing progress state in a crate, containing various properties like operation, status, phase, message, percent, and timestamps.
+- `ProgressState::new` · Method · lines `422-447` · summary source `Llm`
+  - Signature: `fn new(`
+  - Summary: The method initializes a ProgressState object with parameters like operation, action, status, phase, message, percent, and file information, returning a new instance of ProgressState.
+- `ProgressState::with_file_progress` · Method · lines `449-459` · summary source `Llm`
+  - Signature: `fn with_file_progress(`
+  - Summary: The method `with_file_progress` sets the current file progress, counts done files, and counts total files, returning a new instance of the `InstanceState` with the updated progress.
+- `ProgressState::with_item_progress` · Method · lines `461-471` · summary source `Llm`
+  - Signature: `fn with_item_progress(`
+  - Summary: The method `with_item_progress` sets item progress and label, returning a new instance of the `InstanceState` with updated details.
+- `ProgressState::with_error` · Method · lines `473-477` · summary source `Llm`
+  - Signature: `fn with_error(mut self, stage: impl Into<String>, message: impl Into<String>) -> Self`
+  - Summary: The method `with_error` sets the error stage and last error in the `ProgressState::with_error` instance.
+- `CancellableEnricher` · Struct · lines `480-483` · summary source `Llm`
+  - Signature: `struct CancellableEnricher<E>`
+  - Summary: A struct representing a cancellable enricher for an E type, containing an inner E value and a cancel token.
+- `CancellableEnricher::new` · Method · lines `486-491` · summary source `Llm`
+  - Signature: `fn new(inner: E, cancel_token: MatryoshkaCancelToken) -> Self`
+  - Summary: A method in crates/api that creates a cancellable enricher with an inner E and a MatryoshkaCancelToken.
+- `CancellableEnricher::enrich_file` · Method · lines `498-508` · summary source `Llm`
+  - Signature: `fn enrich_file(`
+  - Summary: The method `CancellableEnricher::enrich_file` checks the cancellation token, enriches a file with symbols and context, and returns a file card if successful.
+- `CancellableEnricher::enrich_folder` · Method · lines `510-523` · summary source `Llm`
+  - Signature: `fn enrich_folder(`
+  - Summary: The method `CancellableEnricher::enrich_folder` checks the cancellation token, enrichs the folder with child files and folders, and returns the enriched folder card.
+- `CancellableEnricher::enrich_repo` · Method · lines `525-530` · summary source `Llm`
+  - Signature: `fn enrich_repo(&self, repo_root: &str, folders: &[FolderCard]) -> Result<RepoCard>`
+  - Summary: The method `CancellableEnricher::enrich_repo` checks the cancellation token, enrichs a repo with folder cards, and returns a RepoCard. It ensures cancellation is checked before and after the enriching process.
+- `CancellableEmbedder` · Struct · lines `533-536` · summary source `Llm`
+  - Signature: `struct CancellableEmbedder<M>`
+  - Summary: A struct representing a cancellable embedder with an inner M and a cancel token.
+- `CancellableEmbedder::new` · Method · lines `539-544` · summary source `Llm`
+  - Signature: `fn new(inner: M, cancel_token: MatryoshkaCancelToken) -> Self`
+  - Summary: A method in crates/api that creates a cancellable embedder with an inner M and a MatryoshkaCancelToken.
+- `CancellableEmbedder::model` · Method · lines `551-553` · summary source `Llm`
+  - Signature: `fn model(&self) -> &str`
+  - Summary: The method 'model' returns a reference to the inner 'model' method of the object.
+- `CancellableEmbedder::embed` · Method · lines `555-560` · summary source `Llm`
+  - Signature: `fn embed(&self, inputs: &[String]) -> Result<Vec<Vec<f32>>>`
+  - Summary: The method `CancellableEmbedder::embed` checks the cancellation token, embeds the input strings into vectors of f32, and returns the resulting vectors.
+- `Matryoshka::new` · Method · lines `564-566` · summary source `Llm`
+  - Signature: `pub fn new(config: MatryoshkaConfig) -> Self`
+  - Summary: A method in the crates::api crate that creates a new Matryoshka object with the given configuration.
+- `Matryoshka::config` · Method · lines `568-570` · summary source `Llm`
+  - Signature: `pub fn config(&self) -> &MatryoshkaConfig`
+  - Summary: The method 'config' returns a reference to the 'MatryoshkaConfig' object.
+- `Matryoshka::prepare` · Method · lines `572-574` · summary source `Llm`
+  - Signature: `pub fn prepare(&self, options: PrepareOptions) -> Result<PrepareSummary>`
+  - Summary: The method `Matryoshka::prepare` takes `PrepareOptions` and returns a `Result` with a `PrepareSummary` summary.
+- `Matryoshka::prepare_with_progress` · Method · lines `576-584` · summary source `Llm`
+  - Signature: `pub fn prepare_with_progress(`
+  - Summary: The method `Matryoshka::prepare_with_progress` is used to prepare a Matryoshka with progress tracking and cancellation. It takes options, a cancel token, and an event handler that processes the event.
+- `Matryoshka::prepare_with_progress_and_cancel` · Method · lines `586-977` · summary source `Llm`
+  - Signature: `pub fn prepare_with_progress_and_cancel(`
+  - Summary: The method prepares a Matryoshka with progress and cancellation, ensuring proper locking and managing events. It initializes progress and logs, checks for cancellation, and completes the process with summary details.
+- `Matryoshka::search` · Method · lines `979-997` · summary source `Llm`
+  - Signature: `pub fn search(&self, query: &str, options: SearchOptions) -> Result<Vec<SearchHit>>`
+  - Summary: The method searches for Matryoshka items using a database, ensuring layout and prepare readiness, and applies a dense and late interaction engine with result granularity options.
+- `Matryoshka::read` · Method · lines `999-1007` · summary source `Llm`
+  - Signature: `pub fn read(&self, file: &str) -> Result<ReadCard>`
+  - Summary: The method reads a Matryoshka from a database, ensuring layout and readiness, and returns a ReadCard object.
+- `Matryoshka::read_bundle` · Method · lines `1009-1044` · summary source `Llm`
+  - Signature: `pub fn read_bundle(&self, options: ReadBundleOptions) -> Result<ReadBundle>`
+  - Summary: The method reads a Matryoshka bundle using a database, prepares the store, searches for hits, and returns the bundle with related files based on the query options.
+- `Matryoshka::cards` · Method · lines `1046-1055` · summary source `Llm`
+  - Signature: `pub fn cards(&self, options: CardsOptions) -> Result<Vec<CardSummaryRow>>`
+  - Summary: The method `cards` of the `Matryoshka::cards` type loads active card summaries from a database, prunes orphaned artifacts, and returns summaries with an option to filter empty rows.
+- `Matryoshka::ensure_prepare_ready_for_reads` · Method · lines `1057-1104` · summary source `Llm`
+  - Signature: `fn ensure_prepare_ready_for_reads(&self) -> Result<()>`
+  - Summary: Ensures Matryoshka is ready for reading by checking if the database contains an empty card summary. If not, it returns an error indicating the prepare is not ready and the database is empty. If the database is empty, it returns an error with the list of empty cards. If the database is not empty, it returns an error with the retrieved data and the prepare is ready.
+- `Matryoshka::run_update_once_with_progress` · Method · lines `1106-1150` · summary source `Llm`
+  - Signature: `fn run_update_once_with_progress(`
+  - Summary: The method runs an update with progress tracking, initializes a store, enricher, embedder, and summarizer, and updates the repository with progress logs and summary results.
+- `Matryoshka::run_rebuild_semantic_once_with_progress` · Method · lines `1152-1199` · summary source `Llm`
+  - Signature: `fn run_rebuild_semantic_once_with_progress(`
+  - Summary: The method starts a semantic rebuild process with progress tracking, initializes a store, and uses a summarizer to build the summary. It checks for cancellation tokens and logs the progress.
+- `Matryoshka::run_prewarm_once` · Method · lines `1201-1251` · summary source `Llm`
+  - Signature: `fn run_prewarm_once(`
+  - Summary: The method runs a prewarm operation with a search index, logs the prewarm start and completion, and returns a summary with search statistics.
+- `AgentTask` · Enum · lines `1256-1264` · summary source `Llm`
+  - Signature: `pub enum AgentTask`
+  - Summary: The enum 'AgentTask' represents different task types in the 'crates/api' crate, including finding a symbol, behavior, editing a target, tracing dependencies, architecture, testing for, and reading next.
+- `search_with_reranker` · Function · lines `1266-1289` · summary source `Llm`
+  - Signature: `fn search_with_reranker<M: matryoshka_embed_client::Embedder + 'static>(`
+  - Summary: The function searches for relevant results using a reranker, which can be a chat model or Omlx model, with different configurations and options to handle the reranking process.
+- `ensure_reranker_options` · Function · lines `1291-1302` · summary source `Llm`
+  - Signature: `fn ensure_reranker_options(reranker: &RerankerOptions) -> Result<()>`
+  - Summary: Ensures that the reranker model is not empty, returning an error if it is. If not, it returns a success.
+- `emit_event` · Function · lines `1304-1314` · summary source `Llm`
+  - Signature: `fn emit_event(`
+  - Summary: Emit event with progress tracking and event handler for progress state.
+- `prepare_decision` · Function · lines `1316-1339` · summary source `Llm`
+  - Signature: `fn prepare_decision(`
+  - Summary: The function logs an event for 'prepare_decision' with the action and reason, emits a PrepareDecision event, and returns a result.
+- `ProgressStateWriter` · Struct · lines `1341-1344` · summary source `Llm`
+  - Signature: `struct ProgressStateWriter`
+  - Summary: A struct representing a ProgressStateWriter for writing progress states to a file path. It holds a path and an enabled boolean.
+- `ProgressStateWriter::new` · Method · lines `1347-1356` · summary source `Llm`
+  - Signature: `fn new(db: &Path, enabled: bool) -> Self`
+  - Summary: A method 'new' is created with a path to a progress JSON file, using the 'parent()' method of the 'Path' type to determine the base directory, and setting the 'enabled' flag.
+- `ProgressStateWriter::record_state` · Method · lines `1358-1369` · summary source `Llm`
+  - Signature: `fn record_state(&mut self, state: &ProgressState)`
+  - Summary: The method records progress state in a file system by creating a directory and writing the state JSON to the file if the path is not empty.
+- `progress_state_from_event` · Function · lines `1372-1464` · summary source `Llm`
+  - Signature: `fn progress_state_from_event(event: &MatryoshkaEvent) -> Option<ProgressState>`
+  - Summary: The function processes event types for progress state: 'prepare' with specific states and progress details, returning a `Some` if the event type matches, otherwise None. It handles events like waiting for lock, preparing, starting, and decision progress, as well as indexer and prewarm progress, with various return values and state changes.
+- `prepare_action_phase` · Function · lines `1466-1472` · summary source `Llm`
+  - Signature: `fn prepare_action_phase(action: &str) -> &'static str`
+  - Summary: The function 'prepare_action_phase' returns the 'warming_search' phase based on the input 'rebuild_search' or 'prepare_results'.
+- `prepare_action_message` · Function · lines `1474-1480` · summary source `Llm`
+  - Signature: `fn prepare_action_message(action: &str) -> &'static str`
+  - Summary: The function `prepare_action_message` returns a string based on the action parameter, returning 'Preparing search' for 'rebuild_search', 'Warming search' for 'prepare_results', and 'Getting ready' for others.
+- `prepare_action_percent` · Function · lines `1482-1489` · summary source `Llm`
+  - Signature: `fn prepare_action_percent(action: &str) -> f32`
+  - Summary: The function `prepare_action_percent` takes an action string and returns a f32 value based on the action type, returning 0.03, 0.82, 0.94, or 0.05 depending on the input.
+- `cancel_prepare` · Function · lines `1491-1524` · summary source `Llm`
+  - Signature: `fn cancel_prepare(`
+  - Summary: The function logs an event for preparing cancellation, emits a PrepareCancelling event, logs another event for canceling, and returns a PrepareSummary with the cancellation reason.
+- `cancelled_error` · Function · lines `1526-1528` · summary source `Llm`
+  - Signature: `fn cancelled_error() -> anyhow::Error`
+  - Summary: A function named `cancelled_error` returns an `anyhow::Error` with a message 'matryoshka prepare cancelled'.
+- `is_cancelled_error` · Function · lines `1530-1532` · summary source `Llm`
+  - Signature: `pub fn is_cancelled_error(error: &(dyn std::error::Error + 'static)) -> bool`
+  - Summary: The function checks if an error from the 'matryoshka' prepare operation was cancelled.
+- `indexer_progress_state` · Function · lines `1534-1701` · summary source `Llm`
+  - Signature: `fn indexer_progress_state(`
+  - Summary: The function handles different progress events for a crate indexer, updating the progress state with corresponding information and file progress details. It manages various event types, updating the progress state with details like 'starting', 'discovering_files', 'reading_files', etc., and file progress based on event type. The function also handles specific event types like parsing, enriching, and embedding files, with different progress states and file progress details.
+- `ratio` · Function · lines `1703-1709` · summary source `Llm`
+  - Signature: `fn ratio(done: usize, total: usize) -> f32`
+  - Summary: The function calculates the ratio of done to total, clamping it between 0.0 and 1.0.
+- `CommandLog` · Struct · lines `1711-1713` · summary source `Llm`
+  - Signature: `struct CommandLog`
+  - Summary: A struct named CommandLog contains a file reference as a File.
+- `CommandLog::open` · Method · lines `1716-1723` · summary source `Llm`
+  - Signature: `fn open(db: &Path, name: &str) -> Result<Self>`
+  - Summary: The method `open` creates a file in the parent directory of a given path, using OpenOptions to create and append the file.
+- `CommandLog::event` · Method · lines `1725-1734` · summary source `Llm`
+  - Signature: `fn event(&mut self, event: &str, fields: serde_json::Value) -> Result<()>`
+  - Summary: The method `event` of the `CommandLog` class writes event data to a file with a Unix timestamp, flushes the file, and returns a result.
+- `PrepareLockGuard` · Struct · lines `1741-1744` · summary source `Llm`
+  - Signature: `struct PrepareLockGuard`
+  - Summary: A struct representing a PrepareLockGuard, which holds a file and path to be locked.
+- `PrepareLockGuard::drop` · Method · lines `1747-1749` · summary source `Llm`
+  - Signature: `fn drop(&mut self)`
+  - Summary: The method 'PrepareLockGuard::drop' is called on a mutable reference to a file, which unlocks the file before dropping the guard.
+- `acquire_prepare_lock` · Function · lines `1752-1828` · summary source `Llm`
+  - Signature: `fn acquire_prepare_lock(`
+  - Summary: A function in crates/api that prepares a lock by creating a file in the lock's path, checking if it's available, and handling events for lock acquisition or waiting.
+- `release_prepare_lock` · Function · lines `1830-1850` · summary source `Llm`
+  - Signature: `fn release_prepare_lock(`
+  - Summary: A function releases a lock, logs a prepare lock event, and records the lock path in the database.
+- `prepare_lock_path` · Function · lines `1852-1854` · summary source `Llm`
+  - Signature: `fn prepare_lock_path(db: &Path) -> PathBuf`
+  - Summary: The function 'prepare_lock_path' takes a 'db' parameter of type 'Path' and returns a 'PathBuf' containing a formatted string with the 'db' display as a part of the path.
+- `log_prune_report` · Function · lines `1856-1867` · summary source `Llm`
+  - Signature: `fn log_prune_report(log: &mut CommandLog, event: &str, report: &OrphanPruneReport) -> Result<()>`
+  - Summary: Logs a prune report with the specified report details in the command log.
+- `try_lock_prepare_file` · Function · lines `1870-1893` · summary source `Llm`
+  - Signature: `fn try_lock_prepare_file(file: &File) -> Result<bool>`
+  - Summary: The function tries to lock a file using flock, which requires OS-specific lock operations. If the lock is successful, it returns true; otherwise, it returns false if the lock was refused due to a WouldBlock error, or an error otherwise.
+- `unlock_prepare_file` · Function · lines `1896-1912` · summary source `Llm`
+  - Signature: `fn unlock_prepare_file(file: &File) -> Result<()>`
+  - Summary: The function `unlock_prepare_file` locks a file using the `flock()` function with the `LOCK_UN` constant, returning an Ok() if the function was successful, or an Err() with the last OS error if it failed.
+- `try_lock_prepare_file` · Function · lines `1915-1917` · summary source `Llm`
+  - Signature: `fn try_lock_prepare_file(_file: &File) -> Result<bool>`
+  - Summary: The function `try_lock_prepare_file` attempts to lock a file and returns a boolean indicating success.
+- `unlock_prepare_file` · Function · lines `1920-1922` · summary source `Llm`
+  - Signature: `fn unlock_prepare_file(_file: &File) -> Result<()>`
+  - Summary: The function `unlock_prepare_file` is a function that returns a Result() with no side effects.
+- `default_db_path` · Function · lines `1924-1926` · summary source `Llm`
+  - Signature: `pub fn default_db_path(repo_root: &Path) -> PathBuf`
+  - Summary: The function `default_db_path` takes a `Path` representing the repository root and returns a `PathBuf` by joining the `MATRYOSHKA_DIR` and `DEFAULT_DB_FILE` from the repository root.
+- `ensure_matryoshka_layout` · Function · lines `1928-1935` · summary source `Llm`
+  - Signature: `pub fn ensure_matryoshka_layout(db: &Path) -> Result<()>`
+  - Summary: Creates directories for the 'ensure_matryoshka_layout' function in the crate, creating parent, logs, and state directories.
+- `log_path` · Function · lines `1937-1942` · summary source `Llm`
+  - Signature: `fn log_path(db: &Path, name: &str) -> PathBuf`
+  - Summary: The function logs a path with a JSON file in the logs directory, using the parent of the database as the base path.
+- `progress_state_path` · Function · lines `1944-1949` · summary source `Llm`
+  - Signature: `fn progress_state_path(db: &Path) -> PathBuf`
+  - Summary: The function returns a PathBuf with the progress state path from the database, using the parent() method to get the root directory and joining the path with the specified JSON file.
+- `prepare_state_error_hint` · Function · lines `1951-1992` · summary source `Llm`
+  - Signature: `fn prepare_state_error_hint(db: &Path) -> String`
+  - Summary: The function prepares an error hint for a state in a crate by retrieving progress state, parsing it into a JSON structure, and formatting the result based on the status, phase, and error details from the state data.
+- `ready_marker_path` · Function · lines `1994-1998` · summary source `Llm`
+  - Signature: `pub fn ready_marker_path(db: &Path) -> PathBuf`
+  - Summary: The function returns a PathBuf from the parent of the given Path, joining the MATRYOSHKA_DIR and READY_MARKER_FILE.
+- `artifact_gap_count` · Function · lines `2000-2004` · summary source `Llm`
+  - Signature: `pub fn artifact_gap_count(report: &ArtifactQualityReport) -> usize`
+  - Summary: The function `artifact_gap_count` returns the sum of three values: the number of empty file cards, folder cards, and repository cards, with the repository card's count being 1 if there is a summary.
+- `retrieval_is_ready` · Function · lines `2006-2013` · summary source `Llm`
+  - Signature: `pub fn retrieval_is_ready(report: &RetrievalIndexReport) -> bool`
+  - Summary: The function checks if the retrieval index report has at least 100 semantic records, 100 FTS records, and additional conditions related to dense or late interaction, returning a boolean indicating success.
+- `retrieval_needs_rebuild` · Function · lines `2015-2017` · summary source `Llm`
+  - Signature: `fn retrieval_needs_rebuild(report: &RetrievalIndexReport) -> bool`
+  - Summary: The function checks if the retrieval is ready in the report and returns whether retrieval needs rebuilding.
+- `retrieval_report_from_stats` · Function · lines `2019-2035` · summary source `Llm`
+  - Signature: `fn retrieval_report_from_stats(`
+  - Summary: The function retrieves a RetrievalIndexReport with semantic, embedded, FTS, and late vector records based on the provided RetrievalIndexStats, configuration, and late interaction status.
+- `parser_config` · Function · lines `2037-2039` · summary source `Llm`
+  - Signature: `fn parser_config(ignore: Vec<String>) -> ParserConfig`
+  - Summary: A function in crates/api that initializes a ParserConfig with ignored paths set to the provided vector.
+- `logs_dir` · Function · lines `2041-2045` · summary source `Llm`
+  - Signature: `fn logs_dir(db: &Path) -> PathBuf`
+  - Summary: The function logs_dir takes a database path, returns the parent path if it exists, and joins it with 'logs' to create the final path.
+- `write_ready_marker` · Function · lines `2047-2056` · summary source `Llm`
+  - Signature: `fn write_ready_marker(summary: &PrepareSummary) -> Result<()>`
+  - Summary: A function writes a directory and a file in the 'ready_marker' of a crate's API, creating a file with a JSON summary of the prepare summary.
+- `prepare_summary_json` · Function · lines `2058-2113` · summary source `Llm`
+  - Signature: `pub fn prepare_summary_json(summary: &PrepareSummary) -> serde_json::Value`
+  - Summary: The function prepares a JSON summary with status, repo_root, database, ready marker, logs, actions taken, project map details, search results, prepare results, and embedding model information from the input summary data.
+- `update_summary_json` · Function · lines `2115-2129` · summary source `Llm`
+  - Signature: `fn update_summary_json(summary: &UpdateSummary) -> serde_json::Value`
+  - Summary: The function updates a JSON object with file count, folder count, symbol count, semantic records, artifact quality, retrieval index, changed files, removed files, changed folders, and repo card updated, based on the summary provided.
+- `semantic_rebuild_summary_json` · Function · lines `2131-2141` · summary source `Llm`
+  - Signature: `fn semantic_rebuild_summary_json(summary: &SemanticRebuildSummary) -> serde_json::Value`
+  - Summary: Generates a JSON object containing the count of semantic records, file card records, folder card records, repo card records, artifact quality, retrieval index, and embedding model from the SemanticRebuildSummary.
+- `retrieval_stats_json` · Function · lines `2143-2151` · summary source `Llm`
+  - Signature: `fn retrieval_stats_json(stats: &RetrievalIndexStats) -> serde_json::Value`
+  - Summary: Returns a JSON object containing retrieval statistics for semantic, embedded, FTS, and late vector records.
+- `task_query` · Function · lines `2153-2167` · summary source `Llm`
+  - Signature: `fn task_query(task: AgentTask, query: &str) -> String`
+  - Summary: The function processes agent tasks and returns specific string representations based on the task type, such as finding a symbol, behavior, target, dependency trace, architecture overview, tests, or next read.
+- `select_related_file_ids` · Function · lines `2169-2203` · summary source `Llm`
+  - Signature: `fn select_related_file_ids(`
+  - Summary: The function selects related file IDs based on a query, filters candidates, checks for test conditions, and returns scores with scores, indices, and file IDs sorted and limited.
+- `same_crate_area` · Function · lines `2205-2209` · summary source `Llm`
+  - Signature: `fn same_crate_area(left: &str, right: &str) -> bool`
+  - Summary: The function checks if both crates are present in the same path segment for the same crate area.
+- `same_top_level_area` · Function · lines `2211-2213` · summary source `Llm`
+  - Signature: `fn same_top_level_area(left: &str, right: &str) -> bool`
+  - Summary: The function checks if the top-level path segments of two strings are equal.
+- `same_parent_folder` · Function · lines `2215-2218` · summary source `Llm`
+  - Signature: `fn same_parent_folder(left: &str, right: &str) -> bool`
+  - Summary: The function checks if the parent part of two strings is the same, returning true if they match.
+- `path_segment` · Function · lines `2220-2222` · summary source `Llm`
+  - Signature: `fn path_segment(path: &str, index: usize) -> Option<&str>`
+  - Summary: A function that returns a substring of a path by splitting it on '/' and taking the index-th element.
+- `query_wants_tests`
